@@ -36,8 +36,8 @@ llm:
 embedding:
   model_name: "BAAI/bge-m3"
   model_path: "E:/RAG/models/bge-m3"
-  device: "cpu"
-  batch_size: 16
+  device: "cuda"
+  batch_size: 32
   max_length: 8192
   dimension: 1024
   normalize_embeddings: true
@@ -46,11 +46,11 @@ embedding:
   use_colbert: false
 
 reranker:
-  enabled: false
+  enabled: true
   model_name: "BAAI/bge-reranker-v2-m3"
   model_path: "E:/RAG/models/bge-reranker-v2-m3"
-  device: "cpu"
-  batch_size: 2
+  device: "cuda"
+  batch_size: 8
   top_n: 5
 
 postgres:
@@ -73,6 +73,7 @@ chroma:
   partitions: ["contract", "manual", "process", "policy", "general"]
 
 redis:
+  enabled: true
   url: "redis://localhost:16379/0"
   max_connections: 20
   semantic_cache:

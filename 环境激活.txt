@@ -1,0 +1,12 @@
+# 1. 启动数据库
+cd E:\RAG
+docker-compose up -d
+
+# 2. 启动后端API
+cd /d E:\RAG\industrial-rag
+conda activate industrial-rag
+python -m uvicorn src.api.main:app --reload
+
+# 3. 启动前端（新终端）
+cd E:\RAG\rag-frontend
+npm run dev

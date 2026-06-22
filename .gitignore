@@ -1,0 +1,52 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+.venv/
+venv/
+
+# Node
+node_modules/
+.npm/
+.pnpm-store/
+
+# Frontend build outputs
+.nuxt/
+.output/
+.vite/
+coverage/
+
+# Local services and generated data
+/industrial-rag/data/
+/industrial-rag/.pycache_tmp/
+/models/
+
+# Removed/unused frontend
+/dashboard-design/
+
+# External downloaded skill package
+/ui-ux-pro-max-skill/
+
+# Editors and OS files
+.idea/
+.vscode/
+.claude/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/

@@ -1,0 +1,54 @@
+# 已验证可用的依赖版本组合 (GPU)
+# 环境: Windows 11 + Python 3.12.13 + CUDA 12.6
+# 验证日期: 2026-06-15
+#
+# 重要：这套版本组合经过验证，BGE-M3 GPU 加速正常工作。
+# 不要随意升级以下核心包，新版本可能导致 Segmentation Fault。
+
+# ===== 核心：深度学习（GPU）=====
+# PyTorch 2.4.0 + CUDA 12.1（不要用 2.5.x，与模型不兼容）
+torch==2.4.0
+torchvision==0.19.0
+torchaudio==2.4.0
+# 安装命令：pip install torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 --index-url https://download.pytorch.org/whl/cu121
+
+# ===== 核心：嵌入和 Transformer =====
+# 这些版本是关键！新版本会崩溃
+transformers==4.44.2          # 不要用 5.x
+sentence-transformers==3.0.1  # 不要用 5.x
+tokenizers==0.19.1            # 配合 transformers 4.44
+huggingface-hub==0.36.2
+
+# ===== 核心：数据处理（关键！）=====
+# pandas 3.x + pyarrow 24.x 会导致 access violation 崩溃
+numpy==1.26.4                 # 不要用 2.x
+pandas==2.2.3                 # 不要用 3.x
+pyarrow==17.0.0               # 不要用 24.x（崩溃根源！）
+datasets==2.21.0              # 不要用 5.x（需要 pyarrow>=21）
+
+# ===== Web 框架 =====
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+python-dotenv
+pyyaml
+
+# ===== LLM API =====
+anthropic
+openai
+zhipuai
+
+# ===== 向量库和缓存 =====
+chromadb==1.5.9
+redis
+
+# ===== 文档处理 =====
+PyMuPDF
+python-docx
+openpyxl
+pillow
+
+# ===== 日志监控 =====
+structlog
+prometheus-fastapi-instrumentator

@@ -1,0 +1,246 @@
+# 应用配置
+app:
+  name: "Industrial RAG System"
+  version: "1.0.0"
+  debug: false
+  host: "0.0.0.0"
+  port: 8000
+
+# LLM配置
+llm:
+  text:
+    model_name: "qwen2.5-72b"
+    base_url: "http://vllm-text:8000/v1"
+    api_key: "EMPTY"
+    temperature: 0.7
+    max_tokens: 2048
+    top_p: 0.9
+    frequency_penalty: 0.0
+    presence_penalty: 0.0
+    timeout: 60
+
+  vision:
+    model_name: "qwen2-vl-7b"
+    base_url: "http://vllm-vision:8001/v1"
+    api_key: "EMPTY"
+    temperature: 0.7
+    max_tokens: 1024
+    timeout: 90
+
+# 嵌入模型配置
+embedding:
+  model_name: "BAAI/bge-m3"
+  model_path: "/app/models/bge-m3"
+  device: "cuda"
+  batch_size: 32
+  max_length: 8192
+  normalize_embeddings: true
+  # BGE-M3支持混合检索
+  use_dense: true
+  use_sparse: false  # Milvus 2.4暂不支持，设为false
+  use_colbert: false
+
+# 重排序模型
+reranker:
+  enabled: true
+  model_name: "BAAI/bge-reranker-v2-m3"
+  model_path: "/app/models/bge-reranker-v2-m3"
+  device: "cuda"
+  batch_size: 16
+  top_n: 5
+
+# 向量数据库配置 - Chroma
+chroma:
+  # 生产环境建议用 HTTP 模式连独立 Chroma Server
+  mode: "http"            # persistent | http
+  host: "chroma"
+  port: 8000
+  # persistent 模式时使用：
+  persist_directory: "/app/data/chroma"
+
+  # 集合配置
+  collection:
+    name: "rag_documents"
+    description: "RAG knowledge base"
+    dimension: 1024        # BGE-M3维度
+    distance: "cosine"     # cosine | l2 | ip（BGE-M3已归一化）
+
+  # 按文档类型区分（Chroma 用 metadata 实现，无原生分区）
+  enable_partition: true
+  partitions:
+    - "text"
+    - "table"
+    - "image"
+    - "mixed"
+
+# Redis缓存配置
+redis:
+  url: "redis://redis:6379/0"
+  encoding: "utf-8"
+  decode_responses: true
+  max_connections: 50
+
+  # 语义缓存配置
+  semantic_cache:
+    enabled: true
+    ttl: 3600  # 1小时
+    similarity_threshold: 0.95  # 相似度阈值
+    max_cache_size: 10000
+
+# RabbitMQ配置
+rabbitmq:
+  url: "amqp://guest:guest@rabbitmq:5672/"
+  queue_name: "document_processing"
+  prefetch_count: 1
+
+# 文档处理配置
+document_processing:
+  # 支持的文件类型
+  supported_formats:
+    - "pdf"
+    - "docx"
+    - "doc"
+    - "pptx"
+    - "xlsx"
+    - "md"
+    - "txt"
+    - "html"
+    - "png"
+    - "jpg"
+    - "jpeg"
+
+  max_file_size: 104857600  # 100MB
+
+  # PDF 解析 - MinerU (magic-pdf)
+  pdf:
+    engine: "mineru"
+    parse_method: "auto"       # ocr | txt | auto
+    device: "cuda"
+    output_format: "md"        # md | md_dollar | json
+    formula_enable: true       # 公式识别(LaTeX)
+    table_enable: true         # 表格识别
+
+  # 分块策略
+  chunking:
+    strategy: "semantic"  # semantic, fixed, recursive
+    chunk_size: 512
+    chunk_overlap: 50
+    separators: ["\n\n", "\n", "。", "！", "？", ". ", "! ", "? "]
+
+    # 语义分块配置
+    semantic:
+      buffer_size: 1
+      breakpoint_percentile_threshold: 95
+
+# RAG配置
+rag:
+  # 检索配置
+  retrieval:
+    top_k: 10
+    similarity_threshold: 0.5
+    enable_rerank: true
+    enable_hybrid: false  # 混合检索（BM25+向量）
+    alpha: 0.5  # 混合权重
+
+  # 生成配置
+  generation:
+    system_prompt: |
+      你是一个专业的问答助手。请基于提供的上下文信息回答用户问题。
+      回答要求：
+      1. 准确：严格基于上下文，不编造信息
+      2. 完整：如果上下文不足以回答，明确说明
+      3. 结构化：使用段落、列表组织答案
+      4. 引用来源：在答案中标注信息来源
+
+    max_context_length: 8000
+    context_template: |
+      ## 相关文档 {index}
+      **来源**: {source}
+      **相似度**: {score:.2f}
+
+      {content}
+
+    answer_template: |
+      {answer}
+
+      ---
+      **参考文献**:
+      {sources}
+
+# 多模态配置
+multimodal:
+  # 图像处理
+  image:
+    max_size: 10485760  # 10MB
+    resize: [1024, 1024]
+    formats: ["png", "jpg", "jpeg", "webp"]
+
+    # 图像嵌入模型
+    embedding_model: "openai/clip-vit-base-patch32"
+    device: "cuda"
+
+  # 表格处理
+  table:
+    extraction_method: "pdfplumber"  # pdfplumber, camelot
+    llm_parse: true  # 使用LLM理解表格语义
+
+# 监控配置
+monitoring:
+  prometheus:
+    enabled: true
+    port: 9090
+
+  metrics:
+    - "request_count"
+    - "request_duration"
+    - "embedding_duration"
+    - "llm_duration"
+    - "cache_hit_rate"
+    - "error_count"
+
+# 日志配置
+logging:
+  level: "INFO"
+  format: "json"
+  handlers:
+    - type: "stream"
+      stream: "ext://sys.stdout"
+    - type: "file"
+      filename: "/app/logs/app.log"
+      max_bytes: 10485760
+      backup_count: 5
+
+# 安全配置
+security:
+  # API认证
+  api_key:
+    enabled: false
+    header_name: "X-API-Key"
+
+  # JWT认证
+  jwt:
+    enabled: false
+    secret_key: "your-secret-key-change-in-production"
+    algorithm: "HS256"
+    access_token_expire_minutes: 30
+
+  # CORS
+  cors:
+    enabled: true
+    allow_origins: ["*"]
+    allow_methods: ["*"]
+    allow_headers: ["*"]
+
+# 性能优化
+performance:
+  # 批处理
+  batch_embedding: true
+  batch_size: 32
+
+  # 并发控制
+  max_concurrent_requests: 100
+  worker_threads: 4
+
+  # 连接池
+  db_pool_size: 20
+  redis_pool_size: 50

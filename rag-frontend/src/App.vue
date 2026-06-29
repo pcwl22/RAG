@@ -74,7 +74,15 @@
               {{ msg.role === 'user' ? '👤' : '🤖' }}
             </div>
             <div class="message-content">
-              <div class="message-text">{{ msg.content }}</div>
+              <div
+                v-if="msg.content || msg.streamingStatus"
+                class="message-text"
+                :class="{ streaming: msg.streaming }"
+              >
+                <span v-if="msg.content">{{ msg.content }}</span>
+                <span v-else class="stream-status">{{ msg.streamingStatus }}</span>
+                <span v-if="msg.streaming && msg.content" class="stream-cursor"></span>
+              </div>
 
               <!-- 显示检索上下文 -->
               <div v-if="msg.highConfidenceContexts && msg.highConfidenceContexts.length > 0" class="contexts">
@@ -98,40 +106,6 @@
                     </div>
                     <div class="context-text">{{ getRelevantSnippet(ctx.content, msg.query) }}</div>
                   </div>
-                </div>
-              </div>
-
-              <!-- 显示评估结果 -->
-              <div v-if="msg.evaluation" class="evaluation">
-                <div class="evaluation-header">📊 评估结果</div>
-                <div class="evaluation-grid">
-                  <div class="evaluation-item">
-                    <span>检索命中</span>
-                    <strong>{{ msg.evaluation.retrieval?.hit_count ?? 0 }}/{{ msg.evaluation.retrieval?.total ?? 0 }}</strong>
-                  </div>
-                  <div class="evaluation-item">
-                    <span>检索精度</span>
-                    <strong>{{ formatPercent(msg.evaluation.retrieval?.precision) }}</strong>
-                  </div>
-                  <div class="evaluation-item">
-                    <span>忠实度</span>
-                    <strong>{{ formatPercent(msg.evaluation.generation?.faithfulness) }}</strong>
-                  </div>
-                  <div class="evaluation-item">
-                    <span>相关性</span>
-                    <strong>{{ formatPercent(msg.evaluation.generation?.answer_relevancy) }}</strong>
-                  </div>
-                  <div class="evaluation-item">
-                    <span>上下文精度</span>
-                    <strong>{{ formatPercent(msg.evaluation.generation?.context_precision) }}</strong>
-                  </div>
-                  <div class="evaluation-item">
-                    <span>综合分</span>
-                    <strong>{{ formatPercent(msg.evaluation.pipeline_score) }}</strong>
-                  </div>
-                </div>
-                <div v-if="msg.evaluation.generation?.comment || msg.evaluation.retrieval?.reason" class="evaluation-note">
-                  {{ msg.evaluation.generation?.comment || msg.evaluation.retrieval?.reason }}
                 </div>
               </div>
 
@@ -179,7 +153,7 @@
             </div>
           </div>
 
-          <div v-if="isLoading" class="message assistant">
+          <div v-if="isLoading && !hasActiveStreamingMessage" class="message assistant">
             <div class="message-avatar">🤖</div>
             <div class="message-content">
               <div class="loading">思考中...</div>
@@ -193,10 +167,6 @@
             <label>
               <input type="checkbox" v-model="options.enableUnderstanding">
               启用查询理解
-            </label>
-            <label>
-              <input type="checkbox" v-model="options.enableEvaluation">
-              启用评估
             </label>
             <label>
               <input type="checkbox" v-model="options.stream">
@@ -336,8 +306,7 @@ const uploadProgress = ref(0)
 
 const options = ref({
   enableUnderstanding: true,
-  enableEvaluation: false,
-  stream: false
+  stream: true
 })
 
 // 计算属性：当前对话标题
@@ -346,15 +315,32 @@ const currentChatTitle = computed(() => {
   return session?.title || '新对话'
 })
 
+const hasActiveStreamingMessage = computed(() =>
+  messages.value.some(msg => msg.role === 'assistant' && msg.streaming)
+)
+
+const normalizeStoredMessages = (items = []) =>
+  items.map(msg => {
+    if (msg.role !== 'assistant') return msg
+    return {
+      ...msg,
+      streaming: false,
+      streamingStatus: msg.content ? '' : msg.streamingStatus || ''
+    }
+  })
+
 // 初始化对话
 const initChats = () => {
   const saved = localStorage.getItem('rag_chat_sessions')
   if (saved) {
     try {
       chatSessions.value = JSON.parse(saved)
+      chatSessions.value.forEach(session => {
+        session.messages = normalizeStoredMessages(session.messages || [])
+      })
       if (chatSessions.value.length > 0) {
         currentSessionId.value = chatSessions.value[0].id
-        messages.value = chatSessions.value[0].messages || []
+        messages.value = chatSessions.value[0].messages
       } else {
         createNewChat()
       }
@@ -393,7 +379,8 @@ const switchChat = (sessionId) => {
   const session = chatSessions.value.find(s => s.id === sessionId)
   if (session) {
     currentSessionId.value = sessionId
-    messages.value = session.messages || []
+    session.messages = normalizeStoredMessages(session.messages || [])
+    messages.value = session.messages
     nextTick(() => scrollToBottom())
   }
 }
@@ -449,11 +436,6 @@ const formatTime = (dateStr) => {
   return date.toLocaleDateString()
 }
 
-const formatPercent = (value) => {
-  if (value === null || value === undefined || Number.isNaN(Number(value))) return '-'
-  return Math.round(Number(value) * 100) + '%'
-}
-
 // 检查系统状态
 const checkHealth = async () => {
   try {
@@ -496,6 +478,9 @@ const handleSend = async () => {
   isLoading.value = true
   scrollToBottom()
 
+  let streamingMessage = null
+  let streamWriter = null
+
   try {
     if (options.value.stream) {
       const assistantMessage = {
@@ -504,22 +489,27 @@ const handleSend = async () => {
         contexts: [],
         highConfidenceContexts: [],
         understanding: null,
-        evaluation: null,
+        streamingStatus: '正在连接...',
+        streaming: true,
         showContexts: false,
         query: query
       }
       messages.value.push(assistantMessage)
+      streamingMessage = messages.value[messages.value.length - 1]
+      streamWriter = createStreamWriter((text) => {
+        streamingMessage.streamingStatus = ''
+        streamingMessage.content += text
+        scrollToBottom()
+      })
 
       const endpoint = options.value.enableUnderstanding ? `${API_BASE}/query/enhanced` : `${API_BASE}/answer`
       const payload = options.value.enableUnderstanding
         ? {
             query,
             chat_history: chatHistory,
-            enable_evaluation: options.value.enableEvaluation,
-            stream: true,
-            top_k: 5
+            stream: true
           }
-        : { query, top_k: 5, stream: true }
+        : { query, stream: true }
 
       const res = await fetch(endpoint, {
         method: 'POST',
@@ -531,20 +521,23 @@ const handleSend = async () => {
 
       await readEventStream(res, {
         onChunk: (chunk) => {
-          assistantMessage.content += chunk
-          scrollToBottom()
+          streamWriter.enqueue(chunk)
         },
         onSources: (sources) => {
-          assistantMessage.contexts = sources || []
-          assistantMessage.highConfidenceContexts = assistantMessage.contexts.filter(ctx => ctx.score >= 0.8)
+          streamingMessage.contexts = sources || []
+          streamingMessage.highConfidenceContexts = streamingMessage.contexts.filter(ctx => ctx.score >= 0.8)
         },
         onUnderstanding: (understanding) => {
-          assistantMessage.understanding = understanding
+          streamingMessage.understanding = understanding
         },
-        onEvaluation: (evaluation) => {
-          assistantMessage.evaluation = evaluation
+        onStatus: (status) => {
+          if (!streamingMessage.content) {
+            streamingMessage.streamingStatus = status
+          }
         }
       })
+      await streamWriter.drain()
+      streamingMessage.streaming = false
 
       return
     }
@@ -558,9 +551,7 @@ const handleSend = async () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           query,
-          chat_history: chatHistory,
-          enable_evaluation: options.value.enableEvaluation,
-          top_k: 5
+          chat_history: chatHistory
         })
       })
 
@@ -568,15 +559,14 @@ const handleSend = async () => {
       response = {
         content: data.answer,
         contexts: data.results,
-        understanding: data.understanding,
-        evaluation: data.evaluation
+        understanding: data.understanding
       }
     } else {
       // 标准查询
       const res = await fetch(`${API_BASE}/answer`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query, top_k: 5 })
+        body: JSON.stringify({ query })
       })
 
       const data = await res.json()
@@ -595,20 +585,35 @@ const handleSend = async () => {
       contexts: response.contexts,
       highConfidenceContexts: highConfidenceContexts,
       understanding: response.understanding,
-      evaluation: response.evaluation,
       showContexts: false,
       query: query  // 保存查询用于提取相关内容
     })
 
   } catch (error) {
-    const lastMessage = messages.value[messages.value.length - 1]
-    if (lastMessage?.role === 'assistant' && !lastMessage.content) {
-      lastMessage.content = '抱歉，查询失败: ' + error.message
+    if (streamingMessage) {
+      try {
+        await streamWriter?.drain()
+      } catch (drainError) {
+        console.error('Failed to drain stream writer:', drainError)
+      }
+
+      streamingMessage.streaming = false
+      streamingMessage.streamingStatus = ''
+      if (streamingMessage.content) {
+        streamingMessage.content += `\n\n[流式输出中断：${error.message}]`
+      } else {
+        streamingMessage.content = '抱歉，查询失败: ' + error.message
+      }
     } else {
-      messages.value.push({
-        role: 'assistant',
-        content: '抱歉，查询失败: ' + error.message
-      })
+      const lastMessage = messages.value[messages.value.length - 1]
+      if (lastMessage?.role === 'assistant' && !lastMessage.content) {
+        lastMessage.content = '抱歉，查询失败: ' + error.message
+      } else {
+        messages.value.push({
+          role: 'assistant',
+          content: '抱歉，查询失败: ' + error.message
+        })
+      }
     }
   } finally {
     isLoading.value = false
@@ -699,41 +704,120 @@ const getRelevantSnippet = (content, query) => {
   return content.substring(0, 200) + (content.length > 200 ? '...' : '')
 }
 
+const createStreamWriter = (write) => {
+  let queue = ''
+  let timer = null
+  let drainResolvers = []
+
+  const resolveDrains = () => {
+    const resolvers = drainResolvers
+    drainResolvers = []
+    resolvers.forEach(resolve => resolve())
+  }
+
+  const stop = () => {
+    if (timer) clearInterval(timer)
+    timer = null
+  }
+
+  const flush = () => {
+    if (!queue) {
+      stop()
+      resolveDrains()
+      return
+    }
+
+    const size = queue.length > 160 ? 16 : queue.length > 60 ? 8 : 3
+    const next = queue.slice(0, size)
+    queue = queue.slice(size)
+    write(next)
+  }
+
+  const start = () => {
+    if (!timer) timer = setInterval(flush, 18)
+  }
+
+  return {
+    enqueue(text = '') {
+      if (!text) return
+      queue += text
+      start()
+    },
+    drain() {
+      if (!queue && !timer) return Promise.resolve()
+      start()
+      return new Promise(resolve => {
+        drainResolvers.push(resolve)
+      })
+    }
+  }
+}
+
 const readEventStream = async (res, handlers = {}) => {
   if (!res.body) throw new Error('浏览器不支持流式响应')
 
   const reader = res.body.getReader()
   const decoder = new TextDecoder('utf-8')
   let buffer = ''
+  let finished = false
 
   const handleEvent = (event) => {
-    const dataLine = event.split('\n').find(line => line.startsWith('data: '))
-    if (!dataLine) return
+    const rawData = event
+      .split('\n')
+      .filter(line => line.startsWith('data:'))
+      .map(line => line.slice(5).trimStart())
+      .join('\n')
+      .trim()
 
-    const payload = JSON.parse(dataLine.slice(6))
-    if (payload.type === 'chunk') handlers.onChunk?.(payload.data)
+    if (!rawData) return
+    if (rawData === '[DONE]') {
+      finished = true
+      handlers.onDone?.()
+      return
+    }
+
+    let payload
+    try {
+      payload = JSON.parse(rawData)
+    } catch (error) {
+      throw new Error(`流式响应格式错误: ${rawData.slice(0, 120)}`)
+    }
+
+    if (payload.type === 'error' || payload.error) {
+      throw new Error(payload.error || payload.message || '流式响应失败')
+    }
+
+    if (payload.type === 'chunk' || payload.type === 'token') handlers.onChunk?.(payload.data || '')
     if (payload.type === 'sources') handlers.onSources?.(payload.data)
     if (payload.type === 'understanding') handlers.onUnderstanding?.(payload.data)
-    if (payload.type === 'evaluation') handlers.onEvaluation?.(payload.data)
-    if (payload.type === 'done') handlers.onDone?.(payload)
-  }
-
-  while (true) {
-    const { value, done } = await reader.read()
-    if (done) break
-
-    buffer += decoder.decode(value, { stream: true })
-    buffer = buffer.replace(/\r\n/g, '\n')
-    const events = buffer.split('\n\n')
-    buffer = events.pop() || ''
-
-    for (const event of events) {
-      handleEvent(event)
+    if (payload.type === 'status') handlers.onStatus?.(payload.data || '')
+    if (payload.type === 'done') {
+      finished = true
+      handlers.onDone?.(payload)
     }
   }
 
-  buffer += decoder.decode()
-  if (buffer.trim()) handleEvent(buffer)
+  try {
+    while (!finished) {
+      const { value, done } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+      buffer = buffer.replace(/\r\n/g, '\n')
+      const events = buffer.split('\n\n')
+      buffer = events.pop() || ''
+
+      for (const event of events) {
+        handleEvent(event)
+        if (finished) break
+      }
+    }
+
+    buffer += decoder.decode()
+    if (!finished && buffer.trim()) handleEvent(buffer)
+  } finally {
+    reader.releaseLock()
+  }
 }
 
 onMounted(() => {
@@ -1040,6 +1124,10 @@ onMounted(() => {
   white-space: pre-wrap;
 }
 
+.message-text.streaming {
+  border: 1px solid #d8e1eb;
+}
+
 .message.user .message-text {
   background: #3c5a78;
   color: white;
@@ -1110,50 +1198,6 @@ onMounted(() => {
   line-height: 1.5;
 }
 
-.evaluation {
-  margin-top: 0.75rem;
-  padding: 1rem;
-  background: #eef6ff;
-  border-left: 3px solid #2563eb;
-  border-radius: 0.25rem;
-  font-size: 0.875rem;
-}
-
-.evaluation-header {
-  font-weight: 600;
-  margin-bottom: 0.75rem;
-  color: #1d4ed8;
-}
-
-.evaluation-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
-  gap: 0.5rem;
-}
-
-.evaluation-item {
-  padding: 0.5rem;
-  background: white;
-  border-radius: 0.25rem;
-}
-
-.evaluation-item span {
-  display: block;
-  color: #64748b;
-  font-size: 0.75rem;
-  margin-bottom: 0.2rem;
-}
-
-.evaluation-item strong {
-  color: #1e3a8a;
-}
-
-.evaluation-note {
-  margin-top: 0.75rem;
-  color: #475569;
-  line-height: 1.5;
-}
-
 .understanding {
   margin-top: 0.75rem;
   padding: 1rem;
@@ -1220,6 +1264,28 @@ onMounted(() => {
   padding: 1rem;
   color: #6b7077;
   font-style: italic;
+}
+
+.stream-status {
+  color: #6b7077;
+  font-size: 0.9rem;
+  font-style: italic;
+}
+
+.stream-cursor {
+  display: inline-block;
+  width: 0.55em;
+  height: 1.05em;
+  margin-left: 0.12em;
+  vertical-align: -0.16em;
+  background: #3c5a78;
+  animation: stream-cursor-blink 1s steps(2, start) infinite;
+}
+
+@keyframes stream-cursor-blink {
+  50% {
+    opacity: 0;
+  }
 }
 
 .input-area {

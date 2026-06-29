@@ -36,7 +36,8 @@ services:
     volumes:
       - ../models:/app/models:ro
       - ../data:/app/data
-      - ../configs:/app/configs:ro
+      - ../config:/app/config:ro
+      - ../prompts:/app/prompts:ro
     depends_on:
       - redis
       - milvus-standalone
@@ -71,7 +72,8 @@ services:
     volumes:
       - ../models:/app/models:ro
       - ../data:/app/data
-      - ../configs:/app/configs:ro
+      - ../config:/app/config:ro
+      - ../prompts:/app/prompts:ro
     depends_on:
       - redis
       - milvus-standalone
@@ -145,7 +147,7 @@ services:
       context: ..
       dockerfile: docker/worker/Dockerfile
     container_name: rag-worker
-    command: celery -A src.workers.celery_app worker --loglevel=info --concurrency=4
+    command: celery -A app.workers.celery_app:celery_app worker --loglevel=info --concurrency=4
     environment:
       - REDIS_URL=redis://redis:6379/0
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
@@ -154,7 +156,8 @@ services:
     volumes:
       - ../models:/app/models:ro
       - ../data:/app/data
-      - ../configs:/app/configs:ro
+      - ../config:/app/config:ro
+      - ../prompts:/app/prompts:ro
     depends_on:
       - redis
       - rabbitmq

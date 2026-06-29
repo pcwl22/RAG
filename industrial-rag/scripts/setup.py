@@ -215,7 +215,7 @@ def main():
         print("\n✅ 环境就绪！")
         print("\n下一步:")
         print("  1. 安装依赖: pip install -e .")
-        print("  2. 启动服务: uvicorn src.api.main:app --reload")
+        print("  2. 启动服务: uvicorn app.main:app --reload")
         print("  3. 访问文档: http://localhost:8000/docs")
 
     print()

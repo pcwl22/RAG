@@ -27,7 +27,6 @@ def init_session_state() -> None:
     st.session_state.setdefault("show_sources", True)
     st.session_state.setdefault("enable_coreference", True)
     st.session_state.setdefault("enable_decomposition", True)
-    st.session_state.setdefault("enable_evaluation", False)
 
 
 def upload_document(file, category: str):
@@ -78,7 +77,6 @@ def enhanced_query(query: str, partition: str | None = None) -> dict | None:
         "chat_history": history,
         "enable_coreference": st.session_state.enable_coreference,
         "enable_decomposition": st.session_state.enable_decomposition,
-        "enable_evaluation": st.session_state.enable_evaluation,
         "top_k": 5,
         "partition": partition,
     }
@@ -123,7 +121,6 @@ def sidebar() -> str | None:
         )
         st.checkbox("指代消解", key="enable_coreference")
         st.checkbox("复合问题拆分", key="enable_decomposition")
-        st.checkbox("显示评估结果", key="enable_evaluation")
         st.checkbox("显示来源", key="show_sources")
 
         st.divider()
@@ -191,10 +188,6 @@ def main_chat(partition: str | None) -> None:
                 with st.expander("问题拆分", expanded=False):
                     for subquery in understanding.get("subqueries", []):
                         st.write(subquery)
-
-            if st.session_state.enable_evaluation and result.get("evaluation"):
-                with st.expander("评估结果", expanded=False):
-                    st.json(result["evaluation"])
 
             render_sources(result.get("results", []))
 

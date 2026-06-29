@@ -48,4 +48,4 @@ echo "按 Ctrl+C 停止服务"
 echo "========================================"
 echo
 
-python -m uvicorn src.api.main:app --reload --host 0.0.0.0 --port 8000
+python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000

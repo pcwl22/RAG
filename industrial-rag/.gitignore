@@ -73,6 +73,7 @@ milvus_data/
 
 # 测试
 .pytest_cache/
+.pytest_tmp/
 .coverage
 htmlcov/
 

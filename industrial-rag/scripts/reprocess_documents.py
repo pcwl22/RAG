@@ -9,11 +9,11 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from src.ingest.pipeline import parse_document
-from src.core.chunking import ParentChildChunker
-from src.models.embedding import encode_texts
-from src.storage.postgres_store import init_postgres_store, close_postgres_store, add_documents
-from src.utils.logger import get_logger
+from app.service.ingest_service import parse_document
+from app.parser.chunk import ParentChildChunker
+from app.embedding.embedder import encode_texts
+from app.vectorstore.postgres_store import init_postgres_store, close_postgres_store, add_documents
+from app.utils.logger import get_logger
 import uuid
 
 logger = get_logger(__name__)

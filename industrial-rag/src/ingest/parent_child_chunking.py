@@ -1,8 +1,4 @@
-"""Parent-child chunking for RAG retrieval and generation.
-
-Child chunks are embedded and retrieved for precision. Parent chunks are stored
-in metadata so generation can use a wider, less fragmented context.
-"""
+"""Parent-child chunking for RAG retrieval and generation."""
 import re
 from typing import Any
 
@@ -18,14 +14,16 @@ DEFAULT_SEPARATORS = [
     "\n\n",
     "\n",
     "。",
-    "；",
-    "，",
+    "？",
+    "！",
     ". ",
     "; ",
     ", ",
     " ",
     "",
 ]
+
+ARTICLE_PATTERN = re.compile(r"(?m)^第[一二三四五六七八九十百千万零〇两0-9]+条[^\n]*")
 
 
 def _chunking_config() -> dict:
@@ -108,6 +106,81 @@ def _merge_chunks(splits: list[str], target_size: int, overlap: int) -> list[str
     return chunks
 
 
+def _extract_legal_articles(text: str) -> list[str]:
+    matches = list(ARTICLE_PATTERN.finditer(text))
+    if len(matches) < 3:
+        return []
+
+    articles: list[str] = []
+    for index, match in enumerate(matches):
+        start = match.start()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        article = text[start:end].strip()
+        if article:
+            articles.append(article)
+    return articles
+
+
+def _split_long_article(article: str, child_size: int, child_overlap: int, separators: list[str]) -> list[str]:
+    if len(article) <= child_size:
+        return [article]
+    splits = _split_by_separators(article, separators, child_size * 2)
+    merged = _merge_chunks(splits, child_size, child_overlap)
+    return merged or [article]
+
+
+def _build_parent_child_from_articles(
+    articles: list[str],
+    parent_size: int,
+    child_size: int,
+    child_overlap: int,
+    separators: list[str],
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    parent_chunks: list[str] = []
+    current_parent: list[str] = []
+    current_parent_len = 0
+
+    for article in articles:
+        article_len = len(article) + (2 if current_parent else 0)
+        if current_parent and current_parent_len + article_len > parent_size:
+            parent_chunks.append("\n\n".join(current_parent).strip())
+            current_parent = []
+            current_parent_len = 0
+        current_parent.append(article)
+        current_parent_len += article_len
+
+    if current_parent:
+        parent_chunks.append("\n\n".join(current_parent).strip())
+
+    for parent_index, parent_content in enumerate(parent_chunks):
+        parent_articles = _extract_legal_articles(parent_content) or [parent_content]
+        child_index = 0
+        for article in parent_articles:
+            child_parts = _split_long_article(article, child_size, child_overlap, separators)
+            total_children = len(child_parts)
+            for offset, child_content in enumerate(child_parts):
+                results.append(
+                    {
+                        "parent_id": parent_index,
+                        "parent_content": parent_content,
+                        "child_id": f"{parent_index}_{child_index}",
+                        "child_content": child_content,
+                        "child_index": child_index,
+                        "total_children": total_children,
+                        "article_offset": offset,
+                    }
+                )
+                child_index += 1
+
+    logger.info(
+        "Legal article chunking produced %s child chunks from %s parents",
+        len(results),
+        len(parent_chunks),
+    )
+    return results
+
+
 def create_parent_child_chunks(
     text: str,
     parent_size: int = 3200,
@@ -126,6 +199,16 @@ def create_parent_child_chunks(
         separators.append("")
 
     normalized = _normalize_text(text)
+    legal_articles = _extract_legal_articles(normalized)
+    if legal_articles:
+        return _build_parent_child_from_articles(
+            legal_articles,
+            parent_size=parent_size,
+            child_size=child_size,
+            child_overlap=child_overlap,
+            separators=separators,
+        )
+
     parent_splits = _split_by_separators(normalized, separators, parent_size * 2)
     parent_chunks = _merge_chunks(parent_splits, parent_size, overlap=0)
 

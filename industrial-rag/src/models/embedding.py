@@ -1,10 +1,12 @@
 """
-嵌入模型管理
+Embedding model helpers.
 
-使用 sentence-transformers 加载 BGE-M3 模型。
-由于 FlagEmbedding 在 Windows + Python 3.12 环境存在兼容性问题（Segmentation Fault），
-改用 sentence-transformers，并默认 CPU 模式以保证稳定性。
+This module loads the BGE-M3 embedding model with sentence-transformers.
+FlagEmbedding had compatibility issues in the local Windows + Python 3.12
+environment, so device selection is controlled by config and can use GPU.
 """
+from __future__ import annotations
+
 from typing import List
 
 from src.core.config import get_settings
@@ -12,16 +14,56 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# 全局嵌入模型实例
 _embedding_model = None
+
+
+def get_embedding_runtime_info() -> dict[str, str | bool | None]:
+    """Return runtime device information for the embedding model."""
+    config = get_settings()
+    device = config.get("embedding", {}).get("device", "cuda")
+    info: dict[str, str | bool | None] = {
+        "configured_device": device,
+        "resolved_device": None,
+        "gpu_name": None,
+        "cuda_available": None,
+    }
+
+    try:
+        import torch
+
+        cuda_available = torch.cuda.is_available()
+        info["cuda_available"] = cuda_available
+
+        if _embedding_model is not None:
+            resolved_device = getattr(_embedding_model, "device", None)
+            if resolved_device is not None:
+                info["resolved_device"] = str(resolved_device)
+
+        if cuda_available and str(device).startswith("cuda"):
+            gpu_index = 0
+            if ":" in str(device):
+                try:
+                    gpu_index = int(str(device).split(":", 1)[1])
+                except ValueError:
+                    gpu_index = 0
+            info["gpu_name"] = torch.cuda.get_device_name(gpu_index)
+            if info["resolved_device"] is None:
+                info["resolved_device"] = f"cuda:{gpu_index}"
+        elif info["resolved_device"] is None:
+            info["resolved_device"] = str(device)
+    except Exception:
+        if info["resolved_device"] is None:
+            info["resolved_device"] = str(device)
+
+    return info
 
 
 def load_embedding_model():
     """
-    加载嵌入模型（sentence-transformers，CPU 模式）
+    Load the embedding model with sentence-transformers.
 
     Returns:
-        嵌入模型实例
+        Embedding model instance.
     """
     global _embedding_model
 
@@ -34,14 +76,23 @@ def load_embedding_model():
     embed_config = config["embedding"]
     model_path = embed_config["model_path"]
 
-    # 设备选择（GPU 已验证可用）
+    # Device selection is driven by embedding.device in config.
     device = embed_config.get("device", "cuda")
 
     logger.info(f"Loading embedding model: {model_path} (device={device})")
 
     try:
         _embedding_model = SentenceTransformer(model_path, device=device)
-        logger.info("Embedding model loaded successfully")
+        runtime_info = get_embedding_runtime_info()
+        logger.info(
+            "Embedding model loaded successfully",
+            extra={
+                "configured_device": runtime_info["configured_device"],
+                "resolved_device": runtime_info["resolved_device"],
+                "cuda_available": runtime_info["cuda_available"],
+                "gpu_name": runtime_info["gpu_name"],
+            },
+        )
         return _embedding_model
     except Exception as e:
         logger.error(f"Failed to load embedding model: {e}")
@@ -50,10 +101,10 @@ def load_embedding_model():
 
 def get_embedding_model():
     """
-    获取嵌入模型实例
+    Return the cached embedding model instance.
 
     Returns:
-        嵌入模型
+        Embedding model instance.
     """
     if _embedding_model is None:
         return load_embedding_model()
@@ -62,29 +113,26 @@ def get_embedding_model():
 
 def encode_texts(texts: List[str], batch_size: int = 32) -> List[List[float]]:
     """
-    编码文本为向量
+    Encode a list of texts into embedding vectors.
 
     Args:
-        texts: 文本列表
-        batch_size: 批处理大小
+        texts: Input text list.
+        batch_size: Batch size for encoding.
 
     Returns:
-        向量列表（每个向量为 list[float]）
+        List of embedding vectors.
     """
     model = get_embedding_model()
     config = get_settings()
     embed_config = config["embedding"]
 
     try:
-        # sentence-transformers 的 encode 接口
         embeddings = model.encode(
             texts,
             batch_size=batch_size,
             normalize_embeddings=embed_config.get("normalize_embeddings", True),
             show_progress_bar=False,
         )
-
-        # embeddings 是 numpy 数组
         return embeddings.tolist()
 
     except Exception as e:
@@ -94,13 +142,13 @@ def encode_texts(texts: List[str], batch_size: int = 32) -> List[List[float]]:
 
 def encode_query(query: str) -> List[float]:
     """
-    编码单个查询
+    Encode a single query.
 
     Args:
-        query: 查询文本
+        query: Query text.
 
     Returns:
-        查询向量
+        Query embedding vector.
     """
     embeddings = encode_texts([query], batch_size=1)
     return embeddings[0]

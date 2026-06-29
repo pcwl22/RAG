@@ -84,9 +84,54 @@
                 </div>
                 <div v-show="msg.showContexts" class="contexts-list">
                   <div v-for="(ctx, idx) in msg.highConfidenceContexts" :key="idx" class="context-item">
-                    <div class="context-score">得分: {{ ctx.score?.toFixed(3) }}</div>
+                    <div class="context-score">
+                      得分: {{ ctx.score?.toFixed(3) }}
+                      <span v-if="ctx.multi_query_appearances" class="query-hit-count">
+                        命中 {{ ctx.multi_query_appearances }} 次
+                      </span>
+                    </div>
+                    <div v-if="ctx.matched_queries && ctx.matched_queries.length" class="matched-queries">
+                      <div class="matched-title">命中查询</div>
+                      <div v-for="(matchedQuery, qIdx) in ctx.matched_queries" :key="qIdx" class="matched-query">
+                        {{ matchedQuery }}
+                      </div>
+                    </div>
                     <div class="context-text">{{ getRelevantSnippet(ctx.content, msg.query) }}</div>
                   </div>
+                </div>
+              </div>
+
+              <!-- 显示评估结果 -->
+              <div v-if="msg.evaluation" class="evaluation">
+                <div class="evaluation-header">📊 评估结果</div>
+                <div class="evaluation-grid">
+                  <div class="evaluation-item">
+                    <span>检索命中</span>
+                    <strong>{{ msg.evaluation.retrieval?.hit_count ?? 0 }}/{{ msg.evaluation.retrieval?.total ?? 0 }}</strong>
+                  </div>
+                  <div class="evaluation-item">
+                    <span>检索精度</span>
+                    <strong>{{ formatPercent(msg.evaluation.retrieval?.precision) }}</strong>
+                  </div>
+                  <div class="evaluation-item">
+                    <span>忠实度</span>
+                    <strong>{{ formatPercent(msg.evaluation.generation?.faithfulness) }}</strong>
+                  </div>
+                  <div class="evaluation-item">
+                    <span>相关性</span>
+                    <strong>{{ formatPercent(msg.evaluation.generation?.answer_relevancy) }}</strong>
+                  </div>
+                  <div class="evaluation-item">
+                    <span>上下文精度</span>
+                    <strong>{{ formatPercent(msg.evaluation.generation?.context_precision) }}</strong>
+                  </div>
+                  <div class="evaluation-item">
+                    <span>综合分</span>
+                    <strong>{{ formatPercent(msg.evaluation.pipeline_score) }}</strong>
+                  </div>
+                </div>
+                <div v-if="msg.evaluation.generation?.comment || msg.evaluation.retrieval?.reason" class="evaluation-note">
+                  {{ msg.evaluation.generation?.comment || msg.evaluation.retrieval?.reason }}
                 </div>
               </div>
 
@@ -105,6 +150,12 @@
                   <div class="step-note">将代词还原为明确实体</div>
                 </div>
 
+                <div v-if="msg.understanding.rewritten_query && msg.understanding.rewritten_query !== msg.understanding.resolved_query" class="understanding-step">
+                  <strong>✓ 查询改写：</strong>
+                  <div class="step-content highlight">{{ msg.understanding.rewritten_query }}</div>
+                  <div class="step-note">用于和原查询一起检索，提升召回</div>
+                </div>
+
                 <div v-if="msg.understanding.subqueries && msg.understanding.subqueries.length > 1" class="understanding-step">
                   <strong>✓ 查询拆分：</strong>
                   <div class="step-note">复合问题拆分为 {{ msg.understanding.subqueries.length }} 个子查询</div>
@@ -113,7 +164,14 @@
                   </ol>
                 </div>
 
-                <div v-if="!msg.understanding.is_decomposed && msg.understanding.resolved_query === msg.understanding.original_query" class="understanding-step">
+                <div v-if="msg.understanding.retrieval_queries && msg.understanding.retrieval_queries.length > 0" class="understanding-step">
+                  <strong>✓ 实际检索查询：</strong>
+                  <ol class="subqueries-list">
+                    <li v-for="(rq, i) in msg.understanding.retrieval_queries" :key="i">{{ rq }}</li>
+                  </ol>
+                </div>
+
+                <div v-if="!msg.understanding.is_decomposed && msg.understanding.resolved_query === msg.understanding.original_query && msg.understanding.rewritten_query === msg.understanding.resolved_query" class="understanding-step">
                   <strong>✓ 分析结果：</strong>
                   <div class="step-content">单一问题，无需拆分或改写</div>
                 </div>
@@ -139,6 +197,10 @@
             <label>
               <input type="checkbox" v-model="options.enableEvaluation">
               启用评估
+            </label>
+            <label>
+              <input type="checkbox" v-model="options.stream">
+              流式输出
             </label>
           </div>
           <div class="input-row">
@@ -274,7 +336,8 @@ const uploadProgress = ref(0)
 
 const options = ref({
   enableUnderstanding: true,
-  enableEvaluation: false
+  enableEvaluation: false,
+  stream: false
 })
 
 // 计算属性：当前对话标题
@@ -386,6 +449,11 @@ const formatTime = (dateStr) => {
   return date.toLocaleDateString()
 }
 
+const formatPercent = (value) => {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return '-'
+  return Math.round(Number(value) * 100) + '%'
+}
+
 // 检查系统状态
 const checkHealth = async () => {
   try {
@@ -413,6 +481,10 @@ const handleSend = async () => {
 
   const query = userInput.value.trim()
   userInput.value = ''
+  const chatHistory = messages.value.slice(-6).map(m => ({
+    role: m.role,
+    content: m.content
+  }))
 
   // 添加用户消息
   messages.value.push({
@@ -425,6 +497,58 @@ const handleSend = async () => {
   scrollToBottom()
 
   try {
+    if (options.value.stream) {
+      const assistantMessage = {
+        role: 'assistant',
+        content: '',
+        contexts: [],
+        highConfidenceContexts: [],
+        understanding: null,
+        evaluation: null,
+        showContexts: false,
+        query: query
+      }
+      messages.value.push(assistantMessage)
+
+      const endpoint = options.value.enableUnderstanding ? `${API_BASE}/query/enhanced` : `${API_BASE}/answer`
+      const payload = options.value.enableUnderstanding
+        ? {
+            query,
+            chat_history: chatHistory,
+            enable_evaluation: options.value.enableEvaluation,
+            stream: true,
+            top_k: 5
+          }
+        : { query, top_k: 5, stream: true }
+
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      })
+
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+
+      await readEventStream(res, {
+        onChunk: (chunk) => {
+          assistantMessage.content += chunk
+          scrollToBottom()
+        },
+        onSources: (sources) => {
+          assistantMessage.contexts = sources || []
+          assistantMessage.highConfidenceContexts = assistantMessage.contexts.filter(ctx => ctx.score >= 0.8)
+        },
+        onUnderstanding: (understanding) => {
+          assistantMessage.understanding = understanding
+        },
+        onEvaluation: (evaluation) => {
+          assistantMessage.evaluation = evaluation
+        }
+      })
+
+      return
+    }
+
     let response
 
     if (options.value.enableUnderstanding) {
@@ -434,10 +558,7 @@ const handleSend = async () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           query,
-          chat_history: messages.value.slice(-6).map(m => ({
-            role: m.role,
-            content: m.content
-          })),
+          chat_history: chatHistory,
           enable_evaluation: options.value.enableEvaluation,
           top_k: 5
         })
@@ -461,7 +582,7 @@ const handleSend = async () => {
       const data = await res.json()
       response = {
         content: data.answer,
-        contexts: data.contexts
+        contexts: data.sources || data.contexts || []
       }
     }
 
@@ -480,10 +601,15 @@ const handleSend = async () => {
     })
 
   } catch (error) {
-    messages.value.push({
-      role: 'assistant',
-      content: '抱歉，查询失败: ' + error.message
-    })
+    const lastMessage = messages.value[messages.value.length - 1]
+    if (lastMessage?.role === 'assistant' && !lastMessage.content) {
+      lastMessage.content = '抱歉，查询失败: ' + error.message
+    } else {
+      messages.value.push({
+        role: 'assistant',
+        content: '抱歉，查询失败: ' + error.message
+      })
+    }
   } finally {
     isLoading.value = false
     updateCurrentSession()  // 保存对话
@@ -571,6 +697,43 @@ const getRelevantSnippet = (content, query) => {
 
   // 如果没找到关键词，返回前200字符
   return content.substring(0, 200) + (content.length > 200 ? '...' : '')
+}
+
+const readEventStream = async (res, handlers = {}) => {
+  if (!res.body) throw new Error('浏览器不支持流式响应')
+
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder('utf-8')
+  let buffer = ''
+
+  const handleEvent = (event) => {
+    const dataLine = event.split('\n').find(line => line.startsWith('data: '))
+    if (!dataLine) return
+
+    const payload = JSON.parse(dataLine.slice(6))
+    if (payload.type === 'chunk') handlers.onChunk?.(payload.data)
+    if (payload.type === 'sources') handlers.onSources?.(payload.data)
+    if (payload.type === 'understanding') handlers.onUnderstanding?.(payload.data)
+    if (payload.type === 'evaluation') handlers.onEvaluation?.(payload.data)
+    if (payload.type === 'done') handlers.onDone?.(payload)
+  }
+
+  while (true) {
+    const { value, done } = await reader.read()
+    if (done) break
+
+    buffer += decoder.decode(value, { stream: true })
+    buffer = buffer.replace(/\r\n/g, '\n')
+    const events = buffer.split('\n\n')
+    buffer = events.pop() || ''
+
+    for (const event of events) {
+      handleEvent(event)
+    }
+  }
+
+  buffer += decoder.decode()
+  if (buffer.trim()) handleEvent(buffer)
 }
 
 onMounted(() => {
@@ -912,8 +1075,82 @@ onMounted(() => {
   margin-bottom: 0.25rem;
 }
 
+.query-hit-count {
+  margin-left: 0.5rem;
+  padding: 0.1rem 0.4rem;
+  border-radius: 0.25rem;
+  background: #e7e3da;
+  color: #4b5563;
+  font-size: 0.75rem;
+  font-weight: 500;
+}
+
+.matched-queries {
+  margin: 0.35rem 0 0.5rem;
+  padding: 0.5rem;
+  background: #f7f5f1;
+  border-radius: 0.25rem;
+  color: #4b5563;
+}
+
+.matched-title {
+  margin-bottom: 0.25rem;
+  color: #3c5a78;
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.matched-query {
+  line-height: 1.4;
+  word-break: break-word;
+}
+
 .context-text {
   color: #6b7077;
+  line-height: 1.5;
+}
+
+.evaluation {
+  margin-top: 0.75rem;
+  padding: 1rem;
+  background: #eef6ff;
+  border-left: 3px solid #2563eb;
+  border-radius: 0.25rem;
+  font-size: 0.875rem;
+}
+
+.evaluation-header {
+  font-weight: 600;
+  margin-bottom: 0.75rem;
+  color: #1d4ed8;
+}
+
+.evaluation-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 0.5rem;
+}
+
+.evaluation-item {
+  padding: 0.5rem;
+  background: white;
+  border-radius: 0.25rem;
+}
+
+.evaluation-item span {
+  display: block;
+  color: #64748b;
+  font-size: 0.75rem;
+  margin-bottom: 0.2rem;
+}
+
+.evaluation-item strong {
+  color: #1e3a8a;
+}
+
+.evaluation-note {
+  margin-top: 0.75rem;
+  color: #475569;
   line-height: 1.5;
 }
 

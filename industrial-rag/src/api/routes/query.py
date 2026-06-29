@@ -15,6 +15,11 @@ logger = get_logger(__name__)
 router = APIRouter()
 
 
+def _stream_text_chunks(text: str, chunk_size: int = 24):
+    for index in range(0, len(text), chunk_size):
+        yield text[index : index + chunk_size]
+
+
 class QueryRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=1000)
     top_k: int = Field(default=5, ge=1, le=50)
@@ -126,7 +131,8 @@ async def answer_question(request: AnswerRequest) -> AnswerResponse | StreamingR
                     message = "抱歉，我在知识库中没有找到足够相关的信息来回答这个问题。"
                     yield f"data: {json.dumps({'type': 'chunk', 'data': message}, ensure_ascii=False)}\n\n"
                 else:
-                    async for chunk in generator.generate_stream(request.query, results):
+                    answer = await generator.generate(query=request.query, context_docs=results)
+                    for chunk in _stream_text_chunks(answer):
                         yield f"data: {json.dumps({'type': 'chunk', 'data': chunk}, ensure_ascii=False)}\n\n"
                 yield f"data: {json.dumps({'type': 'done', 'total_time': time.time() - start}, ensure_ascii=False)}\n\n"
 

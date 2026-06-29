@@ -50,8 +50,13 @@ reranker:
   model_name: "BAAI/bge-reranker-v2-m3"
   model_path: "E:/RAG/models/bge-reranker-v2-m3"
   device: "cuda"
-  batch_size: 8
+  batch_size: 1
+  max_length: 512
   top_n: 5
+  # 重排后的绝对相关性阈值，作用于 sigmoid(logit) 校准概率（跨 query 可比）。
+  # 低于此值的文档被丢弃，允许返回 0 条（"无相关法条" 是合法答案）。
+  # null = 关闭阈值过滤（仅按概率排序后取 top_n）。需在真实法律语料上校准后再设值，建议从 0.5 起步。
+  score_threshold: null
 
 postgres:
   host: "localhost"
@@ -114,7 +119,9 @@ rag:
     use_postgres: true
     enable_hybrid: true
     top_k: 5
-    similarity_threshold: 0.2
+    # 重排前的召回分兜底阈值，仅挡掉完全无关的召回；真正的相关性裁决交给重排器
+    # （reranker.score_threshold，作用于 sigmoid 校准概率）。
+    similarity_threshold: 0.05
     enable_rerank: true
     rerank_candidate_multiplier: 4
     rerank_min_candidates: 20
@@ -126,6 +133,8 @@ rag:
     query_understanding:
       enable_coreference: true
       enable_decomposition: true
+      # 查询改写：把口语/场景化提问改写成法言法语再检索（原查询+改写查询合并）。
+      enable_rewrite: true
       max_subqueries: 3
   generation:
     system_prompt: |

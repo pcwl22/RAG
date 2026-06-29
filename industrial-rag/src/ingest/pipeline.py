@@ -1,11 +1,12 @@
 """Document ingestion pipeline."""
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Any
 
 from src.core.config import get_settings
-from src.models.embedding import encode_texts
+from src.models.embedding import encode_texts, get_embedding_runtime_info
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -233,6 +234,7 @@ async def process_document(
 ) -> dict[str, Any]:
     """Parse, chunk, embed and store a document."""
     logger.info("Processing document: %s", filename)
+    pipeline_start = time.perf_counter()
 
     try:
         text = parse_document(file_path)
@@ -242,6 +244,7 @@ async def process_document(
         cfg = _chunking_config()
         strategy = cfg.get("strategy", "recursive")
         child_chunks: list[dict[str, Any]] | None = None
+        chunk_start = time.perf_counter()
 
         if strategy == "parent_child":
             from src.ingest.parent_child_chunking import chunk_text_parent_child
@@ -252,17 +255,36 @@ async def process_document(
         else:
             chunks = chunk_text(text)
 
+        chunk_elapsed = time.perf_counter() - chunk_start
+
         if not chunks:
             raise ValueError("No chunks generated")
 
         document_id = str(uuid.uuid4())
         batch_size = int(_doc_processing_config().get("batch_size", 16))
         embeddings: list[list[float]] = []
+        embedding_runtime = get_embedding_runtime_info()
+        embedding_start = time.perf_counter()
 
-        logger.info("Embedding %s chunks", len(chunks))
+        logger.info(
+            "Embedding %s chunks",
+            len(chunks),
+            extra={
+                "document_id": document_id,
+                "filename": filename,
+                "chunk_strategy": strategy,
+                "chunk_count": len(chunks),
+                "chunk_duration_seconds": round(chunk_elapsed, 4),
+                "embedding_device": embedding_runtime["resolved_device"],
+                "embedding_gpu_name": embedding_runtime["gpu_name"],
+                "cuda_available": embedding_runtime["cuda_available"],
+            },
+        )
         for start in range(0, len(chunks), batch_size):
             batch = chunks[start : start + batch_size]
             embeddings.extend(encode_texts(batch, batch_size=len(batch)))
+
+        embedding_elapsed = time.perf_counter() - embedding_start
 
         base_metadata = metadata or {}
         chunk_ids: list[str] = []
@@ -305,7 +327,22 @@ async def process_document(
             partition=partition,
         )
 
-        logger.info("Document processed successfully: %s", document_id)
+        total_elapsed = time.perf_counter() - pipeline_start
+        logger.info(
+            "Document processed successfully: %s",
+            document_id,
+            extra={
+                "document_id": document_id,
+                "filename": filename,
+                "chunk_strategy": strategy,
+                "chunk_count": len(chunks),
+                "chunk_duration_seconds": round(chunk_elapsed, 4),
+                "embedding_duration_seconds": round(embedding_elapsed, 4),
+                "pipeline_duration_seconds": round(total_elapsed, 4),
+                "embedding_device": embedding_runtime["resolved_device"],
+                "embedding_gpu_name": embedding_runtime["gpu_name"],
+            },
+        )
         return {"document_id": document_id, "total_chunks": len(chunks), "status": "completed"}
 
     except Exception as exc:

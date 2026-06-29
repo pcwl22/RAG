@@ -31,7 +31,8 @@ def load_reranker() -> Any:
 
         model_path = cfg.get("model_path", "E:/RAG/models/bge-reranker-v2-m3")
         device = cfg.get("device", "cuda")
-        _reranker_model = CrossEncoder(model_path, device=device)
+        max_length = cfg.get("max_length")
+        _reranker_model = CrossEncoder(model_path, device=device, max_length=max_length)
         logger.info(f"Reranker loaded successfully from {model_path}")
         return _reranker_model
     except Exception as e:
@@ -55,39 +56,55 @@ def rerank_documents(
 
     cfg = _reranker_config()
     batch_size = cfg.get("batch_size", 8)
-    score_weight = float(cfg.get("score_weight", 0.85))
-    score_weight = min(1.0, max(0.0, score_weight))
+    # Absolute relevance threshold on the sigmoid-calibrated rerank probability.
+    # null/None disables threshold filtering (only top_n is applied).
+    threshold = cfg.get("score_threshold")
+    if threshold is not None:
+        threshold = float(threshold)
 
     pairs = [[query, doc["content"]] for doc in documents]
 
     try:
         scores = reranker.predict(pairs, batch_size=batch_size)
         raw_scores = [float(score) for score in scores]
-        min_score = min(raw_scores)
-        max_score = max(raw_scores)
-        score_range = max_score - min_score
 
         for doc, raw_score in zip(documents, raw_scores):
-            vector_score = float(doc.get("score", 0.0))
-            rerank_score = 0.5 if score_range == 0 else (raw_score - min_score) / score_range
-            fused_score = score_weight * rerank_score + (1.0 - score_weight) * vector_score
+            # BGE-reranker's CrossEncoder has default_activation_function=Sigmoid,
+            # so predict() ALREADY returns a calibrated relevance probability in
+            # [0, 1] that is comparable across queries. Use it directly — applying
+            # sigmoid a second time would squash [0,1] into [0.5, 0.73] and destroy
+            # the separation between relevant and irrelevant documents.
+            rerank_prob = raw_score
 
             metadata = doc.setdefault("metadata", {})
-            metadata["vector_score"] = vector_score
+            # Keep retrieval scores for diagnostics, but do NOT fuse them into
+            # the final ordering: on legal text embedding/BM25 scores are noisy
+            # and would only dilute the cross-encoder's sharper judgement.
+            metadata["vector_score"] = float(doc.get("score", 0.0))
             metadata["rerank_raw_score"] = raw_score
-            metadata["rerank_score"] = rerank_score
-            metadata["rerank_score_weight"] = score_weight
-            doc["score"] = fused_score
+            metadata["rerank_prob"] = rerank_prob
+            doc["score"] = rerank_prob
 
+        # Rank purely by cross-encoder probability.
         reranked = sorted(documents, key=lambda x: x["score"], reverse=True)
-        if top_n:
-            reranked = reranked[:top_n]
 
+        # Absolute threshold filtering. Allowed to return 0 docs — "no relevant
+        # law found" is a valid and important answer in the legal domain.
+        if threshold is not None:
+            kept = [doc for doc in reranked if doc["score"] >= threshold]
+        else:
+            kept = reranked
+
+        # top_n is an UPPER bound only, never a lower bound.
+        if top_n:
+            kept = kept[:top_n]
+
+        top_score = kept[0]["score"] if kept else 0.0
         logger.info(
-            f"Reranked {len(documents)} -> {len(reranked)} docs, "
-            f"top score: {reranked[0]['score']:.3f}"
+            f"Reranked {len(documents)} docs -> {len(kept)} kept "
+            f"(threshold={threshold}, top prob={top_score:.3f})"
         )
-        return reranked
+        return kept
     except Exception as e:
         logger.error(f"Reranking failed: {e}, falling back to original order")
         return documents[:top_n] if top_n else documents

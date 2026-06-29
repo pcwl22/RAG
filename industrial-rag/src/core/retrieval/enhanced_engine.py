@@ -44,20 +44,22 @@ class EnhancedRetrievalEngine:
             qu_config = self.config.get("query_understanding", {})
             enable_coreference = qu_config.get("enable_coreference", True)
             enable_decomposition = qu_config.get("enable_decomposition", True)
+            enable_rewrite = qu_config.get("enable_rewrite", True)
 
             understanding_result = await self.query_understanding.understand_query(
                 query=query,
                 chat_history=chat_history,
                 enable_coreference=enable_coreference,
                 enable_decomposition=enable_decomposition,
+                enable_rewrite=enable_rewrite,
             )
 
             logger.info(
-                f"Query understanding: {len(understanding_result['subqueries'])} subqueries, "
+                f"Query understanding: {len(understanding_result.get('retrieval_queries', []))} retrieval queries, "
                 f"decomposed={understanding_result.get('is_decomposed', False)}"
             )
 
-        subqueries = understanding_result["subqueries"]
+        subqueries = understanding_result.get("retrieval_queries") or understanding_result["subqueries"]
 
         # Step 2: Retrieve for each subquery
         if len(subqueries) == 1:

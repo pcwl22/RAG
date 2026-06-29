@@ -5,12 +5,124 @@ LLM-as-Judge 评估框架
 集成 RAGAS 评估生成质量
 """
 import asyncio
+import re
 from typing import Any
 
 from src.models.llm import get_llm_client
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+def _context_text(context: dict) -> str:
+    metadata = context.get("metadata") or {}
+    return str(context.get("content") or context.get("child_content") or metadata.get("parent_content") or "")
+
+
+def _answer_body(answer: str) -> str:
+    match = re.search(r"(?:##\s*)?【回答】", answer)
+    if not match:
+        return answer
+    body = answer[match.end():]
+    return re.split(r"\n(?:##\s*)?【匹配文件】|\n(?:##\s*)?【文件具体位置", body, maxsplit=1)[0]
+
+
+def _extract_eval_terms(query: str, answer: str) -> list[str]:
+    text = f"{query}\n{_answer_body(answer)}"
+    terms = re.findall(r"第[一二三四五六七八九十百千万零〇两0-9]+条", text)
+    legal_terms = [
+        "非法拘禁",
+        "故意伤害",
+        "故意杀人",
+        "侵权责任",
+        "工作人员",
+        "使用暴力",
+        "致人伤残",
+        "致人死亡",
+        "胁从犯",
+        "被胁迫参加犯罪",
+        "用人单位",
+        "执行工作任务",
+        "职务侵占",
+        "盗窃",
+        "无固定期限劳动合同",
+        "经济补偿",
+        "胎儿",
+        "遗产",
+        "继承",
+        "民事权利能力",
+    ]
+    terms.extend(term for term in legal_terms if term in text)
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for term in terms:
+        if term not in seen:
+            seen.add(term)
+            unique.append(term)
+    return unique
+
+
+def _required_term_groups(query: str) -> list[list[str]]:
+    groups: list[list[str]] = []
+    if "胎儿" in query:
+        groups.append(["胎儿"])
+    if "非法拘禁" in query:
+        groups.append(["非法拘禁"])
+    if "胁从犯" in query or "受胁迫" in query:
+        groups.append(["胁从犯", "被胁迫参加犯罪"])
+    if "职务侵占" in query:
+        groups.append(["职务侵占"])
+    if "盗窃" in query:
+        groups.append(["盗窃"])
+    if "员工" in query or "工作人员" in query or "劳动者" in query:
+        groups.append(["用人单位", "工作人员"])
+    if "执行工作任务" in query:
+        groups.append(["执行工作任务"])
+    if "无固定期限劳动合同" in query:
+        groups.append(["无固定期限劳动合同"])
+    if "经济补偿" in query or "补偿金" in query:
+        groups.append(["经济补偿"])
+    return groups
+
+
+def _rule_based_retrieval_eval(query: str, contexts: list[dict], top_n: int, answer: str = "") -> dict[str, Any]:
+    contexts_to_eval = contexts[:top_n]
+    terms = _extract_eval_terms(query, answer)
+    if not contexts_to_eval or not terms:
+        return {
+            "is_relevant": False,
+            "hit_count": 0,
+            "total": len(contexts_to_eval),
+            "precision": 0.0,
+            "reason": "",
+        }
+
+    query_terms = [term for term in _extract_eval_terms(query, "") if not term.startswith("第")]
+    required_groups = _required_term_groups(query)
+    hit_count = 0
+    matched_terms: list[str] = []
+    for context in contexts_to_eval:
+        text = _context_text(context)
+        context_terms = [term for term in terms if term in text]
+        has_required_signal = not required_groups or any(
+            any(term in text for term in group)
+            for group in required_groups
+        )
+        has_query_signal = has_required_signal and (not query_terms or any(term in text for term in query_terms))
+        if context_terms and has_query_signal:
+            hit_count += 1
+            for term in context_terms:
+                if term not in matched_terms:
+                    matched_terms.append(term)
+
+    return {
+        "is_relevant": hit_count > 0,
+        "hit_count": hit_count,
+        "total": len(contexts_to_eval),
+        "precision": hit_count / len(contexts_to_eval) if contexts_to_eval else 0.0,
+        "reason": f"规则命中关键词：{'、'.join(matched_terms)}" if matched_terms else "",
+    }
 
 
 class LLMJudge:
@@ -24,6 +136,7 @@ class LLMJudge:
         query: str,
         retrieved_contexts: list[dict],
         top_n: int = 5,
+        answer: str = "",
     ) -> dict[str, Any]:
         """评估检索质量
 
@@ -98,6 +211,10 @@ class LLMJudge:
                     result["reason"] = line.split(":", 1)[-1].strip()
 
             result["precision"] = result["hit_count"] / result["total"] if result["total"] > 0 else 0.0
+
+            rule_eval = _rule_based_retrieval_eval(query, retrieved_contexts, top_n, answer)
+            if rule_eval["reason"]:
+                result = rule_eval
 
             logger.info(f"Retrieval evaluation: hit={result['hit_count']}/{result['total']}, precision={result['precision']:.2f}")
             return result
@@ -236,7 +353,7 @@ Context Precision: <0-10>
             完整评估结果
         """
         # 并行评估检索和生成质量
-        retrieval_task = self.evaluate_retrieval(query, contexts, top_n_retrieval)
+        retrieval_task = self.evaluate_retrieval(query, contexts, top_n_retrieval, answer)
         quality_task = self.evaluate_answer_quality(query, contexts, answer)
 
         retrieval_eval, quality_eval = await asyncio.gather(

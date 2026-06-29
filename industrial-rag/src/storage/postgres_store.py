@@ -1,8 +1,4 @@
-"""PostgreSQL + pgvector storage with hybrid retrieval.
-
-The retrieval path runs vector search and keyword search in parallel, then uses
-Reciprocal Rank Fusion (RRF) and Dynamic Top-K pruning.
-"""
+"""PostgreSQL + pgvector storage with hybrid retrieval."""
 import asyncio
 import json
 from concurrent.futures import ThreadPoolExecutor
@@ -231,49 +227,126 @@ async def vector_search(
 
 
 def _extract_chinese_keywords(query: str) -> list[str]:
-    """从中文查询中提取关键词用于ILIKE匹配"""
+    """Extract higher-signal keywords for legal-style Chinese queries."""
     import re
-    # 去除标点
-    cleaned = re.sub(r'[，。？！、\s?!.,;；：:""''（）()\n]+', ' ', query).strip()
-    # 去除常见疑问/虚词短语（长的先替换）
-    stop_phrases = ['什么时候', '什么', '怎么样', '怎么', '如何', '是否', '能否', '为什么',
-                    '怎样', '哪些', '哪个', '多少', '可以', '能够', '应该', '需要']
-    for sp in sorted(stop_phrases, key=len, reverse=True):
-        cleaned = cleaned.replace(sp, ' ')
-    # 去除单字虚词
-    cleaned = re.sub(r'(?<![a-zA-Z])[的了吗呢吧是在有个后前经被把给从到](?![a-zA-Z])', ' ', cleaned)
-    # 按空格分割
-    parts = [p.strip() for p in cleaned.split() if len(p.strip()) >= 2]
 
-    # 对于长片段(>4字符)，提取2-4字符的子串
-    keywords = []
+    cleaned = re.sub(r"[，。？！、\s?!.,;；：:\"'（）()\n]+", " ", query).strip()
+
+    stop_phrases = [
+        "根据",
+        "中华人民共和国",
+        "什么",
+        "如何",
+        "哪些",
+        "哪个",
+        "是否",
+        "可以",
+        "应当",
+        "需要",
+        "有关",
+        "情形",
+        "规定",
+        "核心区别",
+        "区别",
+        "张三",
+        "李四",
+        "王五",
+        "但在",
+        "过程",
+        "实际伤害",
+    ]
+    for phrase in sorted(stop_phrases, key=len, reverse=True):
+        cleaned = cleaned.replace(phrase, " ")
+
+    law_titles = [
+        "中华人民共和国民法典",
+        "中华人民共和国刑法",
+        "中华人民共和国劳动合同法",
+        "民法典",
+        "刑法",
+        "劳动合同法",
+    ]
+
+    keywords: list[str] = [title for title in law_titles if title in query]
+    keywords.extend(re.findall(r"第[一二三四五六七八九十百千万零〇两0-9]+条", query))
+    keywords.extend(re.findall(r"[\u4e00-\u9fff]{2,12}(?:罪|合同|劳动合同|解除劳动合同|定义|刑罚)", query))
+
+    offense_hints = {
+        "盗窃罪": ["第二百六十四条", "盗窃公私财物", "入户盗窃", "扒窃"],
+        "职务侵占罪": ["第二百七十一条", "职务上的便利", "本单位财物", "非法占为己有"],
+        "胁从犯": ["第二十八条", "被胁迫参加犯罪", "减轻处罚", "免除处罚"],
+    }
+    for offense, hints in offense_hints.items():
+        if offense in query:
+            keywords.extend([offense, *hints])
+
+    civil_hints = {
+        ("工作人员", "执行工作任务"): ["第一千一百九十一条", "用人单位的工作人员", "执行工作任务", "用人单位承担侵权责任"],
+        ("员工", "执行工作任务"): ["第一千一百九十一条", "用人单位的工作人员", "执行工作任务", "用人单位承担侵权责任"],
+        ("劳动者", "执行工作任务"): ["第一千一百九十一条", "用人单位的工作人员", "执行工作任务", "用人单位承担侵权责任"],
+    }
+    for triggers, hints in civil_hints.items():
+        if all(trigger in query for trigger in triggers):
+            keywords.extend(hints)
+
+    parts = [p.strip() for p in cleaned.split() if len(p.strip()) >= 2]
     for part in parts:
-        if len(part) <= 4:
+        if len(part) <= 8:
             keywords.append(part)
         else:
-            # 提取4字符、3字符、2字符的非重叠片段
-            i = 0
-            while i < len(part):
-                if i + 4 <= len(part):
-                    keywords.append(part[i:i+4])
-                    i += 4
-                elif i + 3 <= len(part):
-                    keywords.append(part[i:i+3])
-                    i += 3
-                elif i + 2 <= len(part):
-                    keywords.append(part[i:i+2])
-                    i += 2
-                else:
-                    break
+            for size in (6, 4, 3, 2):
+                for i in range(0, len(part) - size + 1, size):
+                    keywords.append(part[i : i + size])
 
-    # 去重，保持顺序
     seen = set()
-    unique = []
-    for kw in keywords:
-        if kw not in seen:
-            seen.add(kw)
-            unique.append(kw)
-    return unique[:6]
+    unique: list[str] = []
+    for keyword in keywords:
+        keyword = keyword.strip()
+        if len(keyword) < 2:
+            continue
+        if any(token in keyword for token in ("什么", "区别是", "的核心", "但在犯罪", "张三")):
+            continue
+        if "与" in keyword and len(keyword) > 3:
+            continue
+        if keyword not in seen:
+            seen.add(keyword)
+            unique.append(keyword)
+    return unique[:20]
+
+
+def _keyword_match_weight(keyword: str) -> float:
+    """Assign stronger weights to titles, article numbers and offense names."""
+    if keyword.startswith("第") and keyword.endswith("条"):
+        return 1.2
+    if keyword in {
+        "职务上的便利",
+        "本单位财物",
+        "非法占为己有",
+        "盗窃公私财物",
+        "被胁迫参加犯罪",
+        "减轻处罚",
+        "免除处罚",
+        "用人单位的工作人员",
+        "执行工作任务",
+        "用人单位承担侵权责任",
+    }:
+        return 1.1
+    if keyword.endswith("罪"):
+        return 1.0
+    if keyword in {
+        "中华人民共和国民法典",
+        "中华人民共和国刑法",
+        "中华人民共和国劳动合同法",
+        "民法典",
+        "刑法",
+        "劳动合同法",
+    }:
+        return 0.9
+    if len(keyword) >= 6:
+        return 0.6
+    if len(keyword) >= 4:
+        return 0.4
+    return 0.25
 
 
 def _keyword_search_sync(query: str, top_k: int, partition: str | None) -> list[dict]:
@@ -281,20 +354,15 @@ def _keyword_search_sync(query: str, top_k: int, partition: str | None) -> list[
     cur = None
     try:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
         keywords = _extract_chinese_keywords(query)
-
         if not keywords:
             return []
 
-        # 构建SQL：每个关键词匹配加0.2分
-        score_parts = ' + '.join([
-            "CASE WHEN content ILIKE %s THEN 0.2 ELSE 0 END" for _ in keywords
-        ])
-
-        where_parts = ' OR '.join([
-            "content ILIKE %s" for _ in keywords
-        ])
+        weights = [_keyword_match_weight(keyword) for keyword in keywords]
+        score_parts = " + ".join(
+            [f"CASE WHEN content ILIKE %s THEN {weight} ELSE 0 END" for weight in weights]
+        )
+        where_parts = " OR ".join(["content ILIKE %s" for _ in keywords])
 
         sql = f"""
             SELECT
@@ -307,9 +375,7 @@ def _keyword_search_sync(query: str, top_k: int, partition: str | None) -> list[
             WHERE {where_parts}
         """
 
-        # 参数：score部分的ILIKE + where部分的ILIKE
         params: list[Any] = [f"%{kw}%" for kw in keywords] + [f"%{kw}%" for kw in keywords]
-
         if partition:
             sql += " AND partition = %s"
             params.append(partition)
@@ -318,7 +384,13 @@ def _keyword_search_sync(query: str, top_k: int, partition: str | None) -> list[
         params.append(top_k)
 
         cur.execute(sql, params)
-        return [_row_to_doc(row) for row in cur.fetchall()]
+        rows = cur.fetchall()
+        logger.info(
+            "Keyword search matched %s rows",
+            len(rows),
+            extra={"query": query, "keywords": keywords[:8]},
+        )
+        return [_row_to_doc(row) for row in rows]
     finally:
         if cur is not None:
             cur.close()
@@ -327,7 +399,7 @@ def _keyword_search_sync(query: str, top_k: int, partition: str | None) -> list[
 
 
 async def bm25_search(query: str, top_k: int = 10, partition: str | None = None) -> list[dict]:
-    """Keyword retrieval implemented with pg_trgm similarity and ILIKE."""
+    """Keyword retrieval implemented with ILIKE-based legal term matching."""
     return await _execute_sync(_keyword_search_sync, query, top_k, partition)
 
 

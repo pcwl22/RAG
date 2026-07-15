@@ -9,9 +9,6 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-import psycopg2
-import psycopg2.extras
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -51,6 +48,11 @@ def _domain(law_name: str) -> str | None:
 
 
 def _load_articles() -> dict[str, list[dict[str, Any]]]:
+    # Keep the database driver optional at module-import time so CI can test
+    # the deterministic suite builder without installing PostgreSQL extras.
+    import psycopg2
+    import psycopg2.extras
+
     cfg = get_settings()["postgres"]
     connection = psycopg2.connect(
         host=cfg["host"], port=cfg["port"], database=cfg["database"],

@@ -31,7 +31,7 @@ def _markdown_table(columns: list[str], rows: list[list[str]]) -> str:
 
 def parse_text(file_path: str) -> str:
     """Read a UTF-8 text or markdown file."""
-    with open(file_path, "r", encoding="utf-8") as f:
+    with open(file_path, encoding="utf-8") as f:
         return f.read()
 
 

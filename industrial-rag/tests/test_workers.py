@@ -1,5 +1,7 @@
 """Worker task tests."""
 
+import pytest
+
 from app.workers import tasks
 
 
@@ -26,3 +28,20 @@ def test_process_document_task_runner_uses_ingest_service(monkeypatch):
     assert result["status"] == "completed"
     assert result["total_chunks"] == 2
     assert result["metadata"] == {"source": "test"}
+
+
+def test_process_document_failure_raises_and_preserves_source(monkeypatch, tmp_path):
+    source = tmp_path / "retry.txt"
+    source.write_text("data", encoding="utf-8")
+
+    async def fake_process_document(*args, **kwargs):
+        return {"status": "failed", "error": "embedding unavailable"}
+
+    import app.service.ingest_service as ingest_service
+
+    monkeypatch.setattr(ingest_service, "process_document", fake_process_document)
+
+    with pytest.raises(RuntimeError, match="embedding unavailable"):
+        tasks._run_process_document(str(source), source.name)
+
+    assert source.exists()

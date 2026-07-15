@@ -1,6 +1,7 @@
 """BGE reranker wrapper."""
 from typing import Any
 
+from app.embedding.embedder import resolve_torch_device
 from app.utils.config import get_settings
 from app.utils.logger import get_logger
 
@@ -30,7 +31,7 @@ def load_reranker() -> Any:
         from sentence_transformers import CrossEncoder
 
         model_path = cfg.get("model_path", "E:/RAG/models/bge-reranker-v2-m3")
-        device = cfg.get("device", "cuda")
+        device = resolve_torch_device(cfg.get("device", "cuda"))
         max_length = cfg.get("max_length")
         _reranker_model = CrossEncoder(model_path, device=device, max_length=max_length)
         logger.info(f"Reranker loaded successfully from {model_path}")
@@ -68,12 +69,12 @@ def rerank_documents(
         scores = reranker.predict(pairs, batch_size=batch_size)
         raw_scores = [float(score) for score in scores]
 
-        for doc, raw_score in zip(documents, raw_scores):
-            # BGE-reranker's CrossEncoder has default_activation_function=Sigmoid,
-            # so predict() ALREADY returns a calibrated relevance probability in
-            # [0, 1] that is comparable across queries. Use it directly — applying
-            # sigmoid a second time would squash [0,1] into [0.5, 0.73] and destroy
-            # the separation between relevant and irrelevant documents.
+        for doc, raw_score in zip(documents, raw_scores, strict=True):
+            # CrossEncoder predict() already applies its configured activation.
+            # Keep the value unchanged: applying sigmoid again would squash the
+            # score range. Scores from differently worded expansion queries still
+            # express relevance to different questions, so the enhanced service
+            # performs a final common-query rerank before comparing them.
             rerank_prob = raw_score
 
             metadata = doc.setdefault("metadata", {})

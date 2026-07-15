@@ -65,6 +65,21 @@ def _connection():
     return _pool.getconn()
 
 
+def _return_connection(conn: Any) -> None:
+    """Return a clean connection to the pool, discarding it if rollback fails."""
+    if _pool is None:
+        return
+    discard = False
+    try:
+        # psycopg2 leaves failed statements in an aborted transaction.  A
+        # rollback is also safe after a commit/read-only transaction.
+        conn.rollback()
+    except Exception:
+        discard = True
+        logger.warning("Discarding PostgreSQL connection after rollback failure", exc_info=True)
+    _pool.putconn(conn, close=discard)
+
+
 def _create_schema_sync() -> None:
     conn = _connection()
     cur = None
@@ -91,7 +106,20 @@ def _create_schema_sync() -> None:
             ON documents USING gin (content gin_trgm_ops);
             """
         )
+        # Match the exact expression used by keyword retrieval, including metadata.
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_documents_search_trgm
+            ON documents USING gin ((content || ' ' || COALESCE(metadata::text, '')) gin_trgm_ops);
+            """
+        )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_documents_partition ON documents (partition);")
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_documents_document_id
+            ON documents ((metadata->>'document_id'));
+            """
+        )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_documents_metadata ON documents USING gin (metadata);")
         cur.execute(
             """
@@ -103,8 +131,7 @@ def _create_schema_sync() -> None:
     finally:
         if cur is not None:
             cur.close()
-        if _pool is not None:
-            _pool.putconn(conn)
+        _return_connection(conn)
 
 
 async def close_postgres_store() -> None:
@@ -174,8 +201,7 @@ def _add_documents_sync(
     finally:
         if cur is not None:
             cur.close()
-        if _pool is not None:
-            _pool.putconn(conn)
+        _return_connection(conn)
 
 
 async def add_documents(
@@ -214,8 +240,7 @@ def _vector_search_sync(
     finally:
         if cur is not None:
             cur.close()
-        if _pool is not None:
-            _pool.putconn(conn)
+        _return_connection(conn)
 
 
 async def vector_search(
@@ -224,6 +249,79 @@ async def vector_search(
     partition: str | None = None,
 ) -> list[dict]:
     return await _execute_sync(_vector_search_sync, query_embedding, top_k, partition)
+
+
+def _get_documents_by_ids_sync(ids: list[str], partition: str | None) -> list[dict]:
+    if not ids:
+        return []
+    conn = _connection()
+    cur = None
+    try:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        sql = "SELECT id, content, metadata, partition FROM documents WHERE id = ANY(%s)"
+        params: list[Any] = [ids]
+        if partition:
+            sql += " AND partition = %s"
+            params.append(partition)
+        sql += " ORDER BY array_position(%s::text[], id)"
+        params.append(ids)
+        cur.execute(sql, params)
+        docs = [_row_to_doc(row) for row in cur.fetchall()]
+        for doc in docs:
+            doc["score"] = 1.0
+            doc["mapped_article_exact_match"] = True
+        return docs
+    finally:
+        if cur is not None:
+            cur.close()
+        _return_connection(conn)
+
+
+async def get_documents_by_ids(ids: list[str], partition: str | None = None) -> list[dict]:
+    """Fetch controlled statute chunks by their exact primary keys."""
+    return await _execute_sync(_get_documents_by_ids_sync, ids, partition)
+
+
+def _get_documents_by_citations_sync(
+    article_numbers: list[str], law_names: list[str], partition: str | None
+) -> list[dict]:
+    if not article_numbers or not law_names:
+        return []
+    conn = _connection()
+    cur = None
+    try:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        sql = """
+            SELECT id, content, metadata, partition
+            FROM documents
+            WHERE metadata->>'article_number' = ANY(%s)
+              AND metadata->>'law_name' = ANY(%s)
+        """
+        params: list[Any] = [article_numbers, law_names]
+        if partition:
+            sql += " AND partition = %s"
+            params.append(partition)
+        sql += " ORDER BY array_position(%s::text[], metadata->>'article_number')"
+        params.append(article_numbers)
+        cur.execute(sql, params)
+        docs = [_row_to_doc(row) for row in cur.fetchall()]
+        for doc in docs:
+            doc["score"] = 1.0
+            doc["explicit_citation_exact_match"] = True
+        return docs
+    finally:
+        if cur is not None:
+            cur.close()
+        _return_connection(conn)
+
+
+async def get_documents_by_citations(
+    article_numbers: list[str], law_names: list[str], partition: str | None = None
+) -> list[dict]:
+    """Fetch provisions explicitly named by law and article in the query."""
+    return await _execute_sync(
+        _get_documents_by_citations_sync, article_numbers, law_names, partition
+    )
 
 
 def _extract_chinese_keywords(query: str) -> list[str]:
@@ -268,6 +366,9 @@ def _extract_chinese_keywords(query: str) -> list[str]:
     ]
 
     keywords: list[str] = [title for title in law_titles if title in query]
+    keywords.extend(
+        re.findall(r"[\u4e00-\u9fffA-Za-z0-9]+(?:_[\u4e00-\u9fffA-Za-z0-9]+)+", query)
+    )
     keywords.extend(re.findall(r"第[一二三四五六七八九十百千万零〇两0-9]+条", query))
     keywords.extend(re.findall(r"[\u4e00-\u9fff]{2,12}(?:罪|合同|劳动合同|解除劳动合同|定义|刑罚)", query))
 
@@ -298,6 +399,8 @@ def _extract_chinese_keywords(query: str) -> list[str]:
 
 def _keyword_match_weight(keyword: str) -> float:
     """Assign stronger weights to titles, article numbers and offense names."""
+    if "_" in keyword and keyword.endswith("条"):
+        return 1.5
     if keyword.startswith("第") and keyword.endswith("条"):
         return 1.2
     if keyword in {
@@ -340,11 +443,12 @@ def _keyword_search_sync(query: str, top_k: int, partition: str | None) -> list[
         if not keywords:
             return []
 
+        search_expr = "(content || ' ' || COALESCE(metadata::text, ''))"
         weights = [_keyword_match_weight(keyword) for keyword in keywords]
         score_parts = " + ".join(
-            [f"CASE WHEN content ILIKE %s THEN {weight} ELSE 0 END" for weight in weights]
+            [f"CASE WHEN {search_expr} ILIKE %s THEN {weight} ELSE 0 END" for weight in weights]
         )
-        where_parts = " OR ".join(["content ILIKE %s" for _ in keywords])
+        where_parts = " OR ".join([f"{search_expr} ILIKE %s" for _ in keywords])
 
         sql = f"""
             SELECT
@@ -354,7 +458,7 @@ def _keyword_search_sync(query: str, top_k: int, partition: str | None) -> list[
                 metadata,
                 partition
             FROM documents
-            WHERE {where_parts}
+            WHERE ({where_parts})
         """
 
         params: list[Any] = [f"%{kw}%" for kw in keywords] + [f"%{kw}%" for kw in keywords]
@@ -376,8 +480,7 @@ def _keyword_search_sync(query: str, top_k: int, partition: str | None) -> list[
     finally:
         if cur is not None:
             cur.close()
-        if _pool is not None:
-            _pool.putconn(conn)
+        _return_connection(conn)
 
 
 async def bm25_search(query: str, top_k: int = 10, partition: str | None = None) -> list[dict]:
@@ -490,15 +593,22 @@ def _delete_document_sync(document_id: str) -> None:
     finally:
         if cur is not None:
             cur.close()
-        if _pool is not None:
-            _pool.putconn(conn)
+        _return_connection(conn)
 
 
 async def delete_document(document_id: str) -> None:
     await _execute_sync(_delete_document_sync, document_id)
+    try:
+        from app.utils.cache import invalidate_semantic_cache
+
+        await invalidate_semantic_cache()
+    except Exception:
+        logger.debug("Semantic cache invalidation unavailable", exc_info=True)
 
 
 def _list_documents_sync(skip: int, limit: int) -> list[dict]:
+    skip = max(0, int(skip))
+    limit = max(1, min(int(limit), 1000))
     conn = _connection()
     cur = None
     try:
@@ -523,9 +633,72 @@ def _list_documents_sync(skip: int, limit: int) -> list[dict]:
     finally:
         if cur is not None:
             cur.close()
-        if _pool is not None:
-            _pool.putconn(conn)
+        _return_connection(conn)
 
 
 async def list_documents(skip: int = 0, limit: int = 100) -> list[dict]:
     return await _execute_sync(_list_documents_sync, skip, limit)
+
+
+def _row_to_chunk(row: dict) -> dict[str, Any]:
+    metadata = dict(row.get("metadata") or {})
+    content = row.get("content") or ""
+    return {
+        "id": row["id"],
+        "content": content,
+        "content_length": len(content),
+        "metadata": metadata,
+        "partition": row.get("partition"),
+        "chunk_index": int(metadata.get("chunk_index", 0) or 0),
+        "chunk_strategy": metadata.get("chunk_strategy"),
+        "created_at": row.get("created_at"),
+    }
+
+
+def _list_document_chunks_sync(document_id: str, skip: int, limit: int) -> dict[str, Any]:
+    conn = _connection()
+    cur = None
+    try:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM documents
+            WHERE metadata->>'document_id' = %s
+            """,
+            (document_id,),
+        )
+        total = int(cur.fetchone()["total"])
+
+        cur.execute(
+            """
+            SELECT id, content, metadata, partition, created_at
+            FROM documents
+            WHERE metadata->>'document_id' = %s
+            ORDER BY
+                CASE
+                    WHEN metadata->>'chunk_index' ~ '^[0-9]+$'
+                    THEN (metadata->>'chunk_index')::int
+                    ELSE 0
+                END,
+                id
+            OFFSET %s LIMIT %s
+            """,
+            (document_id, skip, limit),
+        )
+        return {
+            "total": total,
+            "chunks": [_row_to_chunk(row) for row in cur.fetchall()],
+        }
+    finally:
+        if cur is not None:
+            cur.close()
+        _return_connection(conn)
+
+
+async def list_document_chunks(
+    document_id: str,
+    skip: int = 0,
+    limit: int = 2000,
+) -> dict[str, Any]:
+    return await _execute_sync(_list_document_chunks_sync, document_id, skip, limit)

@@ -1,10 +1,8 @@
 """Answer generation for retrieved RAG contexts."""
+import hashlib
 import re
-from typing import AsyncIterator
+from collections.abc import AsyncIterator
 
-from app.utils.cache import SemanticCache
-from app.utils.config import get_settings
-from app.embedding.embedder import encode_query
 from app.llm.model import get_llm_client
 from app.llm.prompt import (
     ANSWER_FORMAT_INSTRUCTIONS,
@@ -12,6 +10,9 @@ from app.llm.prompt import (
     build_rag_prompt,
     build_system_prompt,
 )
+from app.retrieval.result_merge import result_score
+from app.utils.cache import SemanticCache
+from app.utils.config import get_settings
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -152,7 +153,7 @@ def _article_numbers(text: str | None) -> list[str]:
 
 
 def _chinese_ngrams(text: str, min_size: int = 2, max_size: int = 6) -> list[str]:
-    phrases = re.findall(r"[\u4e00-\u9fff]{%d,}" % min_size, text)
+    phrases = re.findall(rf"[\u4e00-\u9fff]{{{min_size},}}", text)
     grams: list[str] = []
     for phrase in phrases:
         upper = min(max_size, len(phrase))
@@ -215,6 +216,11 @@ def _filter_basis_docs(context_docs: list[dict], query: str | None, answer: str 
     if not context_docs:
         return []
 
+    priority_docs = [
+        doc for doc in context_docs if int(doc.get("mapped_article_priority") or 0) > 0
+    ]
+    priority_docs.sort(key=lambda doc: int(doc.get("mapped_article_priority") or 0), reverse=True)
+
     articles = _article_numbers("\n".join(part for part in [query, answer] if part))
     if articles:
         article_matches = [
@@ -223,7 +229,7 @@ def _filter_basis_docs(context_docs: list[dict], query: str | None, answer: str 
             if any(article in _doc_context_content(doc, 800) for article in articles)
         ]
         if article_matches:
-            return article_matches
+            return _prepend_priority_docs(priority_docs, article_matches)
 
     terms = _evidence_terms(query, answer)
     if not terms:
@@ -237,19 +243,35 @@ def _filter_basis_docs(context_docs: list[dict], query: str | None, answer: str 
             scored_docs.append((score, doc))
 
     if not scored_docs:
-        return context_docs
+        return _prepend_priority_docs(priority_docs, context_docs)
 
     scored_docs.sort(key=lambda item: item[0], reverse=True)
     best_score = scored_docs[0][0]
     minimum_score = best_score if best_score <= 2 else best_score - 1
-    return [doc for score, doc in scored_docs if score >= minimum_score]
+    return _prepend_priority_docs(
+        priority_docs,
+        [doc for score, doc in scored_docs if score >= minimum_score],
+    )
+
+
+def _prepend_priority_docs(priority_docs: list[dict], docs: list[dict]) -> list[dict]:
+    ordered: list[dict] = []
+    seen: set[str] = set()
+    for doc in [*priority_docs, *docs]:
+        key = str(doc.get("id") or id(doc))
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(doc)
+    return ordered
 
 
 def _requested_laws(query: str) -> list[str]:
     return [title for title in KNOWN_LAW_TITLES if title in query]
 
 
-def _missing_requested_laws(query: str, docs: list[dict]) -> list[str]:
+def missing_requested_laws(query: str, docs: list[dict]) -> list[str]:
+    """Return explicitly requested law titles that are absent from retrieved docs."""
     requested = _requested_laws(query)
     if not requested:
         return []
@@ -273,7 +295,8 @@ def _missing_requested_laws(query: str, docs: list[dict]) -> list[str]:
     return missing
 
 
-def _format_missing_law_answer(missing_laws: list[str]) -> str:
+def format_missing_law_answer(missing_laws: list[str]) -> str:
+    """Build a standard answer when the requested law is absent from context."""
     law_names = "、".join(f"《{law}》" for law in missing_laws)
     return f"""【回答】
 结论：
@@ -297,6 +320,17 @@ def _has_no_supported_conclusion(answer: str) -> bool:
     ]
     if any(marker in normalized for marker in strong_markers):
         return True
+
+    supported_conclusion_markers = [
+        "应首先",
+        "应当向",
+        "通常",
+        "倾向",
+        "基础规则",
+        "可以确定",
+    ]
+    if any(marker in normalized for marker in supported_conclusion_markers) or _article_numbers(answer):
+        return False
 
     return (
         ("检索到的上下文" in normalized or "上下文" in normalized)
@@ -326,7 +360,7 @@ class Generator:
         max_per_doc = max(300, int(self.config.get("max_context_per_doc", 1200)))
         for index, doc in enumerate(docs, 1):
             source = _doc_source(doc)
-            score = float(doc.get("rrf_score", doc.get("score", 0.0)) or 0.0)
+            score = result_score(doc)
             content = _doc_context_content(doc, max_per_doc)
             contexts.append(template.format(index=index, source=source, score=score, content=content))
         return "\n".join(contexts)
@@ -351,12 +385,13 @@ class Generator:
                 locations.append(item)
         return locations
 
-    def _format_basis_section(
+    def format_basis_section(
         self,
         context_docs: list[dict],
         answer: str | None = None,
         query: str | None = None,
     ) -> str:
+        """Format the citation/evidence section appended to answers."""
         if answer and _has_no_supported_conclusion(answer):
             return "\n\n依据：\n无直接支持结论的命中文档。"
 
@@ -369,7 +404,8 @@ class Generator:
 
         return f"\n\n依据：\n{basis_text}"
 
-    def _format_answer(self, answer: str, context_docs: list[dict], query: str | None = None) -> str:
+    def format_answer(self, answer: str, context_docs: list[dict], query: str | None = None) -> str:
+        """Normalize an LLM answer and append the standard evidence section."""
         answer = answer.strip()
         answer_match = re.search(r"(?:##\s*)?【回答】", answer)
         if answer_match:
@@ -387,7 +423,7 @@ class Generator:
 
         return f"""【回答】
 结论：
-{answer_body}{self._format_basis_section(context_docs, answer_body, query)}"""
+{answer_body}{self.format_basis_section(context_docs, answer_body, query)}"""
 
     def _build_prompt(self, query: str, context: str, stream: bool = False) -> str:
         max_length = int(self.config.get("max_context_length", 8000))
@@ -402,22 +438,47 @@ class Generator:
     def _get_system_prompt(self) -> str:
         return build_system_prompt(self.config.get("system_prompt"))
 
+    def _cache_context(self, docs: list[dict]) -> dict:
+        """Describe everything that can materially change a generated answer."""
+        settings = get_settings()
+        llm_config = settings.get("llm", {}).get("text", {})
+        provider = llm_config.get("provider", "local")
+        provider_config = llm_config.get(provider, llm_config)
+        context_docs = []
+        for doc in docs:
+            metadata = doc.get("metadata") or {}
+            content = str(doc.get("content") or "")
+            context_docs.append(
+                {
+                    "id": str(doc.get("id") or metadata.get("chunk_id") or ""),
+                    "partition": str(doc.get("partition") or metadata.get("partition") or ""),
+                    "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                }
+            )
+        prompt_material = self._get_system_prompt() + "\n" + str(self.config)
+        return {
+            "provider": provider,
+            "model": provider_config.get("model_name"),
+            "prompt_sha256": hashlib.sha256(prompt_material.encode("utf-8")).hexdigest(),
+            "documents": context_docs,
+        }
+
     async def generate(self, query: str, context_docs: list[dict], use_cache: bool = True) -> str:
-        missing_laws = _missing_requested_laws(query, context_docs)
+        missing_laws = missing_requested_laws(query, context_docs)
         if missing_laws:
-            return _format_missing_law_answer(missing_laws)
+            return format_missing_law_answer(missing_laws)
 
         if use_cache:
             try:
-                query_embedding = encode_query(query)
-                cached = await self.cache.get(query_embedding)
+                cache_context = self._cache_context(context_docs)
+                cached = await self.cache.get(query, cache_context)
                 if cached:
-                    return self._format_answer(cached, context_docs, query)
+                    return self.format_answer(cached, context_docs, query)
             except Exception as exc:
                 logger.warning("Semantic cache lookup skipped: %s", exc)
-                query_embedding = None
+                cache_context = None
         else:
-            query_embedding = None
+            cache_context = None
 
         logger.info(
             "Generating answer with retrieved contexts",
@@ -429,25 +490,25 @@ class Generator:
         )
 
         prompt = self._build_prompt(query, self._build_context(context_docs))
-        answer = await self.llm.generate(
+        raw_answer = await self.llm.generate(
             prompt=prompt,
             system_prompt=self._get_system_prompt(),
             temperature=float(self.config.get("temperature", 0.3)),
             max_tokens=int(self.config.get("max_tokens", 2048)),
         )
-        answer = self._format_answer(answer, context_docs, query)
+        answer = self.format_answer(raw_answer, context_docs, query)
 
-        if use_cache and query_embedding is not None:
+        if use_cache and cache_context is not None:
             try:
-                await self.cache.set(query_embedding, answer)
+                await self.cache.set(query, cache_context, raw_answer)
             except Exception as exc:
                 logger.warning("Semantic cache write skipped: %s", exc)
         return answer
 
     async def generate_stream(self, query: str, context_docs: list[dict]) -> AsyncIterator[str]:
-        missing_laws = _missing_requested_laws(query, context_docs)
+        missing_laws = missing_requested_laws(query, context_docs)
         if missing_laws:
-            yield _format_missing_law_answer(missing_laws)
+            yield format_missing_law_answer(missing_laws)
             return
 
         prompt = self._build_prompt(query, self._build_context(context_docs), stream=True)
@@ -461,7 +522,7 @@ class Generator:
         ):
             streamed_chunks.append(chunk)
             yield chunk
-        yield self._format_basis_section(context_docs, "".join(streamed_chunks), query)
+        yield self.format_basis_section(context_docs, "".join(streamed_chunks), query)
 
     async def chat(
         self,

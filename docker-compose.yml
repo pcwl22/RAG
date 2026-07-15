@@ -1,13 +1,51 @@
 services:
+  frontend:
+    profiles: ["frontend"]
+    build:
+      context: ./rag-frontend
+    container_name: rag-frontend
+    environment:
+      RAG_API_UPSTREAM: ${RAG_API_UPSTREAM:-http://api:8000}
+      RAG_API_KEY: ${RAG_API_KEY:-}
+    ports:
+      - "5173:80"
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+  api:
+    profiles: ["api"]
+    build:
+      context: ./industrial-rag
+      dockerfile: docker/api/Dockerfile
+    container_name: rag-api
+    env_file:
+      - ./industrial-rag/.env
+    environment:
+      RAG_ENV: base
+    ports:
+      - "${RAG_API_PORT:-18000}:8000"
+    volumes:
+      - ./models:/app/models:ro
+      - ./industrial-rag/data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
   postgres:
     image: pgvector/pgvector:pg16
     container_name: rag-postgres
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: rag_db
     ports:
-      - "5432:5432"
+      - "${RAG_POSTGRES_PORT:-15432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     restart: unless-stopped
@@ -16,6 +54,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    security_opt:
+      - no-new-privileges:true
 
   redis:
     image: redis:7-alpine
@@ -31,6 +71,8 @@ services:
       interval: 10s
       timeout: 3s
       retries: 5
+    security_opt:
+      - no-new-privileges:true
 
 volumes:
   postgres_data:

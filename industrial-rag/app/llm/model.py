@@ -8,7 +8,8 @@ LLM 模型接口封装
 
 统一接口：generate() / generate_stream()，根据配置自动选择 Provider。
 """
-from typing import AsyncIterator, Any
+from collections.abc import AsyncIterator
+from typing import Any
 
 from app.utils.config import get_settings
 from app.utils.logger import get_logger
@@ -60,10 +61,10 @@ class LLMClient:
         """初始化 Claude (Anthropic) 客户端。"""
         try:
             from anthropic import AsyncAnthropic
-        except ImportError:
+        except ImportError as exc:
             raise ImportError(
                 "anthropic package not installed. Run: pip install anthropic"
-            )
+            ) from exc
 
         api_key = self.config.get("api_key")
         if not api_key or api_key.startswith("${"):
@@ -81,8 +82,8 @@ class LLMClient:
         """初始化 OpenAI-compatible 客户端 (DeepSeek 等)。"""
         try:
             from openai import AsyncOpenAI
-        except ImportError:
-            raise ImportError("openai package not installed. Run: pip install openai")
+        except ImportError as exc:
+            raise ImportError("openai package not installed. Run: pip install openai") from exc
 
         api_key = self.config.get("api_key")
         if not api_key or api_key.startswith("${"):
@@ -100,8 +101,8 @@ class LLMClient:
         """初始化智谱 AI 客户端。"""
         try:
             from zhipuai import ZhipuAI
-        except ImportError:
-            raise ImportError("zhipuai package not installed. Run: pip install zhipuai")
+        except ImportError as exc:
+            raise ImportError("zhipuai package not installed. Run: pip install zhipuai") from exc
 
         api_key = self.config.get("api_key")
         if not api_key or api_key.startswith("${"):

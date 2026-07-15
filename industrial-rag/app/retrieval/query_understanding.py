@@ -2,8 +2,13 @@
 import json
 import re
 
-from app.utils.config import get_settings
 from app.llm.model import get_llm_client
+from app.retrieval.domain_signal_map import build_domain_signal_queries
+from app.retrieval.legal_concept_map import (
+    build_concept_article_queries,
+    match_legal_concept_articles,
+)
+from app.utils.config import get_settings
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -60,6 +65,11 @@ FORMAL_LEGAL_MARKERS = [
     "量刑",
     "刑罚",
 ]
+
+FACT_TRIGGERED_SIGNAL_TERMS = {
+    "共同犯罪": ["共同", "共犯", "同伙", "合谋", "通谋", "事前", "结伙", "多人"],
+    "连续犯": ["连续犯"],
+}
 
 
 def _query_understanding_config() -> dict:
@@ -135,11 +145,23 @@ def _drop_unsupported_article_terms(value: str, allowed_articles: set[str]) -> s
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
+def _drop_untriggered_signal_terms(value: str, query: str) -> str:
+    cleaned = value
+    for term, triggers in FACT_TRIGGERED_SIGNAL_TERMS.items():
+        if term not in cleaned:
+            continue
+        if any(trigger in query for trigger in triggers):
+            continue
+        cleaned = cleaned.replace(term, " ")
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
 def _normalize_signal_values_for_query(value, query: str) -> list[str]:
     allowed_articles = set(_article_terms(query))
     values: list[str] = []
     for item in _normalize_signal_values(value):
         cleaned = _drop_unsupported_article_terms(item, allowed_articles)
+        cleaned = _drop_untriggered_signal_terms(cleaned, query)
         if cleaned and cleaned not in values:
             values.append(cleaned)
     return values[:6]
@@ -313,7 +335,11 @@ class QueryUnderstanding:
             return [query]
 
     async def extract_retrieval_signals(self, query: str) -> dict:
-        """Extract generic legal retrieval facets without mapping terms to articles."""
+        """Extract generic legal retrieval facets.
+
+        The LLM is still forbidden to invent article numbers here. Controlled
+        concept-to-article mapping is applied separately from a local table.
+        """
         prompt = f"""你是法律检索助手。请从用户问题中提取用于检索的通用法律语义信号，不要推断或补充具体法条号，不要做“关键词到法条”的映射。
 
 用户问题：
@@ -366,11 +392,28 @@ class QueryUnderstanding:
 
         retrieval_signals = await self.extract_retrieval_signals(resolved_query)
         signal_query = _build_signal_query(retrieval_signals)
+        domain_signal_queries = build_domain_signal_queries(
+            resolved_query,
+            rewritten_query,
+            signal_query,
+        )
+        concept_article_mappings = match_legal_concept_articles(
+            resolved_query,
+            rewritten_query,
+            retrieval_signals,
+        )
+        concept_article_queries = build_concept_article_queries(concept_article_mappings)
 
         # 检索查询集 = 原查询 + 改写/拆分查询 + 结构化语义信号，合并去重。
         # 与 is_decomposed 区分开：原+改写不是"子问题"，不应触发分别生成答案再聚合。
         retrieval_queries: list[str] = []
-        for q in [resolved_query, *subqueries, signal_query]:
+        for q in [
+            resolved_query,
+            *subqueries,
+            signal_query,
+            *domain_signal_queries,
+            *concept_article_queries,
+        ]:
             if q and q not in retrieval_queries:
                 retrieval_queries.append(q)
 
@@ -379,6 +422,7 @@ class QueryUnderstanding:
             "resolved_query": resolved_query,
             "rewritten_query": rewritten_query,
             "retrieval_signals": retrieval_signals,
+            "concept_article_mappings": concept_article_mappings,
             "subqueries": subqueries,
             "retrieval_queries": retrieval_queries,
             "is_decomposed": is_decomposed,

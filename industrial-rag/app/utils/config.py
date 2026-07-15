@@ -68,7 +68,7 @@ def _substitute_env_vars(obj: Any) -> Any:
     return obj
 
 
-@lru_cache()
+@lru_cache
 def get_settings() -> dict[str, Any]:
     """
     获取配置（带缓存）。
@@ -84,7 +84,7 @@ def get_settings() -> dict[str, Any]:
 
     config_path = _resolve_config_path()
 
-    with open(config_path, "r", encoding="utf-8") as f:
+    with open(config_path, encoding="utf-8") as f:
         config = yaml.safe_load(f) or {}
 
     config = _substitute_env_vars(config)

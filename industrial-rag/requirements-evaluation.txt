@@ -1,0 +1,7 @@
+# Optional Ragas evaluation stack. Install separately from the production GPU stack.
+# Ragas 0.4.3 imports an integration removed in langchain-community 0.4.x.
+ragas==0.4.3
+langchain==0.3.27
+langchain-community==0.3.31
+langchain-core==0.3.80
+langchain-openai==0.3.35

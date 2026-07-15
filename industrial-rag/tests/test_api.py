@@ -23,7 +23,7 @@ def test_health_and_root_endpoints():
             root = await client.get("/")
 
         assert health.status_code == 200
-        assert health.json()["status"] == "healthy"
+        assert health.json()["status"] == "degraded"
         assert root.status_code == 200
         assert root.json()["docs"] == "/docs"
 

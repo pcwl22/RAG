@@ -8,38 +8,13 @@
     </div>
 
     <div class="main-container">
-      <!-- 左侧边栏 - 对话历史 -->
-      <aside class="sidebar sidebar-left">
-        <div class="sidebar-header">
-          <h2>💬 对话历史</h2>
-          <button @click="createNewChat" class="btn-primary">新建对话</button>
-        </div>
-
-        <div class="chat-list">
-          <div v-if="chatSessions.length === 0" class="empty-state">
-            暂无对话
-          </div>
-          <div
-            v-for="session in chatSessions"
-            :key="session.id"
-            class="chat-item"
-            :class="{ active: currentSessionId === session.id }"
-            @click="switchChat(session.id)"
-          >
-            <div class="chat-icon">💬</div>
-            <div class="chat-info">
-              <div class="chat-title">{{ session.title }}</div>
-              <div class="chat-meta">{{ session.messageCount }} 条消息 · {{ formatTime(session.updatedAt) }}</div>
-            </div>
-            <button
-              v-if="chatSessions.length > 1"
-              @click.stop="deleteChat(session.id)"
-              class="btn-delete"
-              title="删除对话"
-            >✕</button>
-          </div>
-        </div>
-      </aside>
+      <ChatSidebar
+        :chat-sessions="chatSessions"
+        :current-session-id="currentSessionId"
+        @new-chat="createNewChat"
+        @switch-chat="switchChat"
+        @delete-chat="deleteChat"
+      />
 
       <!-- 主对话区域 -->
       <main class="chat-area">
@@ -84,72 +59,26 @@
                 <span v-if="msg.streaming && msg.content" class="stream-cursor"></span>
               </div>
 
-              <!-- 显示检索上下文 -->
-              <div v-if="msg.highConfidenceContexts && msg.highConfidenceContexts.length > 0" class="contexts">
-                <div class="contexts-header" @click="msg.showContexts = !msg.showContexts">
-                  📑 检索到 {{ msg.highConfidenceContexts.length }} 个高置信度文档 (≥0.8)
-                  <span class="toggle">{{ msg.showContexts ? '▼' : '▶' }}</span>
-                </div>
-                <div v-show="msg.showContexts" class="contexts-list">
-                  <div v-for="(ctx, idx) in msg.highConfidenceContexts" :key="idx" class="context-item">
-                    <div class="context-score">
-                      得分: {{ ctx.score?.toFixed(3) }}
-                      <span v-if="ctx.multi_query_appearances" class="query-hit-count">
-                        命中 {{ ctx.multi_query_appearances }} 次
-                      </span>
-                    </div>
-                    <div v-if="ctx.matched_queries && ctx.matched_queries.length" class="matched-queries">
-                      <div class="matched-title">命中查询</div>
-                      <div v-for="(matchedQuery, qIdx) in ctx.matched_queries" :key="qIdx" class="matched-query">
-                        {{ matchedQuery }}
-                      </div>
-                    </div>
-                    <div class="context-text">{{ getRelevantSnippet(ctx.content, msg.query) }}</div>
-                  </div>
-                </div>
-              </div>
+              <ProcessTrace
+                v-if="msg.role === 'assistant' && msg.process"
+                :process="msg.process"
+                :context-count="msg.contexts?.length || 0"
+                @toggle="msg.process.show = !msg.process.show"
+              />
 
-              <!-- 显示查询理解 -->
-              <div v-if="msg.understanding" class="understanding">
-                <div class="understanding-header">🧠 查询理解过程</div>
+              <RetrievalContexts
+                v-if="msg.contexts && msg.contexts.length > 0"
+                :contexts="msg.contexts"
+                :show="msg.showContexts"
+                @toggle="msg.showContexts = !msg.showContexts"
+              />
 
-                <div class="understanding-step">
-                  <strong>原始查询：</strong>
-                  <div class="step-content">{{ msg.understanding.original_query }}</div>
-                </div>
-
-                <div v-if="msg.understanding.resolved_query !== msg.understanding.original_query" class="understanding-step">
-                  <strong>✓ 指代消解：</strong>
-                  <div class="step-content highlight">{{ msg.understanding.resolved_query }}</div>
-                  <div class="step-note">将代词还原为明确实体</div>
-                </div>
-
-                <div v-if="msg.understanding.rewritten_query && msg.understanding.rewritten_query !== msg.understanding.resolved_query" class="understanding-step">
-                  <strong>✓ 查询改写：</strong>
-                  <div class="step-content highlight">{{ msg.understanding.rewritten_query }}</div>
-                  <div class="step-note">用于和原查询一起检索，提升召回</div>
-                </div>
-
-                <div v-if="msg.understanding.subqueries && msg.understanding.subqueries.length > 1" class="understanding-step">
-                  <strong>✓ 查询拆分：</strong>
-                  <div class="step-note">复合问题拆分为 {{ msg.understanding.subqueries.length }} 个子查询</div>
-                  <ol class="subqueries-list">
-                    <li v-for="(sq, i) in msg.understanding.subqueries" :key="i">{{ sq }}</li>
-                  </ol>
-                </div>
-
-                <div v-if="msg.understanding.retrieval_queries && msg.understanding.retrieval_queries.length > 0" class="understanding-step">
-                  <strong>✓ 实际检索查询：</strong>
-                  <ol class="subqueries-list">
-                    <li v-for="(rq, i) in msg.understanding.retrieval_queries" :key="i">{{ rq }}</li>
-                  </ol>
-                </div>
-
-                <div v-if="!msg.understanding.is_decomposed && msg.understanding.resolved_query === msg.understanding.original_query && msg.understanding.rewritten_query === msg.understanding.resolved_query" class="understanding-step">
-                  <strong>✓ 分析结果：</strong>
-                  <div class="step-content">单一问题，无需拆分或改写</div>
-                </div>
-              </div>
+              <QueryUnderstandingPanel
+                v-if="msg.understanding"
+                :understanding="msg.understanding"
+                :show="msg.showUnderstanding"
+                @toggle="msg.showUnderstanding = !msg.showUnderstanding"
+              />
             </div>
           </div>
 
@@ -192,107 +121,83 @@
       </main>
     </div>
 
-    <!-- 文档上传对话框 -->
-    <div v-if="showUpload" class="modal" @click.self="showUpload = false">
-      <div class="modal-content">
-        <div class="modal-header">
-          <h3>📤 上传文档</h3>
-          <button @click="showUpload = false" class="btn-close">✕</button>
-        </div>
-        <div class="modal-body">
-          <div class="upload-area" @drop.prevent="handleDrop" @dragover.prevent>
-            <input
-              type="file"
-              ref="fileInput"
-              @change="handleFileSelect"
-              accept=".pdf,.txt,.md,.docx,.xlsx"
-              style="display: none"
-            >
-            <div class="upload-prompt" @click="$refs.fileInput.click()">
-              <div class="upload-icon">📁</div>
-              <div>点击选择文件或拖拽到此处</div>
-              <div class="upload-hint">支持 PDF, TXT, MD, DOCX, XLSX</div>
-            </div>
-          </div>
+    <UploadModal
+      v-if="showUpload"
+      :selected-file="selectedFile"
+      :upload-partition="uploadPartition"
+      :upload-progress="uploadProgress"
+      :uploading="uploading"
+      @close="showUpload = false"
+      @update:selected-file="selectedFile = $event"
+      @update:upload-partition="uploadPartition = $event"
+      @upload="handleUpload"
+    />
 
-          <div v-if="selectedFile" class="selected-file">
-            <div>已选择: {{ selectedFile.name }}</div>
-            <select v-model="uploadPartition">
-              <option value="general">通用</option>
-              <option value="contract">合同</option>
-              <option value="manual">手册</option>
-              <option value="process">流程</option>
-              <option value="policy">制度</option>
-            </select>
-          </div>
-
-          <div v-if="uploadProgress > 0" class="progress-bar">
-            <div class="progress-fill" :style="{ width: uploadProgress + '%' }"></div>
-          </div>
-        </div>
-        <div class="modal-footer">
-          <button @click="showUpload = false" class="btn-secondary">取消</button>
-          <button
-            @click="handleUpload"
-            :disabled="!selectedFile || uploading"
-            class="btn-primary"
-          >
-            {{ uploading ? '上传中...' : '上传' }}
-          </button>
-        </div>
-      </div>
-    </div>
-
-    <!-- 文档库对话框 -->
-    <div v-if="showDocuments" class="modal" @click.self="showDocuments = false">
-      <div class="modal-content">
-        <div class="modal-header">
-          <h3>📚 文档库</h3>
-          <button @click="showDocuments = false" class="btn-close">✕</button>
-        </div>
-        <div class="modal-body">
-          <div v-if="documents.length === 0" class="empty-state">
-            暂无文档
-          </div>
-          <div v-else class="documents-grid">
-            <div
-              v-for="doc in documents"
-              :key="doc.document_id"
-              class="document-card"
-            >
-              <div class="doc-icon">📄</div>
-              <div class="doc-info">
-                <div class="doc-name">{{ doc.filename }}</div>
-                <div class="doc-meta">
-                  {{ doc.chunk_count }} 块 · {{ doc.partition }}
-                </div>
-                <div class="doc-date">{{ formatTime(doc.updated_at) }}</div>
-              </div>
-            </div>
-          </div>
-        </div>
-        <div class="modal-footer">
-          <button @click="showDocuments = false" class="btn-secondary">关闭</button>
-        </div>
-      </div>
-    </div>
+    <DocumentsModal
+      v-if="showDocuments"
+      :documents="documents"
+      :selected-doc="selectedDoc"
+      :selected-doc-chunks="selectedDocChunks"
+      :selected-doc-chunk-total="selectedDocChunkTotal"
+      :document-chunks-loading="documentChunksLoading"
+      :document-chunks-error="documentChunksError"
+      @close="showDocuments = false"
+      @load-chunks="loadDocumentChunks"
+      @toggle-chunk="toggleDocumentChunk"
+    />
   </div>
 </template>
 
 <script setup>
 import { ref, computed, onMounted, nextTick } from 'vue'
-
-const API_BASE = 'http://localhost:8000/api/v1'
+import ChatSidebar from './components/ChatSidebar.vue'
+import DocumentsModal from './components/DocumentsModal.vue'
+import ProcessTrace from './components/ProcessTrace.vue'
+import QueryUnderstandingPanel from './components/QueryUnderstandingPanel.vue'
+import RetrievalContexts from './components/RetrievalContexts.vue'
+import UploadModal from './components/UploadModal.vue'
+import {
+  ENDPOINTS,
+  fetchDocumentChunks,
+  fetchDocuments,
+  fetchHealth,
+  ingestDocument,
+  postJson,
+  postStream
+} from './api/ragApi'
+import {
+  addProcessEvent,
+  addProcessStep,
+  createProcessTrace,
+  finishProcess
+} from './utils/processTrace'
+import {
+  createStreamWriter,
+  readEventStream
+} from './utils/eventStream'
+import { useChatSessions } from './composables/useChatSessions'
 
 const isOnline = ref(false)
 const documents = ref([])
 const selectedDoc = ref(null)
+const selectedDocChunks = ref([])
+const selectedDocChunkTotal = ref(0)
+const documentChunksLoading = ref(false)
+const documentChunksError = ref('')
 const showDocuments = ref(false)
 
 // 对话管理
-const chatSessions = ref([])
-const currentSessionId = ref(null)
-const messages = ref([])
+const {
+  chatSessions,
+  currentSessionId,
+  messages,
+  currentChatTitle,
+  createNewChat,
+  deleteChat,
+  initChats,
+  switchChat,
+  updateCurrentSession
+} = useChatSessions({ onAfterSwitch: () => scrollToBottom() })
 
 const userInput = ref('')
 const isLoading = ref(false)
@@ -309,152 +214,60 @@ const options = ref({
   stream: true
 })
 
-// 计算属性：当前对话标题
-const currentChatTitle = computed(() => {
-  const session = chatSessions.value.find(s => s.id === currentSessionId.value)
-  return session?.title || '新对话'
-})
-
 const hasActiveStreamingMessage = computed(() =>
   messages.value.some(msg => msg.role === 'assistant' && msg.streaming)
 )
 
-const normalizeStoredMessages = (items = []) =>
-  items.map(msg => {
-    if (msg.role !== 'assistant') return msg
-    return {
-      ...msg,
-      streaming: false,
-      streamingStatus: msg.content ? '' : msg.streamingStatus || ''
-    }
-  })
-
-// 初始化对话
-const initChats = () => {
-  const saved = localStorage.getItem('rag_chat_sessions')
-  if (saved) {
-    try {
-      chatSessions.value = JSON.parse(saved)
-      chatSessions.value.forEach(session => {
-        session.messages = normalizeStoredMessages(session.messages || [])
-      })
-      if (chatSessions.value.length > 0) {
-        currentSessionId.value = chatSessions.value[0].id
-        messages.value = chatSessions.value[0].messages
-      } else {
-        createNewChat()
-      }
-    } catch (e) {
-      console.error('Failed to load chat sessions:', e)
-      createNewChat()
-    }
-  } else {
-    createNewChat()
-  }
-}
-
-// 保存对话到本地存储
-const saveChats = () => {
-  localStorage.setItem('rag_chat_sessions', JSON.stringify(chatSessions.value))
-}
-
-// 新建对话
-const createNewChat = () => {
-  const newSession = {
-    id: Date.now().toString(),
-    title: `对话 ${chatSessions.value.length + 1}`,
-    messages: [],
-    messageCount: 0,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString()
-  }
-  chatSessions.value.unshift(newSession)
-  currentSessionId.value = newSession.id
-  messages.value = []
-  saveChats()
-}
-
-// 切换对话
-const switchChat = (sessionId) => {
-  const session = chatSessions.value.find(s => s.id === sessionId)
-  if (session) {
-    currentSessionId.value = sessionId
-    session.messages = normalizeStoredMessages(session.messages || [])
-    messages.value = session.messages
-    nextTick(() => scrollToBottom())
-  }
-}
-
-// 删除对话
-const deleteChat = (sessionId) => {
-  if (!confirm('确定要删除这个对话吗？')) return
-
-  chatSessions.value = chatSessions.value.filter(s => s.id !== sessionId)
-
-  if (currentSessionId.value === sessionId) {
-    if (chatSessions.value.length > 0) {
-      switchChat(chatSessions.value[0].id)
-    } else {
-      createNewChat()
-    }
-  }
-  saveChats()
-}
-
-// 更新当前对话
-const updateCurrentSession = () => {
-  const session = chatSessions.value.find(s => s.id === currentSessionId.value)
-  if (session) {
-    session.messages = messages.value
-    session.messageCount = messages.value.length
-    session.updatedAt = new Date().toISOString()
-
-    // 自动生成标题（使用第一条用户消息）
-    if (session.messageCount > 0 && session.title.startsWith('对话')) {
-      const firstUserMsg = messages.value.find(m => m.role === 'user')
-      if (firstUserMsg) {
-        session.title = firstUserMsg.content.substring(0, 20) + (firstUserMsg.content.length > 20 ? '...' : '')
-      }
-    }
-
-    saveChats()
-  }
-}
-
-// 格式化时间
-const formatTime = (dateStr) => {
-  if (!dateStr) return ''
-  const date = new Date(dateStr)
-  const now = new Date()
-  const diff = now - date
-
-  if (diff < 60000) return '刚刚'
-  if (diff < 3600000) return Math.floor(diff / 60000) + '分钟前'
-  if (diff < 86400000) return Math.floor(diff / 3600000) + '小时前'
-  if (diff < 604800000) return Math.floor(diff / 86400000) + '天前'
-
-  return date.toLocaleDateString()
-}
-
 // 检查系统状态
 const checkHealth = async () => {
-  try {
-    const res = await fetch(`http://localhost:8000/health`)
-    isOnline.value = res.ok
-  } catch (error) {
-    isOnline.value = false
-  }
+  isOnline.value = await fetchHealth()
 }
 
 // 加载文档列表
 const loadDocuments = async () => {
   try {
-    const res = await fetch(`${API_BASE}/documents`)
-    const data = await res.json()
+    const data = await fetchDocuments()
     documents.value = data.documents || []
+    if (selectedDoc.value) {
+      const refreshed = documents.value.find(doc => doc.document_id === selectedDoc.value.document_id)
+      if (refreshed) {
+        selectedDoc.value = refreshed
+      } else {
+        selectedDoc.value = null
+        selectedDocChunks.value = []
+        selectedDocChunkTotal.value = 0
+      }
+    }
   } catch (error) {
     console.error('加载文档失败:', error)
   }
+}
+
+const loadDocumentChunks = async (doc) => {
+  if (!doc?.document_id) return
+  selectedDoc.value = doc
+  documentChunksLoading.value = true
+  documentChunksError.value = ''
+
+  try {
+    const data = await fetchDocumentChunks(doc.document_id, { limit: 5000 })
+    selectedDocChunkTotal.value = data.total || 0
+    selectedDocChunks.value = (data.chunks || []).map((chunk, index) => ({
+      ...chunk,
+      show: index === 0
+    }))
+  } catch (error) {
+    selectedDocChunks.value = []
+    selectedDocChunkTotal.value = 0
+    documentChunksError.value = `加载切片失败: ${error.message}`
+  } finally {
+    documentChunksLoading.value = false
+  }
+}
+
+const toggleDocumentChunk = (chunk) => {
+  if (!chunk) return
+  chunk.show = !chunk.show
 }
 
 // 发送消息
@@ -480,18 +293,38 @@ const handleSend = async () => {
 
   let streamingMessage = null
   let streamWriter = null
+  let activeProcessTrace = null
 
   try {
     if (options.value.stream) {
+      const endpoint = options.value.enableUnderstanding ? ENDPOINTS.enhancedQuery : ENDPOINTS.answer
+      const payload = options.value.enableUnderstanding
+        ? {
+            query,
+            chat_history: chatHistory,
+            stream: true
+          }
+        : { query, stream: true }
+      const processTrace = createProcessTrace({
+        mode: options.value.enableUnderstanding ? '增强查询 / 流式' : '标准问答 / 流式',
+        endpoint,
+        request: payload
+      })
+      processTrace.streaming = true
+      activeProcessTrace = processTrace
+      addProcessStep(processTrace, '发送请求', endpoint)
+
       const assistantMessage = {
         role: 'assistant',
         content: '',
         contexts: [],
         highConfidenceContexts: [],
         understanding: null,
+        process: processTrace,
         streamingStatus: '正在连接...',
         streaming: true,
         showContexts: false,
+        showUnderstanding: false,
         query: query
       }
       messages.value.push(assistantMessage)
@@ -502,42 +335,40 @@ const handleSend = async () => {
         scrollToBottom()
       })
 
-      const endpoint = options.value.enableUnderstanding ? `${API_BASE}/query/enhanced` : `${API_BASE}/answer`
-      const payload = options.value.enableUnderstanding
-        ? {
-            query,
-            chat_history: chatHistory,
-            stream: true
-          }
-        : { query, stream: true }
-
-      const res = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      })
-
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-
+      const res = await postStream(endpoint, payload)
       await readEventStream(res, {
+        onEvent: (payload) => {
+          addProcessEvent(streamingMessage.process, payload)
+        },
         onChunk: (chunk) => {
           streamWriter.enqueue(chunk)
         },
         onSources: (sources) => {
           streamingMessage.contexts = sources || []
           streamingMessage.highConfidenceContexts = streamingMessage.contexts.filter(ctx => ctx.score >= 0.8)
+          addProcessStep(streamingMessage.process, '收到检索结果', `${streamingMessage.contexts.length} 条`)
         },
         onUnderstanding: (understanding) => {
           streamingMessage.understanding = understanding
+          addProcessStep(
+            streamingMessage.process,
+            '查询理解完成',
+            `${understanding?.retrieval_queries?.length || 0} 个实际检索查询`
+          )
         },
         onStatus: (status) => {
           if (!streamingMessage.content) {
             streamingMessage.streamingStatus = status
           }
+          addProcessStep(streamingMessage.process, '后端状态', status)
+        },
+        onDone: (payload) => {
+          finishProcess(streamingMessage.process, payload?.total_time ?? null)
         }
       })
       await streamWriter.drain()
       streamingMessage.streaming = false
+      streamingMessage.process.streaming = false
 
       return
     }
@@ -546,33 +377,66 @@ const handleSend = async () => {
 
     if (options.value.enableUnderstanding) {
       // 使用增强查询
-      const res = await fetch(`${API_BASE}/query/enhanced`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          query,
-          chat_history: chatHistory
-        })
+      const endpoint = ENDPOINTS.enhancedQuery
+      const payload = {
+        query,
+        chat_history: chatHistory
+      }
+      const processTrace = createProcessTrace({
+        mode: '增强查询 / 非流式',
+        endpoint,
+        request: payload
       })
+      activeProcessTrace = processTrace
+      addProcessStep(processTrace, '发送请求', endpoint)
 
-      const data = await res.json()
+      const data = await postJson(endpoint, payload)
+      addProcessEvent(processTrace, {
+        type: 'json_response',
+        data: {
+          result_count: data.results?.length || 0,
+          has_understanding: Boolean(data.understanding),
+          sub_answer_count: data.sub_answers?.length || 0,
+          answer_length: data.answer?.length || 0
+        }
+      })
+      addProcessStep(processTrace, '收到响应', `${data.results?.length || 0} 条检索结果`)
+      processTrace.subAnswers = data.sub_answers || []
+      finishProcess(processTrace)
       response = {
         content: data.answer,
         contexts: data.results,
-        understanding: data.understanding
+        understanding: data.understanding,
+        process: processTrace
       }
     } else {
       // 标准查询
-      const res = await fetch(`${API_BASE}/answer`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query })
+      const endpoint = ENDPOINTS.answer
+      const payload = { query }
+      const processTrace = createProcessTrace({
+        mode: '标准问答 / 非流式',
+        endpoint,
+        request: payload
       })
+      activeProcessTrace = processTrace
+      addProcessStep(processTrace, '发送请求', endpoint)
 
-      const data = await res.json()
+      const data = await postJson(endpoint, payload)
+      const contexts = data.sources || data.contexts || []
+      addProcessEvent(processTrace, {
+        type: 'json_response',
+        data: {
+          result_count: contexts.length,
+          answer_length: data.answer?.length || 0,
+          total_time: data.total_time
+        }
+      })
+      addProcessStep(processTrace, '收到响应', `${contexts.length} 条检索结果`)
+      finishProcess(processTrace, data.total_time ?? null)
       response = {
         content: data.answer,
-        contexts: data.sources || data.contexts || []
+        contexts,
+        process: processTrace
       }
     }
 
@@ -585,12 +449,17 @@ const handleSend = async () => {
       contexts: response.contexts,
       highConfidenceContexts: highConfidenceContexts,
       understanding: response.understanding,
+      process: response.process,
       showContexts: false,
+      showUnderstanding: false,
       query: query  // 保存查询用于提取相关内容
     })
 
   } catch (error) {
     if (streamingMessage) {
+      streamingMessage.process.error = error.message
+      addProcessStep(streamingMessage.process, '流程异常', error.message)
+      addProcessEvent(streamingMessage.process, { type: 'error', error: error.message })
       try {
         await streamWriter?.drain()
       } catch (drainError) {
@@ -598,6 +467,7 @@ const handleSend = async () => {
       }
 
       streamingMessage.streaming = false
+      streamingMessage.process.streaming = false
       streamingMessage.streamingStatus = ''
       if (streamingMessage.content) {
         streamingMessage.content += `\n\n[流式输出中断：${error.message}]`
@@ -605,13 +475,26 @@ const handleSend = async () => {
         streamingMessage.content = '抱歉，查询失败: ' + error.message
       }
     } else {
+      if (activeProcessTrace) {
+        activeProcessTrace.error = error.message
+        addProcessStep(activeProcessTrace, '流程异常', error.message)
+        addProcessEvent(activeProcessTrace, { type: 'error', error: error.message })
+        finishProcess(activeProcessTrace)
+      }
+
       const lastMessage = messages.value[messages.value.length - 1]
       if (lastMessage?.role === 'assistant' && !lastMessage.content) {
         lastMessage.content = '抱歉，查询失败: ' + error.message
+        lastMessage.process = activeProcessTrace
       } else {
         messages.value.push({
           role: 'assistant',
-          content: '抱歉，查询失败: ' + error.message
+          content: '抱歉，查询失败: ' + error.message,
+          contexts: [],
+          highConfidenceContexts: [],
+          process: activeProcessTrace,
+          showContexts: false,
+          query
         })
       }
     }
@@ -622,15 +505,6 @@ const handleSend = async () => {
   }
 }
 
-// 文件选择
-const handleFileSelect = (e) => {
-  selectedFile.value = e.target.files[0]
-}
-
-const handleDrop = (e) => {
-  selectedFile.value = e.dataTransfer.files[0]
-}
-
 // 上传文档
 const handleUpload = async () => {
   if (!selectedFile.value) return
@@ -638,27 +512,15 @@ const handleUpload = async () => {
   uploading.value = true
   uploadProgress.value = 0
 
-  const formData = new FormData()
-  formData.append('file', selectedFile.value)
-  formData.append('partition', uploadPartition.value)
-
   try {
-    const res = await fetch(`${API_BASE}/documents/ingest`, {
-      method: 'POST',
-      body: formData
-    })
-
-    if (res.ok) {
-      uploadProgress.value = 100
-      setTimeout(() => {
-        showUpload.value = false
-        selectedFile.value = null
-        uploadProgress.value = 0
-        loadDocuments()
-      }, 500)
-    } else {
-      alert('上传失败')
-    }
+    await ingestDocument(selectedFile.value, uploadPartition.value)
+    uploadProgress.value = 100
+    setTimeout(() => {
+      showUpload.value = false
+      selectedFile.value = null
+      uploadProgress.value = 0
+      loadDocuments()
+    }, 500)
   } catch (error) {
     alert('上传失败: ' + error.message)
   } finally {
@@ -674,152 +536,6 @@ const scrollToBottom = () => {
   })
 }
 
-// 提取相关摘要（智能截取包含关键词的部分）
-const getRelevantSnippet = (content, query) => {
-  if (!content || !query) return content?.substring(0, 200) + '...'
-
-  // 提取查询中的关键词
-  const keywords = query.replace(/[？?！!，,。.]/g, ' ').split(' ').filter(w => w.length > 1)
-
-  // 查找第一个匹配的关键词位置
-  let matchIndex = -1
-  for (const keyword of keywords) {
-    matchIndex = content.indexOf(keyword)
-    if (matchIndex !== -1) break
-  }
-
-  // 如果找到关键词，从该位置前后截取
-  if (matchIndex !== -1) {
-    const start = Math.max(0, matchIndex - 50)
-    const end = Math.min(content.length, matchIndex + 300)
-    let snippet = content.substring(start, end)
-
-    if (start > 0) snippet = '...' + snippet
-    if (end < content.length) snippet = snippet + '...'
-
-    return snippet
-  }
-
-  // 如果没找到关键词，返回前200字符
-  return content.substring(0, 200) + (content.length > 200 ? '...' : '')
-}
-
-const createStreamWriter = (write) => {
-  let queue = ''
-  let timer = null
-  let drainResolvers = []
-
-  const resolveDrains = () => {
-    const resolvers = drainResolvers
-    drainResolvers = []
-    resolvers.forEach(resolve => resolve())
-  }
-
-  const stop = () => {
-    if (timer) clearInterval(timer)
-    timer = null
-  }
-
-  const flush = () => {
-    if (!queue) {
-      stop()
-      resolveDrains()
-      return
-    }
-
-    const size = queue.length > 160 ? 16 : queue.length > 60 ? 8 : 3
-    const next = queue.slice(0, size)
-    queue = queue.slice(size)
-    write(next)
-  }
-
-  const start = () => {
-    if (!timer) timer = setInterval(flush, 18)
-  }
-
-  return {
-    enqueue(text = '') {
-      if (!text) return
-      queue += text
-      start()
-    },
-    drain() {
-      if (!queue && !timer) return Promise.resolve()
-      start()
-      return new Promise(resolve => {
-        drainResolvers.push(resolve)
-      })
-    }
-  }
-}
-
-const readEventStream = async (res, handlers = {}) => {
-  if (!res.body) throw new Error('浏览器不支持流式响应')
-
-  const reader = res.body.getReader()
-  const decoder = new TextDecoder('utf-8')
-  let buffer = ''
-  let finished = false
-
-  const handleEvent = (event) => {
-    const rawData = event
-      .split('\n')
-      .filter(line => line.startsWith('data:'))
-      .map(line => line.slice(5).trimStart())
-      .join('\n')
-      .trim()
-
-    if (!rawData) return
-    if (rawData === '[DONE]') {
-      finished = true
-      handlers.onDone?.()
-      return
-    }
-
-    let payload
-    try {
-      payload = JSON.parse(rawData)
-    } catch (error) {
-      throw new Error(`流式响应格式错误: ${rawData.slice(0, 120)}`)
-    }
-
-    if (payload.type === 'error' || payload.error) {
-      throw new Error(payload.error || payload.message || '流式响应失败')
-    }
-
-    if (payload.type === 'chunk' || payload.type === 'token') handlers.onChunk?.(payload.data || '')
-    if (payload.type === 'sources') handlers.onSources?.(payload.data)
-    if (payload.type === 'understanding') handlers.onUnderstanding?.(payload.data)
-    if (payload.type === 'status') handlers.onStatus?.(payload.data || '')
-    if (payload.type === 'done') {
-      finished = true
-      handlers.onDone?.(payload)
-    }
-  }
-
-  try {
-    while (!finished) {
-      const { value, done } = await reader.read()
-      if (done) break
-
-      buffer += decoder.decode(value, { stream: true })
-      buffer = buffer.replace(/\r\n/g, '\n')
-      const events = buffer.split('\n\n')
-      buffer = events.pop() || ''
-
-      for (const event of events) {
-        handleEvent(event)
-        if (finished) break
-      }
-    }
-
-    buffer += decoder.decode()
-    if (!finished && buffer.trim()) handleEvent(buffer)
-  } finally {
-    reader.releaseLock()
-  }
-}
-
 onMounted(() => {
   initChats()  // 初始化对话历史
   checkHealth()
@@ -829,10 +545,6 @@ onMounted(() => {
 </script>
 
 <style scoped>
-* {
-  box-sizing: border-box;
-}
-
 .rag-chat {
   height: 100vh;
   display: flex;
@@ -873,160 +585,6 @@ onMounted(() => {
   flex: 1;
   display: flex;
   overflow: hidden;
-}
-
-.sidebar {
-  width: 280px;
-  background: white;
-  border-right: 1px solid #e7e3da;
-  display: flex;
-  flex-direction: column;
-}
-
-.sidebar-left {
-  border-right: 1px solid #e7e3da;
-}
-
-.sidebar-header {
-  padding: 1.5rem;
-  border-bottom: 1px solid #e7e3da;
-}
-
-.sidebar-header h2 {
-  margin: 0 0 1rem 0;
-  font-size: 1.125rem;
-  color: #1e2227;
-}
-
-.chat-list {
-  flex: 1;
-  overflow-y: auto;
-  padding: 0.5rem;
-}
-
-.chat-item {
-  display: flex;
-  align-items: center;
-  padding: 0.75rem;
-  margin-bottom: 0.5rem;
-  border-radius: 0.5rem;
-  cursor: pointer;
-  transition: background 0.2s;
-  position: relative;
-}
-
-.chat-item:hover {
-  background: #f7f5f1;
-}
-
-.chat-item:hover .btn-delete {
-  display: block;
-}
-
-.chat-item.active {
-  background: #3c5a78;
-  color: white;
-}
-
-.chat-icon {
-  font-size: 1.5rem;
-  margin-right: 0.75rem;
-}
-
-.chat-info {
-  flex: 1;
-  min-width: 0;
-}
-
-.chat-title {
-  font-weight: 500;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.chat-meta {
-  font-size: 0.75rem;
-  opacity: 0.7;
-  margin-top: 0.25rem;
-}
-
-.btn-delete {
-  display: none;
-  position: absolute;
-  right: 0.5rem;
-  top: 50%;
-  transform: translateY(-50%);
-  background: #ef4444;
-  color: white;
-  border: none;
-  border-radius: 50%;
-  width: 1.5rem;
-  height: 1.5rem;
-  cursor: pointer;
-  font-size: 0.875rem;
-  line-height: 1;
-}
-
-.btn-delete:hover {
-  background: #dc2626;
-}
-
-.chat-item.active .btn-delete {
-  background: white;
-  color: #3c5a78;
-}
-
-.chat-item.active .btn-delete:hover {
-  background: #f7f5f1;
-}
-
-.documents-list {
-  flex: 1;
-  overflow-y: auto;
-  padding: 0.5rem;
-}
-
-.document-item {
-  display: flex;
-  align-items: center;
-  padding: 0.75rem;
-  margin-bottom: 0.5rem;
-  border-radius: 0.5rem;
-  cursor: pointer;
-  transition: background 0.2s;
-}
-
-.document-item:hover {
-  background: #f7f5f1;
-}
-
-.document-item.active {
-  background: #3c5a78;
-  color: white;
-}
-
-.doc-icon {
-  font-size: 1.5rem;
-  margin-right: 0.75rem;
-}
-
-.doc-info {
-  flex: 1;
-  min-width: 0;
-}
-
-.doc-name {
-  font-weight: 500;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.doc-meta {
-  font-size: 0.75rem;
-  opacity: 0.7;
-  margin-top: 0.25rem;
 }
 
 .chat-area {
@@ -1133,133 +691,6 @@ onMounted(() => {
   color: white;
 }
 
-.contexts {
-  margin-top: 1rem;
-  background: white;
-  border: 1px solid #e7e3da;
-  border-radius: 0.5rem;
-  overflow: hidden;
-}
-
-.contexts-header {
-  padding: 0.75rem 1rem;
-  background: #f7f5f1;
-  cursor: pointer;
-  display: flex;
-  justify-content: space-between;
-  font-weight: 500;
-  font-size: 0.875rem;
-}
-
-.context-item {
-  padding: 0.75rem 1rem;
-  border-top: 1px solid #e7e3da;
-  font-size: 0.875rem;
-}
-
-.context-score {
-  color: #3c5a78;
-  font-weight: 500;
-  margin-bottom: 0.25rem;
-}
-
-.query-hit-count {
-  margin-left: 0.5rem;
-  padding: 0.1rem 0.4rem;
-  border-radius: 0.25rem;
-  background: #e7e3da;
-  color: #4b5563;
-  font-size: 0.75rem;
-  font-weight: 500;
-}
-
-.matched-queries {
-  margin: 0.35rem 0 0.5rem;
-  padding: 0.5rem;
-  background: #f7f5f1;
-  border-radius: 0.25rem;
-  color: #4b5563;
-}
-
-.matched-title {
-  margin-bottom: 0.25rem;
-  color: #3c5a78;
-  font-size: 0.75rem;
-  font-weight: 600;
-}
-
-.matched-query {
-  line-height: 1.4;
-  word-break: break-word;
-}
-
-.context-text {
-  color: #6b7077;
-  line-height: 1.5;
-}
-
-.understanding {
-  margin-top: 0.75rem;
-  padding: 1rem;
-  background: #fffbeb;
-  border-left: 3px solid #f59e0b;
-  border-radius: 0.25rem;
-  font-size: 0.875rem;
-}
-
-.understanding-header {
-  font-weight: 600;
-  margin-bottom: 0.75rem;
-  font-size: 0.9rem;
-}
-
-.understanding-step {
-  margin-bottom: 0.75rem;
-  padding-bottom: 0.75rem;
-  border-bottom: 1px solid #fde68a;
-}
-
-.understanding-step:last-child {
-  margin-bottom: 0;
-  padding-bottom: 0;
-  border-bottom: none;
-}
-
-.understanding-step strong {
-  display: block;
-  margin-bottom: 0.25rem;
-  color: #92400e;
-}
-
-.step-content {
-  padding: 0.5rem;
-  background: white;
-  border-radius: 0.25rem;
-  margin-top: 0.25rem;
-}
-
-.step-content.highlight {
-  background: #fef3c7;
-  font-weight: 500;
-}
-
-.step-note {
-  font-size: 0.8rem;
-  color: #78716c;
-  margin-top: 0.25rem;
-  font-style: italic;
-}
-
-.subqueries-list {
-  margin: 0.5rem 0 0 0;
-  padding-left: 1.5rem;
-}
-
-.subqueries-list li {
-  margin-bottom: 0.25rem;
-  padding: 0.25rem 0;
-}
-
 .loading {
   padding: 1rem;
   color: #6b7077;
@@ -1341,201 +772,5 @@ textarea {
 .btn-send:disabled {
   opacity: 0.5;
   cursor: not-allowed;
-}
-
-.btn-primary {
-  padding: 0.5rem 1rem;
-  background: #3c5a78;
-  color: white;
-  border: none;
-  border-radius: 0.5rem;
-  cursor: pointer;
-  font-weight: 500;
-  width: 100%;
-}
-
-.btn-primary:hover:not(:disabled) {
-  background: #2e4760;
-}
-
-.btn-primary:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.btn-secondary {
-  padding: 0.5rem 1rem;
-  background: #e7e3da;
-  color: #1e2227;
-  border: none;
-  border-radius: 0.5rem;
-  cursor: pointer;
-}
-
-.modal {
-  position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  background: rgba(0, 0, 0, 0.5);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 1000;
-}
-
-.modal-content {
-  background: white;
-  border-radius: 0.75rem;
-  width: 90%;
-  max-width: 500px;
-  box-shadow: 0 10px 25px rgba(0, 0, 0, 0.2);
-}
-
-.modal-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 1.5rem;
-  border-bottom: 1px solid #e7e3da;
-}
-
-.modal-header h3 {
-  margin: 0;
-}
-
-.btn-close {
-  background: none;
-  border: none;
-  font-size: 1.5rem;
-  cursor: pointer;
-  padding: 0;
-  width: 2rem;
-  height: 2rem;
-}
-
-.modal-body {
-  padding: 1.5rem;
-}
-
-.upload-area {
-  border: 2px dashed #e7e3da;
-  border-radius: 0.5rem;
-  padding: 3rem;
-  text-align: center;
-  cursor: pointer;
-  transition: border-color 0.2s;
-}
-
-.upload-area:hover {
-  border-color: #3c5a78;
-}
-
-.upload-icon {
-  font-size: 3rem;
-  margin-bottom: 1rem;
-}
-
-.upload-hint {
-  font-size: 0.875rem;
-  color: #6b7077;
-  margin-top: 0.5rem;
-}
-
-.selected-file {
-  margin-top: 1rem;
-  padding: 1rem;
-  background: #f7f5f1;
-  border-radius: 0.5rem;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 1rem;
-}
-
-.selected-file select {
-  padding: 0.5rem;
-  border: 1px solid #e7e3da;
-  border-radius: 0.25rem;
-}
-
-.progress-bar {
-  margin-top: 1rem;
-  height: 0.5rem;
-  background: #e7e3da;
-  border-radius: 0.25rem;
-  overflow: hidden;
-}
-
-.progress-fill {
-  height: 100%;
-  background: #3c5a78;
-  transition: width 0.3s;
-}
-
-.modal-footer {
-  padding: 1.5rem;
-  border-top: 1px solid #e7e3da;
-  display: flex;
-  gap: 1rem;
-  justify-content: flex-end;
-}
-
-.documents-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-  gap: 1rem;
-  padding: 1rem 0;
-}
-
-.document-card {
-  border: 1px solid #e7e3da;
-  border-radius: 0.5rem;
-  padding: 1rem;
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-  transition: all 0.2s;
-}
-
-.document-card:hover {
-  border-color: #3c5a78;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
-}
-
-.document-card .doc-icon {
-  font-size: 2rem;
-  text-align: center;
-}
-
-.document-card .doc-info {
-  flex: 1;
-}
-
-.document-card .doc-name {
-  font-weight: 500;
-  font-size: 0.875rem;
-  margin-bottom: 0.25rem;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.document-card .doc-meta {
-  font-size: 0.75rem;
-  color: #6b7077;
-}
-
-.document-card .doc-date {
-  font-size: 0.75rem;
-  color: #9ca3af;
-  margin-top: 0.25rem;
-}
-
-.empty-state {
-  text-align: center;
-  padding: 2rem 1rem;
-  color: #6b7077;
 }
 </style>

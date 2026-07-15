@@ -4,17 +4,21 @@
 """
 import asyncio
 import sys
+import uuid
 from pathlib import Path
 
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from app.service.ingest_service import parse_document
-from app.parser.chunk import ParentChildChunker
-from app.embedding.embedder import encode_texts
-from app.vectorstore.postgres_store import init_postgres_store, close_postgres_store, add_documents
-from app.utils.logger import get_logger
-import uuid
+from app.embedding.embedder import encode_texts  # noqa: E402
+from app.parser.chunk import ParentChildChunker  # noqa: E402
+from app.service.ingest_service import parse_document  # noqa: E402
+from app.utils.logger import get_logger  # noqa: E402
+from app.vectorstore.postgres_store import (  # noqa: E402
+    add_documents,
+    close_postgres_store,
+    init_postgres_store,
+)
 
 logger = get_logger(__name__)
 

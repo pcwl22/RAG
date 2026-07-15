@@ -56,7 +56,6 @@ def create_directories():
     dirs = [
         "data/uploads",
         "data/processed",
-        "data/chroma",
         "logs",
         "models",
     ]

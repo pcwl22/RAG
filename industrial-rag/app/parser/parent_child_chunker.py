@@ -2,8 +2,8 @@
 Parent-Child分块器
 使用结构化解析生成父子分块，并添加标题路径增强
 """
-from typing import List, Dict, Any
 from dataclasses import dataclass
+from typing import Any
 
 from .legal_parser import LegalDocumentParser, LegalSection
 
@@ -13,7 +13,7 @@ class Chunk:
     """文档块"""
     id: str
     content: str
-    metadata: Dict[str, Any]
+    metadata: dict[str, Any]
     is_parent: bool
     parent_id: str | None = None
 
@@ -69,7 +69,7 @@ class ParentChildChunker:
         document_id: str,
         filename: str,
         partition: str = "general",
-    ) -> tuple[List[Chunk], List[Chunk]]:
+    ) -> tuple[list[Chunk], list[Chunk]]:
         """
         对文档进行Parent-Child分块
 
@@ -99,11 +99,11 @@ class ParentChildChunker:
 
     def _create_parent_chunks(
         self,
-        sections: List[LegalSection],
+        sections: list[LegalSection],
         document_id: str,
         filename: str,
         partition: str,
-    ) -> List[Chunk]:
+    ) -> list[Chunk]:
         """创建父块：按结构层级聚合"""
         parent_chunks = []
         current_group = []
@@ -144,7 +144,7 @@ class ParentChildChunker:
 
     def _build_parent_chunk(
         self,
-        sections: List[LegalSection],
+        sections: list[LegalSection],
         document_id: str,
         filename: str,
         partition: str,
@@ -183,11 +183,11 @@ class ParentChildChunker:
 
     def _create_child_chunks(
         self,
-        parent_chunks: List[Chunk],
+        parent_chunks: list[Chunk],
         document_id: str,
         filename: str,
         partition: str,
-    ) -> List[Chunk]:
+    ) -> list[Chunk]:
         """从父块中提取子块"""
         child_chunks = []
         child_index = 0
@@ -301,7 +301,7 @@ class ParentChildChunker:
         document_id: str,
         filename: str,
         partition: str,
-    ) -> tuple[List[Chunk], List[Chunk]]:
+    ) -> tuple[list[Chunk], list[Chunk]]:
         """回退分块策略：简单按token数切分"""
         parent_chunks = []
         child_chunks = []

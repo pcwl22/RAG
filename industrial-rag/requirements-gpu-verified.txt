@@ -4,6 +4,8 @@
 #
 # 重要：这套版本组合经过验证，BGE-M3 GPU 加速正常工作。
 # 不要随意升级以下核心包，新版本可能导致 Segmentation Fault。
+# 请通过 scripts/setup_gpu_env.ps1 安装；requirements 文件本身不能声明
+# PyTorch 的专用 CUDA wheel 索引，直接 pip install -r 可能装到 CPU wheel。
 
 # ===== 核心：深度学习（GPU）=====
 # PyTorch 2.4.0 + CUDA 12.1（不要用 2.5.x，与模型不兼容）
@@ -40,7 +42,6 @@ openai
 zhipuai
 
 # ===== 向量库和缓存 =====
-chromadb==1.5.9
 redis
 
 # ===== 文档处理 =====

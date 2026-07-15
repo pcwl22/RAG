@@ -53,29 +53,21 @@ reranker:
   batch_size: 1
   max_length: 512
   top_n: 5
-  # 重排后的绝对相关性阈值，作用于 sigmoid(logit) 校准概率（跨 query 可比）。
+  # 重排后的绝对相关性阈值；多查询分数需再用原始问题统一重排后才可比较。
   # 低于此值的文档被丢弃，允许返回 0 条（"无相关法条" 是合法答案）。
   # null = 关闭阈值过滤（仅按概率排序后取 top_n）。需在真实法律语料上校准后再设值，建议从 0.5 起步。
-  score_threshold: null
+  score_threshold: 0.5
 
 postgres:
   host: "localhost"
-  port: 5432
+  # 避免与同机其他 PostgreSQL 项目的默认 5432 端口冲突。
+  port: 15432
   database: "rag_db"
   user: "postgres"
   password: "${POSTGRES_PASSWORD}"
   min_pool_size: 1
   max_pool_size: 5
   command_timeout: 60
-
-chroma:
-  persist_directory: "./data/chroma"
-  collection:
-    name: "rag_documents"
-    dimension: 1024
-    distance: "cosine"
-  enable_partition: true
-  partitions: ["contract", "manual", "process", "policy", "general"]
 
 redis:
   enabled: true
@@ -84,8 +76,8 @@ redis:
   semantic_cache:
     enabled: true
     ttl: 3600
-    similarity_threshold: 0.95
-    max_cache_size: 5000
+    # Deterministic context-aware answer cache. This is not vector similarity.
+    cache_version: "1"
 
 queue:
   provider: "memory"
@@ -116,7 +108,6 @@ document_processing:
 
 rag:
   retrieval:
-    use_postgres: true
     enable_hybrid: true
     top_k: 5
     # 重排前的召回分兜底阈值，仅挡掉完全无关的召回；真正的相关性裁决交给重排器
@@ -126,10 +117,15 @@ rag:
     rerank_candidate_multiplier: 4
     rerank_min_candidates: 20
     rerank_max_candidates: 80
-    max_chunks_per_document: 6
+    max_chunks_per_document: 12
     rrf_k: 60
     enable_dynamic_topk: true
     dynamic_topk_threshold: 0.5
+    # 多查询召回后，用原始问题统一重排并动态裁剪生成上下文。
+    dynamic_context_selection: true
+    flat_score_top_n: 2
+    min_final_rerank_spread: 0.05
+    min_final_rerank_gap: 0.08
     query_understanding:
       enable_coreference: true
       enable_decomposition: true
@@ -172,9 +168,13 @@ logging:
   format: "text"
 
 security:
+  api_key:
+    enabled: false
+    header_name: "X-API-Key"
   cors:
     enabled: true
     allow_origins: ["*"]
+    allow_credentials: false
     allow_methods: ["*"]
     allow_headers: ["*"]
 
@@ -183,3 +183,7 @@ performance:
   batch_size: 16
   max_concurrent_requests: 10
   worker_threads: 2
+  # Local embedding and reranking are synchronous GPU workloads. Keep them in
+  # a bounded executor so concurrent HTTP requests do not block the event loop
+  # or overcommit GPU memory.
+  gpu_inference_workers: 1

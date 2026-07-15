@@ -6,6 +6,7 @@
 - "rabbitmq" / "celery"：延迟导入 Celery 任务。
 """
 import json
+import os
 import uuid
 from pathlib import Path
 
@@ -25,6 +26,39 @@ config = get_settings()
 # ---------------------------------------------------------------------------
 # 结构: {task_id: {"status": str, "progress": int, "total_chunks": int, "error": str | None}}
 _task_registry: dict[str, dict] = {}
+_MAX_IN_MEMORY_TASKS = 1000
+
+
+def _remember_task(task_id: str, state: dict) -> None:
+    """Keep the local fallback bounded; distributed deployments should use Celery."""
+    _task_registry[task_id] = state
+    while len(_task_registry) > _MAX_IN_MEMORY_TASKS:
+        _task_registry.pop(next(iter(_task_registry)))
+
+
+async def _persist_task_state(task_id: str, state: dict) -> None:
+    _remember_task(task_id, state)
+    try:
+        from app.utils.cache import set_task_state
+
+        await set_task_state(task_id, state)
+    except Exception:
+        logger.debug("Task state persistence unavailable", exc_info=True)
+
+
+async def _load_task_state(task_id: str) -> dict | None:
+    state = _task_registry.get(task_id)
+    if state is not None:
+        return state
+    try:
+        from app.utils.cache import get_task_state
+
+        state = await get_task_state(task_id)
+        if state:
+            _remember_task(task_id, state)
+        return state
+    except Exception:
+        return None
 
 
 def _get_upload_dir() -> Path:
@@ -47,47 +81,52 @@ def _process_document_memory(
     """内存模式下的后台文档处理。"""
     import asyncio
 
-    _task_registry[task_id] = {
+    state = {
         "status": "processing",
         "progress": 0,
         "total_chunks": 0,
         "error": None,
     }
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(_persist_task_state(task_id, state))
     try:
         # 调用处理流水线
         from app.service.ingest_service import process_document
 
         # 在新的事件循环中运行异步任务
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
         result = loop.run_until_complete(
             process_document(file_path, filename, partition, metadata)
         )
-        loop.close()
-
         if result["status"] == "completed":
-            _task_registry[task_id] = {
+            loop.run_until_complete(_persist_task_state(task_id, {
                 "status": "completed",
                 "progress": 100,
                 "total_chunks": result["total_chunks"],
                 "error": None,
-            }
+            }))
             logger.info(f"Document processed: {task_id}, {result['total_chunks']} chunks")
         else:
-            _task_registry[task_id] = {
+            loop.run_until_complete(_persist_task_state(task_id, {
                 "status": "failed",
                 "progress": 0,
                 "total_chunks": 0,
                 "error": result.get("error", "Unknown error"),
-            }
+            }))
     except Exception as e:
         logger.error(f"Document processing failed for task {task_id}: {e}")
-        _task_registry[task_id] = {
+        loop.run_until_complete(_persist_task_state(task_id, {
             "status": "failed",
             "progress": 0,
             "total_chunks": 0,
             "error": str(e),
-        }
+        }))
+    finally:
+        try:
+            os.unlink(file_path)
+        except FileNotFoundError:
+            pass
+        loop.close()
 
 
 class DocumentIngestResponse(BaseModel):
@@ -129,7 +168,8 @@ async def ingest_document(
         摄入任务信息
     """
     # 验证文件类型
-    file_ext = file.filename.split(".")[-1].lower() if file.filename else ""
+    safe_filename = Path(file.filename or "unknown").name
+    file_ext = Path(safe_filename).suffix.removeprefix(".").lower()
     supported_formats = config["document_processing"]["supported_formats"]
 
     if file_ext not in supported_formats:
@@ -138,56 +178,78 @@ async def ingest_document(
             detail=f"Unsupported file format. Supported: {', '.join(supported_formats)}",
         )
 
-    # 验证文件大小
+    # Stream to disk so a large upload does not consume process memory.
     max_size = config["document_processing"]["max_file_size"]
-    content = await file.read()
-    if len(content) > max_size:
-        raise HTTPException(
-            status_code=400,
-            detail=f"File too large. Max size: {max_size / 1024 / 1024:.0f}MB",
-        )
-
-    # 生成任务ID
     task_id = str(uuid.uuid4())
-
-    # 保存文件（跨平台路径）
     upload_dir = _get_upload_dir()
-    file_path = upload_dir / f"{task_id}_{file.filename}"
-    with open(file_path, "wb") as f:
-        f.write(content)
+    file_path = upload_dir / f"{task_id}_{safe_filename}"
+    bytes_written = 0
+    try:
+        with open(file_path, "wb") as output:
+            while chunk := await file.read(1024 * 1024):
+                bytes_written += len(chunk)
+                if bytes_written > max_size:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"File too large. Max size: {max_size / 1024 / 1024:.0f}MB",
+                    )
+                output.write(chunk)
+    except Exception:
+        try:
+            os.unlink(file_path)
+        except FileNotFoundError:
+            pass
+        raise
 
     # 解析元数据
     try:
         metadata_dict = json.loads(metadata)
-    except json.JSONDecodeError:
-        metadata_dict = {}
+    except json.JSONDecodeError as exc:
+        try:
+            os.unlink(file_path)
+        except FileNotFoundError:
+            pass
+        raise HTTPException(status_code=400, detail="metadata must be valid JSON") from exc
+    if not isinstance(metadata_dict, dict):
+        try:
+            os.unlink(file_path)
+        except FileNotFoundError:
+            pass
+        raise HTTPException(status_code=400, detail="metadata must be a JSON object")
 
     # 根据队列提供方分发任务
     provider = _queue_provider()
     if provider in ("rabbitmq", "celery"):
         # 延迟导入，避免 memory 模式下强依赖 Celery
-        from app.workers.tasks import process_document_task
+        try:
+            from app.workers.tasks import process_document_task
 
-        task = process_document_task.delay(
-            file_path=str(file_path),
-            filename=file.filename or "unknown",
-            partition=partition,
-            metadata=metadata_dict,
-        )
-        task_id = task.id
+            task = process_document_task.delay(
+                file_path=str(file_path),
+                filename=safe_filename,
+                partition=partition,
+                metadata=metadata_dict,
+            )
+            task_id = task.id
+        except Exception as exc:
+            try:
+                os.unlink(file_path)
+            except FileNotFoundError:
+                pass
+            raise HTTPException(status_code=503, detail="Document queue unavailable") from exc
     else:
         # 内存模式：FastAPI 后台任务
-        _task_registry[task_id] = {
+        _remember_task(task_id, {
             "status": "pending",
             "progress": 0,
             "total_chunks": 0,
             "error": None,
-        }
+        })
         background_tasks.add_task(
             _process_document_memory,
             task_id=task_id,
             file_path=str(file_path),
-            filename=file.filename or "unknown",
+            filename=safe_filename,
             partition=partition,
             metadata=metadata_dict,
         )
@@ -196,7 +258,7 @@ async def ingest_document(
 
     return DocumentIngestResponse(
         task_id=task_id,
-        filename=file.filename or "unknown",
+        filename=safe_filename,
         status="processing",
         message="Document is being processed",
     )
@@ -238,15 +300,19 @@ async def get_document_status(task_id: str) -> DocumentStatus:
         }
         if result.state == "SUCCESS":
             info = result.info or {}
-            response_data["progress"] = 100
-            response_data["total_chunks"] = info.get("total_chunks", 0)
+            if isinstance(info, dict) and info.get("status") == "failed":
+                response_data["status"] = "failed"
+                response_data["error"] = info.get("error") or "Document ingestion failed"
+            else:
+                response_data["progress"] = 100
+                response_data["total_chunks"] = info.get("total_chunks", 0) if isinstance(info, dict) else 0
         elif result.state == "FAILURE":
             response_data["error"] = str(result.info)
 
         return DocumentStatus(**response_data)
 
     # 内存模式
-    state = _task_registry.get(task_id)
+    state = await _load_task_state(task_id)
     if state is None:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
 
@@ -264,14 +330,14 @@ async def delete_document(document_id: str) -> dict:
     Returns:
         删除结果
     """
-    from app.vectorstore.qdrant_client import delete_document
+    from app.vectorstore.storage_adapter import delete_document
 
     try:
         await delete_document(document_id)
         return {"status": "success", "message": f"Document {document_id} deleted"}
     except Exception as e:
         logger.error(f"Failed to delete document {document_id}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Document deletion failed") from e
 
 
 @router.get("/documents")
@@ -286,11 +352,43 @@ async def list_documents(skip: int = 0, limit: int = 100) -> dict:
     Returns:
         文档列表
     """
-    from app.vectorstore.qdrant_client import list_documents as list_docs
+    from app.vectorstore.storage_adapter import list_documents as list_docs
 
     try:
         documents = await list_docs(skip=skip, limit=limit)
         return {"total": len(documents), "documents": documents}
     except Exception as e:
         logger.error(f"Failed to list documents: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Document listing failed") from e
+
+
+@router.get("/documents/{document_id}/chunks")
+async def list_document_chunks(
+    document_id: str,
+    skip: int = 0,
+    limit: int = 2000,
+) -> dict:
+    """
+    列出某个文档真实入库切片。
+
+    Args:
+        document_id: 文档ID
+        skip: 跳过数量
+        limit: 返回数量
+
+    Returns:
+        切片列表，content 为数据库实际存储并参与检索的文本
+    """
+    from app.vectorstore.storage_adapter import list_document_chunks as list_chunks
+
+    try:
+        bounded_limit = max(1, min(limit, 5000))
+        data = await list_chunks(document_id=document_id, skip=skip, limit=bounded_limit)
+        return {
+            "document_id": document_id,
+            "total": data.get("total", 0),
+            "chunks": data.get("chunks", []),
+        }
+    except Exception as e:
+        logger.error(f"Failed to list document chunks for {document_id}: {e}")
+        raise HTTPException(status_code=500, detail="Document chunk listing failed") from e

@@ -48,34 +48,20 @@ reranker:
   device: "cuda"
   batch_size: 16
   top_n: 5
-  # 重排后的绝对相关性阈值，作用于 sigmoid(logit) 校准概率（跨 query 可比）。
+  # 重排后的绝对相关性阈值；多查询分数需再用原始问题统一重排后才可比较。
   # 低于此值的文档被丢弃，允许返回 0 条（"无相关法条" 是合法答案）。
   # null = 关闭阈值过滤（仅按概率排序后取 top_n）。需在真实法律语料上校准后再设值，建议从 0.5 起步。
-  score_threshold: null
+  score_threshold: 0.5
 
-# 向量数据库配置 - Chroma
-chroma:
-  # 生产环境建议用 HTTP 模式连独立 Chroma Server
-  mode: "http"            # persistent | http
-  host: "chroma"
-  port: 8000
-  # persistent 模式时使用：
-  persist_directory: "/app/data/chroma"
-
-  # 集合配置
-  collection:
-    name: "rag_documents"
-    description: "RAG knowledge base"
-    dimension: 1024        # BGE-M3维度
-    distance: "cosine"     # cosine | l2 | ip（BGE-M3已归一化）
-
-  # 按文档类型区分（Chroma 用 metadata 实现，无原生分区）
-  enable_partition: true
-  partitions:
-    - "text"
-    - "table"
-    - "image"
-    - "mixed"
+postgres:
+  host: "postgres"
+  port: 5432
+  database: "rag_db"
+  user: "postgres"
+  password: "${POSTGRES_PASSWORD}"
+  min_pool_size: 1
+  max_pool_size: 10
+  command_timeout: 60
 
 # Redis缓存配置
 redis:
@@ -88,8 +74,8 @@ redis:
   semantic_cache:
     enabled: true
     ttl: 3600  # 1小时
-    similarity_threshold: 0.95  # 相似度阈值
-    max_cache_size: 10000
+    # Deterministic context-aware answer cache. This is not vector similarity.
+    cache_version: "1"
 
 # RabbitMQ配置
 rabbitmq:
@@ -145,6 +131,12 @@ rag:
     # （reranker.score_threshold，作用于 sigmoid 校准概率）。
     similarity_threshold: 0.05
     enable_rerank: true
+    max_chunks_per_document: 12
+    # 多查询召回后，用原始问题统一重排并动态裁剪生成上下文。
+    dynamic_context_selection: true
+    flat_score_top_n: 2
+    min_final_rerank_spread: 0.05
+    min_final_rerank_gap: 0.08
     enable_hybrid: false  # 混合检索（BM25+向量）
     alpha: 0.5  # 混合权重
 
@@ -220,7 +212,7 @@ logging:
 security:
   # API认证
   api_key:
-    enabled: false
+    enabled: true
     header_name: "X-API-Key"
 
   # JWT认证
@@ -233,7 +225,8 @@ security:
   # CORS
   cors:
     enabled: true
-    allow_origins: ["*"]
+    allow_origins: []
+    allow_credentials: false
     allow_methods: ["*"]
     allow_headers: ["*"]
 
@@ -246,6 +239,7 @@ performance:
   # 并发控制
   max_concurrent_requests: 100
   worker_threads: 4
+  gpu_inference_workers: 1
 
   # 连接池
   db_pool_size: 20

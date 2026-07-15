@@ -1,0 +1,9 @@
+{"id":"civil-falling-object","query":"小区共有外墙瓷砖脱落砸伤行人，应由谁承担责任？","expected_citations":["第一千二百五十三条"],"expected_sources":["中华人民共和国民法典"],"expected_answer":"建筑物所有人、管理人或者使用人不能证明自己没有过错的，应承担侵权责任；赔偿后可向其他责任人追偿。"}
+{"id":"civil-spouse-debt","query":"婚姻存续期间一方超出家庭日常生活需要所负债务，何时属于夫妻共同债务？","expected_citations":["第一千零六十四条"],"expected_sources":["中华人民共和国民法典"],"expected_answer":"债权人能够证明该债务用于夫妻共同生活、共同生产经营或者基于夫妻双方共同意思表示时，属于共同债务。"}
+{"id":"criminal-minor-liability","query":"已满十二周岁不满十四周岁的人在什么条件下负刑事责任？","expected_citations":["第十七条"],"expected_sources":["中华人民共和国刑法"],"expected_answer":"犯故意杀人、故意伤害罪，致人死亡或者以特别残忍手段致人重伤造成严重残疾，情节恶劣，经最高人民检察院核准追诉的，应负刑事责任。"}
+{"id":"criminal-theft-embezzlement","query":"盗窃罪与职务侵占罪的核心区别是什么？","expected_citations":["第二百六十四条","第二百七十一条"],"expected_sources":["中华人民共和国刑法"],"expected_answer":"核心区别在于行为人是否利用职务便利侵占本单位财物；普通秘密窃取通常适用盗窃罪。"}
+{"id":"criminal-coerced-accomplice","query":"受胁迫参加犯罪的胁从犯依法应如何处罚？","expected_citations":["第二十八条"],"expected_sources":["中华人民共和国刑法"],"expected_answer":"应当按照其犯罪情节减轻处罚或者免除处罚。"}
+{"id":"labor-open-ended-contract","query":"连续订立几次固定期限劳动合同后应订立无固定期限劳动合同？","expected_citations":["第十四条"],"expected_sources":["中华人民共和国劳动合同法"],"expected_answer":"连续订立二次固定期限劳动合同，且劳动者不存在法定例外情形，续订时除劳动者提出固定期限合同外，应订立无固定期限劳动合同。"}
+{"id":"labor-probation-dismissal","query":"试用期被证明不符合录用条件而解除合同，是否需要支付经济补偿？","expected_citations":["第三十九条","第四十六条"],"expected_sources":["中华人民共和国劳动合同法"],"expected_answer":"用人单位可依法解除，通常不属于应支付经济补偿的法定情形。"}
+{"id":"civil-employee-tort","query":"工作人员执行工作任务造成他人损害，侵权责任由谁承担？","expected_citations":["第一千一百九十一条"],"expected_sources":["中华人民共和国民法典"],"expected_answer":"由用人单位承担侵权责任；工作人员有故意或者重大过失的，用人单位承担后可以追偿。"}
+{"id":"criminal-illegal-detention","query":"非法拘禁中使用暴力致人伤残、死亡，应如何定罪？","expected_citations":["第二百三十八条"],"expected_sources":["中华人民共和国刑法"],"expected_answer":"使用暴力致人伤残、死亡的，依照故意伤害罪、故意杀人罪定罪处罚。"}

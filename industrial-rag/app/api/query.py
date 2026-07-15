@@ -8,8 +8,9 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.api.retrieval_params import resolve_retrieval_params
-from app.utils.config import get_settings
+from app.retrieval.result_merge import result_score
 from app.service.chat_service import Generator
+from app.utils.config import get_settings
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -60,7 +61,7 @@ class AnswerResponse(BaseModel):
 
 def _retrieval_engine():
     retrieval_cfg = get_settings().get("rag", {}).get("retrieval", {})
-    if retrieval_cfg.get("use_postgres", True) or retrieval_cfg.get("enable_hybrid", True):
+    if retrieval_cfg.get("enable_hybrid", True):
         from app.retrieval.hybrid import HybridRetrievalEngine
 
         return HybridRetrievalEngine()
@@ -71,12 +72,11 @@ def _retrieval_engine():
 
 
 def _to_retrieved_document(doc: dict) -> RetrievedDocument:
-    score = float(doc.get("rrf_score", doc.get("score", 0.0)) or 0.0)
     metadata = doc.get("metadata") or {}
     return RetrievedDocument(
         id=str(doc.get("id")),
         content=doc.get("content", ""),
-        score=score,
+        score=result_score(doc),
         metadata=metadata,
         chunk_index=int(metadata.get("chunk_index", doc.get("chunk_index", 0)) or 0),
     )
@@ -108,7 +108,7 @@ async def query_documents(request: QueryRequest) -> QueryResponse:
         )
     except Exception as exc:
         logger.error("Query failed: %s", exc, exc_info=True)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail="Query failed") from exc
 
 
 @router.post("/answer", response_model=AnswerResponse)
@@ -147,7 +147,7 @@ async def answer_question(request: AnswerRequest) -> AnswerResponse | StreamingR
                     yield f"data: {json.dumps({'type': 'done', 'total_time': time.time() - start}, ensure_ascii=False)}\n\n"
                 except Exception as exc:
                     logger.error("Answer stream failed: %s", exc, exc_info=True)
-                    yield f"data: {json.dumps({'type': 'error', 'error': str(exc)}, ensure_ascii=False)}\n\n"
+                    yield f"data: {json.dumps({'type': 'error', 'error': 'Answer generation failed'}, ensure_ascii=False)}\n\n"
 
             return StreamingResponse(
                 stream_generator(),
@@ -178,4 +178,4 @@ async def answer_question(request: AnswerRequest) -> AnswerResponse | StreamingR
         )
     except Exception as exc:
         logger.error("Answer generation failed: %s", exc, exc_info=True)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail="Answer generation failed") from exc

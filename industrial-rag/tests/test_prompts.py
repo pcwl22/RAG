@@ -36,6 +36,10 @@ def test_rag_prompt_uses_template_parts():
     assert "用户问题" in prompt
     assert "【回答】" in prompt
     assert "依据" in prompt
+    assert "不同观点" in prompt
+    assert "单线逻辑" in prompt
+    assert "相邻条文" in prompt
+    assert "基础主体、法律关系或权利义务" in prompt
 
 
 def test_system_prompt_combines_role_business_and_citation():
@@ -44,6 +48,9 @@ def test_system_prompt_combines_role_business_and_citation():
     assert "RAG" in system_prompt
     assert "业务规则" in system_prompt
     assert "引用要求" in system_prompt
+    assert "不同裁判口径" in system_prompt
+    assert "强相关上下文" in system_prompt
+    assert "基础法律关系" in system_prompt
 
 
 def test_generator_builds_normal_and_stream_prompts_from_templates():

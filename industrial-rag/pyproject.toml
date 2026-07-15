@@ -18,7 +18,6 @@ dependencies = [
     "llama-index>=0.10.0",
     "llama-index-llms-vllm>=0.1.0",
     "llama-index-embeddings-huggingface>=0.1.0",
-    "llama-index-vector-stores-chroma>=0.1.0",
     "transformers>=4.38.0",
     "torch>=2.2.0",
     "sentence-transformers>=2.3.0",
@@ -30,7 +29,6 @@ dependencies = [
     "zhipuai>=2.0.0",        # 智谱AI
 
     # Vector Database
-    "chromadb>=0.5.0",
     "redis>=5.0.0",
     "asyncpg>=0.29.0",      # PostgreSQL async driver
     "psycopg2-binary>=2.9.0",  # PostgreSQL sync driver
@@ -101,6 +99,16 @@ benchmark = [
     "seaborn>=0.13.0",
 ]
 
+# Ragas 0.4.3 still imports integrations removed by LangChain Community 0.4.
+# Keep this optional evaluation stack pinned until upstream relaxes that coupling.
+evaluation = [
+    "ragas==0.4.3",
+    "langchain==0.3.27",
+    "langchain-community==0.3.31",
+    "langchain-core==0.3.80",
+    "langchain-openai==0.3.35",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -161,7 +169,6 @@ module = [
     "pymilvus.*",
     "magic_pdf.*",
     "FlagEmbedding.*",
-    "chromadb.*",
 ]
 ignore_missing_imports = true
 
@@ -171,3 +178,7 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-v --cov=app --cov-report=html --cov-report=term-missing --basetemp=.pytest_tmp -p no:cacheprovider"
+
+[tool.coverage.report]
+# Ratchet this upward as PostgreSQL, cache, model and upload integration tests land.
+fail_under = 60

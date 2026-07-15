@@ -1,12 +1,43 @@
-# 1. 启动数据库
+# RAG 项目环境启动说明
+
+## 1. 启动基础服务（PostgreSQL + Redis）
+
 cd E:\RAG
-docker-compose up -d
+docker compose up -d
 
-# 2. 启动后端API
-cd /d E:\RAG\industrial-rag
+说明：
+- PostgreSQL: `localhost:5432`
+- Redis: `localhost:16379`
+- 当前 `industrial-rag/config/laptop.yaml` 使用 Redis `16379`，因此数据库服务从 `E:\RAG` 根目录启动。
+
+## 2. 启动后端 API
+
+cd  /d E:\RAG\industrial-rag
 conda activate industrial-rag
-python -m uvicorn src.api.main:app --reload
+python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 
-# 3. 启动前端（新终端）
-cd E:\RAG\rag-frontend
+
+后端访问：
+- 健康检查：http://127.0.0.1:8000/health
+- API 文档：http://127.0.0.1:8000/docs
+
+## 3. 运行后端测试（可选）
+
+cd E:\RAG\industrial-rag
+conda activate industrial-rag
+python -m pytest
+
+
+## 4. 启动前端（新终端）
+
+cd /d E:\RAG\rag-frontend
 npm run dev
+
+
+## 5. 当前项目入口
+
+- 后端主项目：`E:\RAG\industrial-rag`
+- 后端代码入口：`E:\RAG\industrial-rag\app`
+- 前端项目：`E:\RAG\rag-frontend`
+- 提示词目录：`E:\RAG\industrial-rag\prompts`
+- 测试目录：`E:\RAG\industrial-rag\tests`

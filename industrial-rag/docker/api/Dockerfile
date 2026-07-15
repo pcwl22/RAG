@@ -12,13 +12,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libreoffice \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml .
-RUN pip install --no-cache-dir -e . && \
-    pip install --no-cache-dir gunicorn
-
+COPY pyproject.toml README.md ./
 COPY app/ ./app/
 COPY prompts/ ./prompts/
 COPY config/ ./config/
+
+RUN pip install --no-cache-dir . gunicorn
 
 RUN mkdir -p /app/data /app/models
 

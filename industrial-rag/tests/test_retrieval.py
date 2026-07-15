@@ -2,6 +2,9 @@
 import asyncio
 
 from app.retrieval import dense, hybrid, reranker
+from app.retrieval.legal_concept_map import match_legal_concept_articles
+from app.retrieval.result_merge import merge_retrieval_results, result_score
+from app.vectorstore import postgres_store
 from app.vectorstore.postgres_store import _extract_chinese_keywords
 
 
@@ -40,6 +43,41 @@ def test_reranker_falls_back_when_model_unavailable(monkeypatch):
     assert reranker.rerank_documents("query", docs, top_n=1) == [docs[0]]
 
 
+def test_result_score_uses_first_valid_rank_score():
+    assert (
+        result_score(
+            {
+                "score": "0.62",
+                "rrf_score": 9.0,
+                "metadata": {"rerank_prob": "not-a-number"},
+            }
+        )
+        == 0.62
+    )
+    assert result_score({"metadata": {"rerank_prob": 0.0}, "score": 0.9}) == 0.0
+
+
+def test_merge_prioritizes_controlled_article_ids():
+    results = merge_retrieval_results(
+        [
+            [
+                {"id": "unmapped-high", "score": 0.99, "metadata": {}},
+                {
+                    "id": "mapped-low",
+                    "score": 0.2,
+                    "metadata": {"semantic_chunk_id": "劳动合同法_劳动合同的订立_7条"},
+                },
+            ]
+        ],
+        top_k=1,
+        queries=["mapped query"],
+        priority_ids=["劳动合同法_劳动合同的订立_7条"],
+    )
+
+    assert [doc["id"] for doc in results] == ["mapped-low"]
+    assert results[0]["mapped_article_priority"] == 1
+
+
 def test_legal_keyword_extraction_uses_query_terms_without_article_mapping():
     keywords = _extract_chinese_keywords("多次贩卖含依托咪酯的上头电子烟，如何定罪？")
 
@@ -47,6 +85,106 @@ def test_legal_keyword_extraction_uses_query_terms_without_article_mapping():
     assert "第三百五十七条" not in keywords
     assert any("依托咪酯" in keyword for keyword in keywords)
     assert any("电子烟" in keyword for keyword in keywords)
+
+
+def test_legal_keyword_extraction_preserves_semantic_chunk_ids():
+    keywords = _extract_chinese_keywords(
+        "未缴社保 经济补偿 劳动合同法_劳动合同的解除和终止_46条"
+    )
+
+    assert "劳动合同法_劳动合同的解除和终止_46条" in keywords
+
+
+def test_controlled_mappings_cover_comparison_and_coerced_accomplice():
+    comparison = match_legal_concept_articles("盗窃罪与职务侵占罪的核心区别是什么？")
+    comparison_ids = {
+        article["semantic_chunk_id"]
+        for mapping in comparison
+        for article in mapping["articles"]
+    }
+    coerced = match_legal_concept_articles("受胁迫参加犯罪的胁从犯依法应如何处罚？")
+    coerced_ids = {
+        article["semantic_chunk_id"]
+        for mapping in coerced
+        for article in mapping["articles"]
+    }
+
+    assert "刑法_分则_侵犯财产罪_盗窃罪_264条" in comparison_ids
+    assert "刑法_分则_侵犯财产罪_职务侵占罪_271条" in comparison_ids
+    assert "刑法_总则_犯罪_共同犯罪_28条" in coerced_ids
+
+
+def test_explicit_legal_citations_extracts_multiple_articles_and_longest_law_name():
+    articles, laws = hybrid._explicit_legal_citations(
+        "对比《中华人民共和国劳动合同法实施条例》第五条与第六条。"
+    )
+    assert articles == ["第五条", "第六条"]
+    assert laws == ["中华人民共和国劳动合同法实施条例"]
+
+
+def test_out_of_scope_signals_distinguish_procedure_from_criminal_provision():
+    assert hybrid._is_known_out_of_scope("增值税专用发票抵扣期限如何规定") is True
+    assert hybrid._is_known_out_of_scope("出口退税备案材料有哪些") is True
+    assert hybrid._is_known_out_of_scope("无线电频率许可如何申请") is True
+    assert hybrid._is_known_out_of_scope("虚开增值税专用发票如何定罪") is False
+
+
+def test_keyword_search_applies_partition_to_all_or_terms(monkeypatch):
+    captured = {}
+
+    class FakeCursor:
+        def execute(self, sql, params):
+            captured["sql"] = " ".join(sql.split())
+            captured["params"] = params
+
+        def fetchall(self):
+            return []
+
+        def close(self):
+            pass
+
+    class FakeConnection:
+        def rollback(self):
+            captured["rolled_back"] = True
+
+        def cursor(self, *args, **kwargs):
+            return FakeCursor()
+
+    class FakePool:
+        def putconn(self, conn, close=False):
+            captured["returned_connection"] = conn
+            captured["connection_discarded"] = close
+
+    monkeypatch.setattr(postgres_store, "_connection", lambda: FakeConnection())
+    monkeypatch.setattr(postgres_store, "_pool", FakePool())
+    monkeypatch.setattr(postgres_store, "_extract_chinese_keywords", lambda query: ["社保", "补偿"])
+
+    assert postgres_store._keyword_search_sync("社保补偿", top_k=5, partition="labor") == []
+    assert "WHERE (" in captured["sql"]
+    assert ") AND partition = %s" in captured["sql"]
+    assert captured["params"][-2:] == ["labor", 5]
+    assert captured["rolled_back"] is True
+    assert captured["connection_discarded"] is False
+
+
+def test_failed_rollback_discards_connection(monkeypatch):
+    captured = {}
+
+    class BrokenConnection:
+        def rollback(self):
+            raise RuntimeError("connection lost")
+
+    class FakePool:
+        def putconn(self, conn, close=False):
+            captured["connection"] = conn
+            captured["discarded"] = close
+
+    connection = BrokenConnection()
+    monkeypatch.setattr(postgres_store, "_pool", FakePool())
+
+    postgres_store._return_connection(connection)
+
+    assert captured == {"connection": connection, "discarded": True}
 
 
 def test_retrievers_default_threshold_matches_config_default(monkeypatch):

@@ -2,10 +2,11 @@
 简化的查询路由 - 绕过 Pydantic 验证问题
 修复中文编码问题
 """
-from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import JSONResponse
-import time
 import json
+import time
+
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
 
 from app.api.retrieval_params import resolve_retrieval_params
 from app.retrieval.dense import RetrievalEngine
@@ -87,7 +88,7 @@ async def query_simple(request: Request):
         logger.error(f"Simple query failed: {e}", exc_info=True)
         return JSONResponse(
             status_code=500,
-            content={"error": str(e)},
+            content={"error": "Query failed"},
             media_type="application/json; charset=utf-8"
         )
 
@@ -183,6 +184,6 @@ async def answer_simple(request: Request):
         logger.error(f"Simple answer failed: {e}", exc_info=True)
         return JSONResponse(
             status_code=500,
-            content={"error": str(e)},
+            content={"error": "Answer generation failed"},
             media_type="application/json; charset=utf-8"
         )

@@ -10,11 +10,14 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from app.utils.config import get_settings
-from app.utils.logger import get_logger
-from app.parser.chunk import ParentChildChunker
-from app.embedding.embedder import encode_texts
-from app.vectorstore.postgres_store import init_postgres_store, close_postgres_store, add_documents
+from app.embedding.embedder import encode_texts  # noqa: E402
+from app.parser.chunk import ParentChildChunker  # noqa: E402
+from app.utils.logger import get_logger  # noqa: E402
+from app.vectorstore.postgres_store import (  # noqa: E402
+    add_documents,
+    close_postgres_store,
+    init_postgres_store,
+)
 
 logger = get_logger(__name__)
 
@@ -28,8 +31,9 @@ async def rechunk_all_documents():
 
     try:
         # 1. 获取所有现有文档
-        from app.vectorstore.postgres_store import _connection
         import psycopg2.extras
+
+        from app.vectorstore.postgres_store import _connection
 
         conn = _connection()
         cur = None

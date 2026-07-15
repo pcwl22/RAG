@@ -1,7 +1,7 @@
 """FastAPI application entrypoint for the rag-system layout."""
 import time
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,9 +14,11 @@ except ImportError:
 
 from app.api import chat, search, upload
 from app.embedding.embedder import load_embedding_model
+from app.security import authentication_middleware, validate_security_config
 from app.utils.config import get_settings
+from app.utils.inference import close_inference_executor
 from app.utils.logger import get_logger
-from app.vectorstore.qdrant_client import close_vector_store, init_vector_store
+from app.vectorstore.storage_adapter import close_vector_store, init_vector_store
 
 logger = get_logger(__name__)
 
@@ -26,23 +28,33 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Manage application startup and shutdown."""
     logger.info("Starting RAG System...")
 
-    await init_vector_store()
-    logger.info("Vector store initialized")
+    try:
+        await init_vector_store()
+        app.state.dependencies["postgres"] = True
+        logger.info("Vector store initialized")
+    except Exception as exc:
+        logger.error("Vector store initialization failed: %s", exc, exc_info=True)
 
     try:
         from app.utils.cache import init_redis
 
-        await init_redis()
+        app.state.dependencies["redis"] = await init_redis()
     except Exception as exc:
         logger.warning(f"Redis initialization failed: {exc}. Caching will be disabled.")
 
-    load_embedding_model()
-    logger.info("System ready")
+    try:
+        load_embedding_model()
+        app.state.dependencies["embedding"] = True
+    except Exception as exc:
+        logger.error("Embedding model initialization failed: %s", exc, exc_info=True)
+    logger.info("System ready (dependencies=%s)", app.state.dependencies)
+    app.state.startup_complete = True
 
     yield
 
     logger.info("Shutting down...")
-    await close_vector_store()
+    if app.state.dependencies.get("postgres"):
+        await close_vector_store()
 
     try:
         from app.utils.cache import close_redis
@@ -50,9 +62,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await close_redis()
     except Exception as exc:
         logger.warning(f"Redis shutdown failed: {exc}")
+    close_inference_executor()
 
 
 config = get_settings()
+validate_security_config(config)
 
 app = FastAPI(
     title="RAG System",
@@ -60,16 +74,20 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+app.state.dependencies = {"postgres": False, "embedding": False, "redis": False}
+app.state.startup_complete = False
 
 if config.get("security", {}).get("cors", {}).get("enabled", True):
     cors_config = config["security"]["cors"]
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cors_config.get("allow_origins", ["*"]),
-        allow_credentials=True,
+        allow_credentials=bool(cors_config.get("allow_credentials", False)),
         allow_methods=cors_config.get("allow_methods", ["*"]),
         allow_headers=cors_config.get("allow_headers", ["*"]),
     )
+
+app.middleware("http")(authentication_middleware(config))
 
 
 @app.middleware("http")
@@ -117,11 +135,31 @@ if Instrumentator is not None and config.get("monitoring", {}).get("prometheus",
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
+    dependencies = getattr(app.state, "dependencies", {})
+    ready = getattr(app.state, "startup_complete", False) and all(
+        dependencies.get(name, False) for name in ("postgres", "embedding")
+    )
     return {
-        "status": "healthy",
+        "status": "healthy" if ready else "degraded",
         "version": "1.0.0",
         "timestamp": int(time.time()),
+        "dependencies": dependencies,
     }
+
+
+@app.get("/health/live")
+async def liveness_check():
+    return {"status": "alive", "timestamp": int(time.time())}
+
+
+@app.get("/health/ready")
+async def readiness_check():
+    dependencies = getattr(app.state, "dependencies", {})
+    ready = getattr(app.state, "startup_complete", False) and all(
+        dependencies.get(name, False) for name in ("postgres", "embedding")
+    )
+    payload = {"status": "ready" if ready else "not_ready", "dependencies": dependencies}
+    return JSONResponse(status_code=200 if ready else 503, content=payload)
 
 
 @app.get("/")

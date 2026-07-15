@@ -7,8 +7,6 @@ environment, so device selection is controlled by config and can use GPU.
 """
 from __future__ import annotations
 
-from typing import List
-
 from app.utils.config import get_settings
 from app.utils.logger import get_logger
 
@@ -17,13 +15,32 @@ logger = get_logger(__name__)
 _embedding_model = None
 
 
+def resolve_torch_device(configured_device: str | None) -> str:
+    """Return a usable torch device, falling back to CPU when CUDA is unavailable."""
+    device = str(configured_device or "cpu")
+    if not device.startswith("cuda"):
+        return device
+
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return device
+    except Exception:
+        pass
+
+    logger.warning("Configured device %s is unavailable; falling back to cpu", device)
+    return "cpu"
+
+
 def get_embedding_runtime_info() -> dict[str, str | bool | None]:
     """Return runtime device information for the embedding model."""
     config = get_settings()
     device = config.get("embedding", {}).get("device", "cuda")
+    resolved_config_device = resolve_torch_device(device)
     info: dict[str, str | bool | None] = {
         "configured_device": device,
-        "resolved_device": None,
+        "resolved_device": resolved_config_device,
         "gpu_name": None,
         "cuda_available": None,
     }
@@ -49,11 +66,8 @@ def get_embedding_runtime_info() -> dict[str, str | bool | None]:
             info["gpu_name"] = torch.cuda.get_device_name(gpu_index)
             if info["resolved_device"] is None:
                 info["resolved_device"] = f"cuda:{gpu_index}"
-        elif info["resolved_device"] is None:
-            info["resolved_device"] = str(device)
     except Exception:
-        if info["resolved_device"] is None:
-            info["resolved_device"] = str(device)
+        pass
 
     return info
 
@@ -76,8 +90,9 @@ def load_embedding_model():
     embed_config = config["embedding"]
     model_path = embed_config["model_path"]
 
-    # Device selection is driven by embedding.device in config.
-    device = embed_config.get("device", "cuda")
+    # Device selection is driven by embedding.device in config, with a local
+    # CPU fallback for environments where torch was installed without CUDA.
+    device = resolve_torch_device(embed_config.get("device", "cuda"))
 
     logger.info(f"Loading embedding model: {model_path} (device={device})")
 
@@ -111,7 +126,7 @@ def get_embedding_model():
     return _embedding_model
 
 
-def encode_texts(texts: List[str], batch_size: int = 32) -> List[List[float]]:
+def encode_texts(texts: list[str], batch_size: int = 32) -> list[list[float]]:
     """
     Encode a list of texts into embedding vectors.
 
@@ -140,7 +155,7 @@ def encode_texts(texts: List[str], batch_size: int = 32) -> List[List[float]]:
         raise
 
 
-def encode_query(query: str) -> List[float]:
+def encode_query(query: str) -> list[float]:
     """
     Encode a single query.
 

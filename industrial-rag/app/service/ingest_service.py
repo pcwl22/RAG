@@ -9,6 +9,7 @@ from app.parser.document_parser import parse_document
 from app.parser.legal_parser import build_legal_article_chunks
 from app.parser.parent_child_chunking import chunk_text_parent_child
 from app.utils.config import get_settings
+from app.utils.inference import run_inference
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -23,9 +24,19 @@ def _chunking_config() -> dict:
 
 
 def _storage_backend():
-    from app.vectorstore.qdrant_client import add_documents
+    from app.vectorstore.storage_adapter import add_documents
 
     return add_documents
+
+
+def _dedupe_chunk_id(base_id: str, seen: set[str]) -> str:
+    chunk_id = base_id
+    suffix = 2
+    while chunk_id in seen:
+        chunk_id = f"{base_id}_{suffix}"
+        suffix += 1
+    seen.add(chunk_id)
+    return chunk_id
 
 
 async def process_document(
@@ -90,18 +101,16 @@ async def process_document(
         )
         for start in range(0, len(chunks), batch_size):
             batch = chunks[start : start + batch_size]
-            embeddings.extend(encode_texts(batch, batch_size=len(batch)))
+            embeddings.extend(await run_inference(encode_texts, batch, batch_size=len(batch)))
 
         embedding_elapsed = time.perf_counter() - embedding_start
 
         base_metadata = metadata or {}
         chunk_ids: list[str] = []
         chunk_metadatas: list[dict[str, Any]] = []
+        seen_chunk_ids: set[str] = set()
 
         for index, chunk in enumerate(chunks):
-            chunk_id = f"{document_id}_chunk_{index}"
-            chunk_ids.append(chunk_id)
-
             chunk_meta: dict[str, Any] = {
                 **base_metadata,
                 "document_id": document_id,
@@ -109,11 +118,17 @@ async def process_document(
                 "chunk_index": index,
                 "total_chunks": len(chunks),
                 "chunk_length": len(chunk),
+                "chunk_strategy": effective_strategy,
                 "partition": partition,
             }
 
             if chunk_metadata_overrides:
                 chunk_meta.update(chunk_metadata_overrides[index])
+
+            chunk_id_base = str(chunk_meta.get("semantic_chunk_id") or f"{document_id}_chunk_{index}")
+            chunk_id = _dedupe_chunk_id(chunk_id_base, seen_chunk_ids)
+            chunk_ids.append(chunk_id)
+            chunk_meta["chunk_id"] = chunk_id
 
             if child_chunks:
                 child = child_chunks[index]
@@ -137,6 +152,12 @@ async def process_document(
             metadatas=chunk_metadatas,
             partition=partition,
         )
+        try:
+            from app.utils.cache import invalidate_semantic_cache
+
+            await invalidate_semantic_cache()
+        except Exception:
+            logger.debug("Semantic cache invalidation unavailable", exc_info=True)
 
         total_elapsed = time.perf_counter() - pipeline_start
         logger.info(

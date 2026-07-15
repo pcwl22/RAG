@@ -41,6 +41,9 @@ coverage/
 # External downloaded skill package
 /ui-ux-pro-max-skill/
 
+# External legal RAG evaluation toolkit clone
+/LRAGE/
+
 # Editors and OS files
 .idea/
 .vscode/

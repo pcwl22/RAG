@@ -2,13 +2,14 @@
 对话API路由
 """
 import json
-from typing import List
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.api.retrieval_params import resolve_retrieval_params
+from app.service.enhanced_query_service import EnhancedQueryOptions, EnhancedQueryService
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -19,14 +20,14 @@ SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 class Message(BaseModel):
     """消息"""
 
-    role: str = Field(..., description="角色: user/assistant/system")
-    content: str = Field(..., description="消息内容")
+    role: Literal["user", "assistant", "system"] = Field(..., description="角色")
+    content: str = Field(..., min_length=1, max_length=8000, description="消息内容")
 
 
 class ChatRequest(BaseModel):
     """对话请求"""
 
-    messages: List[Message] = Field(..., description="对话历史")
+    messages: list[Message] = Field(..., min_length=1, max_length=100, description="对话历史")
     use_rag: bool = Field(default=True, description="是否使用RAG")
     top_k: int | None = Field(default=None, description="检索文档数；不传则使用配置默认值", ge=1, le=50)
     similarity_threshold: float | None = Field(
@@ -36,15 +37,15 @@ class ChatRequest(BaseModel):
         le=1.0,
     )
     enable_rerank: bool | None = Field(default=None, description="是否启用重排；不传则使用配置默认值")
-    temperature: float = Field(default=0.7, description="生成温度", ge=0.0, le=2.0)
-    max_tokens: int = Field(default=2048, description="最大生成token数", ge=1, le=4096)
+    temperature: float = Field(default=0.7, description="非 RAG 对话生成温度", ge=0.0, le=2.0)
+    max_tokens: int = Field(default=2048, description="非 RAG 对话最大生成 token 数", ge=1, le=4096)
 
 
 class ChatResponse(BaseModel):
     """对话响应"""
 
     message: Message
-    sources: List[dict] | None = None
+    sources: list[dict] | None = None
 
 
 @router.post("/chat", response_model=ChatResponse)
@@ -58,41 +59,33 @@ async def chat(request: ChatRequest) -> ChatResponse:
     Returns:
         对话响应
     """
+    user_message = next((msg for msg in reversed(request.messages) if msg.role == "user"), None)
+    if not user_message:
+        raise HTTPException(status_code=400, detail="No user message found")
+
     try:
         from app.service.chat_service import Generator
 
         generator = Generator()
 
-        # 获取最后一条用户消息
-        user_message = next((msg for msg in reversed(request.messages) if msg.role == "user"), None)
-        if not user_message:
-            raise HTTPException(status_code=400, detail="No user message found")
-
         sources = None
 
         # 如果启用RAG，先检索
         if request.use_rag:
-            from app.retrieval.dense import RetrievalEngine
-
             params = resolve_retrieval_params(
                 top_k=request.top_k,
                 similarity_threshold=request.similarity_threshold,
                 enable_rerank=request.enable_rerank,
             )
-            engine = RetrievalEngine()
-            results = await engine.retrieve(
+            result = await EnhancedQueryService().run(EnhancedQueryOptions(
                 query=user_message.content,
+                chat_history=[msg.model_dump() for msg in request.messages[:-1]],
                 top_k=params.top_k,
                 similarity_threshold=params.similarity_threshold,
                 enable_rerank=params.enable_rerank,
-            )
-            sources = results
-
-            # 生成带上下文的答案
-            answer = await generator.generate(
-                query=user_message.content,
-                context_docs=results,
-            )
+            ))
+            sources = result.results
+            answer = result.answer
         else:
             # 直接对话，不使用RAG
             answer = await generator.chat(
@@ -105,7 +98,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
 
     except Exception as e:
         logger.error(f"Chat failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Chat request failed") from e
 
 
 @router.post("/chat/stream")
@@ -136,38 +129,20 @@ async def chat_stream(request: ChatRequest):
 
             # 如果启用RAG，先检索并发送来源
             if request.use_rag:
-                from app.retrieval.dense import RetrievalEngine
-
                 params = resolve_retrieval_params(
                     top_k=request.top_k,
                     similarity_threshold=request.similarity_threshold,
                     enable_rerank=request.enable_rerank,
                 )
-                engine = RetrievalEngine()
-                results = await engine.retrieve(
+                options = EnhancedQueryOptions(
                     query=user_message.content,
+                    chat_history=[msg.model_dump() for msg in request.messages[:-1]],
                     top_k=params.top_k,
                     similarity_threshold=params.similarity_threshold,
                     enable_rerank=params.enable_rerank,
                 )
-
-                # 发送来源信息
-                sources_data = [
-                    {
-                        "id": doc["id"],
-                        "content": doc["content"][:200],
-                        "score": doc["score"],
-                    }
-                    for doc in results
-                ]
-                yield f"data: {json.dumps({'type': 'sources', 'data': sources_data}, ensure_ascii=False)}\n\n"
-
-                # 流式生成答案
-                async for chunk in generator.generate_stream(
-                    query=user_message.content,
-                    context_docs=results,
-                ):
-                    yield f"data: {json.dumps({'type': 'chunk', 'data': chunk}, ensure_ascii=False)}\n\n"
+                async for event in EnhancedQueryService().stream_events(options):
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
             else:
                 # 直接流式对话
                 async for chunk in generator.chat_stream(
@@ -184,6 +159,6 @@ async def chat_stream(request: ChatRequest):
 
         except Exception as e:
             logger.error(f"Stream chat failed: {e}", exc_info=True)
-            yield f"data: {json.dumps({'type': 'error', 'error': str(e)}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': 'error', 'error': 'Chat stream failed'}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream", headers=SSE_HEADERS)

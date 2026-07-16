@@ -1,4 +1,5 @@
 """FastAPI application entrypoint for the rag-system layout."""
+import asyncio
 import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -132,10 +133,30 @@ if Instrumentator is not None and config.get("monitoring", {}).get("prometheus",
     Instrumentator().instrument(app).expose(app)
 
 
+async def _probe_dependencies() -> dict[str, bool]:
+    """Refresh critical dependency state with a bounded live probe."""
+    dependencies = dict(getattr(app.state, "dependencies", {}))
+    if not getattr(app.state, "startup_complete", False):
+        return dependencies
+
+    try:
+        from app.vectorstore.storage_adapter import check_vector_store_health
+
+        dependencies["postgres"] = await asyncio.wait_for(
+            check_vector_store_health(), timeout=2.0
+        )
+    except Exception:
+        logger.warning("PostgreSQL readiness probe failed", exc_info=True)
+        dependencies["postgres"] = False
+
+    app.state.dependencies.update(dependencies)
+    return dependencies
+
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
-    dependencies = getattr(app.state, "dependencies", {})
+    dependencies = await _probe_dependencies()
     ready = getattr(app.state, "startup_complete", False) and all(
         dependencies.get(name, False) for name in ("postgres", "embedding")
     )
@@ -154,7 +175,7 @@ async def liveness_check():
 
 @app.get("/health/ready")
 async def readiness_check():
-    dependencies = getattr(app.state, "dependencies", {})
+    dependencies = await _probe_dependencies()
     ready = getattr(app.state, "startup_complete", False) and all(
         dependencies.get(name, False) for name in ("postgres", "embedding")
     )

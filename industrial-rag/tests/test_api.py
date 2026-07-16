@@ -28,3 +28,32 @@ def test_health_and_root_endpoints():
         assert root.json()["docs"] == "/docs"
 
     asyncio.run(run())
+
+
+def test_readiness_uses_live_postgres_probe(monkeypatch):
+    from app.vectorstore import storage_adapter
+
+    async def unavailable():
+        return False
+
+    monkeypatch.setattr(storage_adapter, "check_vector_store_health", unavailable)
+
+    async def run():
+        previous_startup = app.state.startup_complete
+        previous_dependencies = dict(app.state.dependencies)
+        try:
+            app.state.startup_complete = True
+            app.state.dependencies = {"postgres": True, "embedding": True, "redis": True}
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://testserver"
+            ) as client:
+                response = await client.get("/health/ready")
+
+            assert response.status_code == 503
+            assert response.json()["dependencies"]["postgres"] is False
+        finally:
+            app.state.startup_complete = previous_startup
+            app.state.dependencies = previous_dependencies
+
+    asyncio.run(run())

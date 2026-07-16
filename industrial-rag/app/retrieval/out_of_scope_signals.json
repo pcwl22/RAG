@@ -1,0 +1,16 @@
+[
+  {
+    "rule_id": "tax-invoice-procedure",
+    "match_all": [
+      ["增值税专用发票", "出口退税"],
+      ["抵扣期限", "备案材料"]
+    ]
+  },
+  {
+    "rule_id": "radio-frequency-licensing",
+    "match_all": [
+      ["无线电频率", "无线电"],
+      ["许可", "审批", "申请"]
+    ]
+  }
+]

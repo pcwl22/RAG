@@ -1,6 +1,6 @@
 // Default to same-origin. The reverse proxy/BFF owns upstream routing and any
 // server-side API credential; permanent secrets must not be bundled by Vite.
-export const API_BASE = import.meta.env.VITE_API_BASE || '/api/v1'
+export const API_BASE = import.meta.env?.VITE_API_BASE || '/api/v1'
 export const API_ROOT = API_BASE.replace(/\/api\/v1\/?$/, '')
 
 export const ENDPOINTS = {
@@ -24,8 +24,10 @@ const ensureOk = async (response) => {
 
 export const fetchHealth = async () => {
   try {
-    const response = await fetch(`${API_ROOT}/health`)
-    return response.ok
+    const response = await fetch(`${API_ROOT}/health/ready`)
+    if (!response.ok) return false
+    const data = await response.json()
+    return data.status === 'ready'
   } catch (error) {
     return false
   }
@@ -55,12 +57,13 @@ export const postJson = async (endpoint, payload) => {
   return response.json()
 }
 
-export const postStream = async (endpoint, payload) =>
+export const postStream = async (endpoint, payload, { signal } = {}) =>
   ensureOk(
     await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
+      signal
     })
   )
 
@@ -69,10 +72,19 @@ export const ingestDocument = async (file, partition) => {
   formData.append('file', file)
   formData.append('partition', partition)
 
-  return ensureOk(
+  const response = await ensureOk(
     await fetch(`${API_BASE}/documents/ingest`, {
       method: 'POST',
       body: formData
     })
   )
+  return response.json()
+}
+
+export const fetchDocumentStatus = async (taskId) => {
+  const encodedTaskId = encodeURIComponent(taskId)
+  const response = await ensureOk(
+    await fetch(`${API_BASE}/documents/status/${encodedTaskId}`)
+  )
+  return response.json()
 }

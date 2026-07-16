@@ -9,23 +9,30 @@ app:
 # LLM配置
 llm:
   text:
-    model_name: "qwen2.5-72b"
-    base_url: "http://vllm-text:8000/v1"
-    api_key: "EMPTY"
-    temperature: 0.7
-    max_tokens: 2048
-    top_p: 0.9
-    frequency_penalty: 0.0
-    presence_penalty: 0.0
-    timeout: 60
+    provider: "openai_compatible"
+    claude:
+      model_name: "claude-sonnet-4-6"
+      api_key: "${CLAUDE_API_KEY}"
+      base_url: "https://api.anthropic.com"
+      temperature: 0.3
+      max_tokens: 4096
+      timeout: 60
+    openai_compatible:
+      model_name: "deepseek-chat"
+      api_key: "${DEEPSEEK_API_KEY}"
+      base_url: "https://api.deepseek.com/v1"
+      temperature: 0.3
+      max_tokens: 4096
+      timeout: 60
+    zhipu:
+      model_name: "glm-4-plus"
+      api_key: "${ZHIPU_API_KEY}"
+      temperature: 0.3
+      max_tokens: 4096
+      timeout: 60
 
   vision:
-    model_name: "qwen2-vl-7b"
-    base_url: "http://vllm-vision:8001/v1"
-    api_key: "EMPTY"
-    temperature: 0.7
-    max_tokens: 1024
-    timeout: 90
+    enabled: false
 
 # 嵌入模型配置
 embedding:
@@ -61,7 +68,11 @@ postgres:
   password: "${POSTGRES_PASSWORD}"
   min_pool_size: 1
   max_pool_size: 10
+  connect_timeout: 5
   command_timeout: 60
+  keepalives_idle: 30
+  keepalives_interval: 10
+  keepalives_count: 3
 
 # Redis缓存配置
 redis:
@@ -89,17 +100,13 @@ document_processing:
   supported_formats:
     - "pdf"
     - "docx"
-    - "doc"
-    - "pptx"
     - "xlsx"
     - "md"
     - "txt"
-    - "html"
-    - "png"
-    - "jpg"
-    - "jpeg"
 
   max_file_size: 104857600  # 100MB
+  failed_upload_retention_seconds: 604800  # 7 days
+  failed_upload_max_files: 100
 
   # PDF 解析 - MinerU (magic-pdf)
   pdf:
@@ -112,15 +119,16 @@ document_processing:
 
   # 分块策略
   chunking:
-    strategy: "semantic"  # semantic, fixed, recursive
-    chunk_size: 512
-    chunk_overlap: 50
-    separators: ["\n\n", "\n", "。", "！", "？", ". ", "! ", "? "]
-
-    # 语义分块配置
-    semantic:
-      buffer_size: 1
-      breakpoint_percentile_threshold: 95
+    strategy: "parent_child"
+    chunk_size: 800
+    chunk_overlap: 120
+    min_chunk_size: 80
+    separators: ["\n# ", "\n## ", "\n### ", "\n\n", "\n", "。", "；", "，", ". ", "; ", ", ", " "]
+    parent_child:
+      enabled: true
+      parent_size: 3200
+      child_size: 800
+      child_overlap: 200
 
 # RAG配置
 rag:

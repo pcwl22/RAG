@@ -45,6 +45,7 @@ def test_comparison_sample_groups_contexts_for_joint_relevance():
         }
     )
     assert sample.retrieved_contexts == ["第一条\n\n第二条"]
+    assert sample.source_context_count == 2
 
 
 def test_load_ragas_samples_validates_generated_response(tmp_path):

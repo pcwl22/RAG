@@ -136,6 +136,54 @@ def test_generator_basis_keeps_priority_mapped_articles():
     assert formatted.index("第二条") < formatted.index("第七条")
 
 
+def test_enhanced_query_refuses_empty_retrieval_without_calling_llm():
+    async def run():
+        understanding = {
+            "original_query": "知识库外问题",
+            "resolved_query": "知识库外问题",
+            "rewritten_query": "知识库外问题",
+            "subqueries": ["知识库外问题"],
+            "is_decomposed": False,
+            "retrieval_queries": ["知识库外问题"],
+            "concept_article_mappings": [],
+        }
+
+        class FakeUnderstanding:
+            async def understand_query(self, **kwargs):
+                return dict(understanding)
+
+        class EmptyRetrieval:
+            async def retrieve(self, *args, **kwargs):
+                return []
+
+        class FailGenerator:
+            async def generate(self, *args, **kwargs):
+                raise AssertionError("LLM generation must not run without evidence")
+
+            async def generate_stream(self, *args, **kwargs):
+                raise AssertionError("LLM streaming must not run without evidence")
+                yield  # pragma: no cover
+
+        service = enhanced_service.EnhancedQueryService(
+            query_understanding=FakeUnderstanding(),
+            retrieval_engine=EmptyRetrieval(),
+            generator=FailGenerator(),
+        )
+        options = enhanced_service.EnhancedQueryOptions(query="知识库外问题")
+
+        result = await service.run(options)
+        events = [event async for event in service.stream_events(options)]
+
+        assert result.results == []
+        assert "无法基于当前知识库可靠回答" in result.answer
+        assert any(
+            event["type"] == "chunk" and "无法基于当前知识库可靠回答" in event["data"]
+            for event in events
+        )
+
+    asyncio.run(run())
+
+
 def test_generator_keeps_basis_for_partial_supported_conclusion():
     generator = Generator.__new__(Generator)
     docs = [
@@ -669,8 +717,12 @@ def test_process_document_structures_legal_articles(monkeypatch):
 第二条 测试行为造成结果的，应当依法处理。
 """.strip()
 
-        async def fake_add_documents(ids, embeddings, documents, metadatas=None, partition="general"):
-            fake_add_documents.calls = {
+        async def fake_replace_document(
+            source_key, filename, ids, embeddings, documents, metadatas, partition="general"
+        ):
+            fake_replace_document.calls = {
+                "source_key": source_key,
+                "filename": filename,
                 "ids": ids,
                 "embeddings": embeddings,
                 "documents": documents,
@@ -685,21 +737,22 @@ def test_process_document_structures_legal_articles(monkeypatch):
             "encode_texts",
             lambda texts, batch_size=32: [[0.1, 0.2, 0.3] for _ in texts],
         )
-        monkeypatch.setattr(ingest_service, "_storage_backend", lambda: fake_add_documents)
+        monkeypatch.setattr(ingest_service, "_storage_backend", lambda: fake_replace_document)
 
         result = await ingest_service.process_document("unused.docx", "中华人民共和国测试法_20240101.docx")
 
-        metadatas = fake_add_documents.calls["metadatas"]
+        metadatas = fake_replace_document.calls["metadatas"]
         assert result["status"] == "completed"
         assert result["total_chunks"] == 2
-        assert fake_add_documents.calls["documents"][0].startswith("第一条")
+        assert fake_replace_document.calls["documents"][0].startswith("第一条")
         assert metadatas[0]["document_type"] == "legal_article"
         assert metadatas[0]["law_name"] == "中华人民共和国测试法"
         assert metadatas[0]["law_chapter"] == "第一章 基本规定"
         assert metadatas[0]["article_number"] == "第一条"
-        assert metadatas[0]["article_text"] == fake_add_documents.calls["documents"][0]
-        assert fake_add_documents.calls["ids"][0] == metadatas[0]["semantic_chunk_id"]
-        assert metadatas[0]["chunk_id"] == fake_add_documents.calls["ids"][0]
+        assert metadatas[0]["article_text"] == fake_replace_document.calls["documents"][0]
+        assert fake_replace_document.calls["ids"][0] != metadatas[0]["semantic_chunk_id"]
+        assert metadatas[0]["chunk_id"] == fake_replace_document.calls["ids"][0]
+        assert metadatas[0]["source_key"] == fake_replace_document.calls["source_key"]
 
     asyncio.run(run())
 
@@ -708,8 +761,12 @@ def test_process_document_orchestrates_parser_embedding_and_storage(monkeypatch)
     async def run():
         sample_text = ("Article 1. Module smoke test content.\n\n" * 20).strip()
 
-        async def fake_add_documents(ids, embeddings, documents, metadatas=None, partition="general"):
-            fake_add_documents.calls = {
+        async def fake_replace_document(
+            source_key, filename, ids, embeddings, documents, metadatas, partition="general"
+        ):
+            fake_replace_document.calls = {
+                "source_key": source_key,
+                "filename": filename,
                 "ids": ids,
                 "embeddings": embeddings,
                 "documents": documents,
@@ -748,13 +805,14 @@ def test_process_document_orchestrates_parser_embedding_and_storage(monkeypatch)
             "encode_texts",
             lambda texts, batch_size=32: [[0.1, 0.2, 0.3] for _ in texts],
         )
-        monkeypatch.setattr(ingest_service, "_storage_backend", lambda: fake_add_documents)
+        monkeypatch.setattr(ingest_service, "_storage_backend", lambda: fake_replace_document)
 
         result = await ingest_service.process_document("unused.txt", "demo.txt")
 
         assert result["status"] == "completed"
         assert result["total_chunks"] == 2
-        assert len(fake_add_documents.calls["ids"]) == 2
-        assert fake_add_documents.calls["metadatas"][0]["filename"] == "demo.txt"
+        assert len(fake_replace_document.calls["ids"]) == 2
+        assert fake_replace_document.calls["metadatas"][0]["filename"] == "demo.txt"
+        assert fake_replace_document.calls["filename"] == "demo.txt"
 
     asyncio.run(run())

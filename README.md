@@ -29,7 +29,7 @@ Industrial RAG 是一个面向中文法律文本的本地知识库问答项目�
 | Ragas Context Precision | 1.0000 |
 | Ragas Context Recall | 1.0000 |
 
-后端目前有 99 项自动化测试，覆盖率约 68%，并通过 Ruff、前端测试、生产构建和 Compose 配置验证。
+后端目前有 108 项自动化测试（包含真实 pgvector 集成测试），覆盖率约 68%，并通过 Ruff、前端测试、生产构建和 Compose 配置验证。
 
 ## 主要功能
 
@@ -89,6 +89,7 @@ flowchart LR
 3. 普通文档使用父子块策略，结构化法律文本优先按条切分。
 4. BGE-M3 生成向量，正文、向量和元数据写入 PostgreSQL。
 5. 摄入成功后更新 Redis 语料版本，使旧答案缓存自动失效。
+6. 失败文件进入受限隔离目录，默认保留 7 天且最多保留 100 个文件。
 
 ## 仓库结构
 
@@ -250,12 +251,31 @@ npm run dev
 
 ## 可选：使用 Docker Compose 启动完整服务
 
-API 和前端通过 profile 提供，PostgreSQL/Redis 默认启动：
+Docker API 和 worker 镜像默认使用 PyMuPDF 解析 PDF，不安装 MinerU。MinerU 的
+Torch/Transformers 版本矩阵与主运行时不同；如需 OCR、公式或复杂表格解析，请在
+独立 Python 环境或独立解析服务中安装 `industrial-rag[mineru]`，不要将该 extra
+与 `constraints-docker.txt` 一起安装。
+
+Compose 默认只将前端、API、PostgreSQL 和 Redis 绑定到 `127.0.0.1`。只有在明确
+需要局域网访问并已配置防火墙、强密钥和数据库访问控制时，才应在 `.env` 中设置
+`RAG_BIND_ADDRESS=0.0.0.0`。
+
+API、前端和 Celery worker 通过 profile 提供，PostgreSQL/Redis 默认启动：
 
 ```powershell
 docker compose --env-file industrial-rag\.env `
   --profile api `
   --profile frontend `
+  up -d --build
+```
+
+需要 Celery 摄入队列时，在 `.env` 设置 `QUEUE_PROVIDER=celery`，并额外启用 worker：
+
+```powershell
+docker compose --env-file industrial-rag\.env `
+  --profile api `
+  --profile frontend `
+  --profile worker `
   up -d --build
 ```
 
@@ -265,7 +285,9 @@ docker compose --env-file industrial-rag\.env `
 - API：<http://127.0.0.1:18000>
 - API 文档：<http://127.0.0.1:18000/docs>
 
-容器使用 `config/base.yaml`，模型目录以只读方式挂载到 `/app/models`。如果只运行前端容器并把 API 运行在主机，请设置：
+API/worker 镜像基于官方 PyTorch 2.4.0 + CUDA 12.1 runtime，避免构建时下载超大 Torch wheel；API 使用单 GPU 推理进程，worker 通过环境变量强制 CPU，避免在单张显卡上重复加载模型。模型目录以只读方式挂载到 `/app/models`。如果只运行前端容器并把 API 运行在主机，请设置：
+
+首次构建需要拉取较大的官方 PyTorch runtime 基础镜像。API 和 worker 共享同一基础层，建议顺序构建以充分复用本地镜像缓存。
 
 ```dotenv
 RAG_API_UPSTREAM=http://host.docker.internal:8000

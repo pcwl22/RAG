@@ -4,6 +4,8 @@ from pathlib import Path
 from app.parser.docx_parser import parse_docx
 from app.parser.pdf_parser import parse_pdf
 
+SUPPORTED_EXTENSIONS = frozenset({"pdf", "docx", "xlsx", "txt", "md"})
+
 
 def parse_excel(file_path: str) -> str:
     """Parse Excel workbooks into markdown tables."""
@@ -40,13 +42,20 @@ def parse_document(file_path: str) -> str:
     ext = Path(file_path).suffix.lower()
     if ext == ".pdf":
         return parse_pdf(file_path)
-    if ext in {".docx", ".doc"}:
+    if ext == ".docx":
         return parse_docx(file_path)
-    if ext in {".xlsx", ".xls"}:
+    if ext == ".xlsx":
         return parse_excel(file_path)
     if ext in {".txt", ".md"}:
         return parse_text(file_path)
     raise ValueError(f"Unsupported file format: {ext}")
 
 
-__all__ = ["parse_document", "parse_pdf", "parse_docx", "parse_excel", "parse_text"]
+__all__ = [
+    "SUPPORTED_EXTENSIONS",
+    "parse_document",
+    "parse_pdf",
+    "parse_docx",
+    "parse_excel",
+    "parse_text",
+]

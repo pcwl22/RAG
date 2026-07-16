@@ -1,4 +1,5 @@
 """BGE reranker wrapper."""
+import os
 from typing import Any
 
 from app.embedding.embedder import resolve_torch_device
@@ -31,7 +32,9 @@ def load_reranker() -> Any:
         from sentence_transformers import CrossEncoder
 
         model_path = cfg.get("model_path", "E:/RAG/models/bge-reranker-v2-m3")
-        device = resolve_torch_device(cfg.get("device", "cuda"))
+        device = resolve_torch_device(
+            os.getenv("RERANKER_DEVICE") or cfg.get("device", "cuda")
+        )
         max_length = cfg.get("max_length")
         _reranker_model = CrossEncoder(model_path, device=device, max_length=max_length)
         logger.info(f"Reranker loaded successfully from {model_path}")

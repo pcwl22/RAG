@@ -20,6 +20,13 @@ async def close_vector_store() -> None:
     await close_postgres_store()
 
 
+async def check_vector_store_health() -> bool:
+    """Return whether PostgreSQL currently accepts a lightweight query."""
+    from app.vectorstore.postgres_store import check_postgres_health
+
+    return await check_postgres_health()
+
+
 async def add_documents(
     ids: list[str],
     embeddings: list[list[float]],
@@ -31,6 +38,29 @@ async def add_documents(
     from app.vectorstore.postgres_store import add_documents as add_postgres
 
     return await add_postgres(ids, embeddings, documents, metadatas, partition)
+
+
+async def replace_document(
+    source_key: str,
+    filename: str,
+    ids: list[str],
+    embeddings: list[list[float]],
+    documents: list[str],
+    metadatas: list[dict],
+    partition: str = "general",
+) -> int:
+    """Atomically replace every chunk belonging to one logical source."""
+    from app.vectorstore.postgres_store import replace_document as replace_postgres
+
+    return await replace_postgres(
+        source_key,
+        filename,
+        ids,
+        embeddings,
+        documents,
+        metadatas,
+        partition,
+    )
 
 
 async def search(
@@ -50,21 +80,21 @@ async def search(
 
 
 async def get_documents_by_ids(ids: list[str], partition: str | None = None) -> list[dict]:
-    """Fetch documents by exact PostgreSQL primary keys."""
+    """Fetch documents by primary key or stable semantic chunk identity."""
     from app.vectorstore.postgres_store import get_documents_by_ids as get_postgres_documents
 
     return await get_postgres_documents(ids, partition)
 
 
 async def get_documents_by_citations(
-    article_numbers: list[str], law_names: list[str], partition: str | None = None
+    citation_pairs: list[tuple[str, str]], partition: str | None = None
 ) -> list[dict]:
     """Fetch explicitly cited provisions from PostgreSQL."""
     from app.vectorstore.postgres_store import (
         get_documents_by_citations as get_postgres_citations,
     )
 
-    return await get_postgres_citations(article_numbers, law_names, partition)
+    return await get_postgres_citations(citation_pairs, partition)
 
 
 async def hybrid_search(
@@ -89,11 +119,11 @@ async def hybrid_search(
     )
 
 
-async def delete_document(document_id: str) -> None:
+async def delete_document(document_id: str) -> bool:
     """Delete a document from PostgreSQL."""
     from app.vectorstore.postgres_store import delete_document as delete_postgres
 
-    await delete_postgres(document_id)
+    return await delete_postgres(document_id)
 
 
 async def list_documents(skip: int = 0, limit: int = 100) -> list[dict]:
@@ -101,6 +131,13 @@ async def list_documents(skip: int = 0, limit: int = 100) -> list[dict]:
     from app.vectorstore.postgres_store import list_documents as list_postgres
 
     return await list_postgres(skip, limit)
+
+
+async def count_documents() -> int:
+    """Return the total number of grouped source documents."""
+    from app.vectorstore.postgres_store import count_documents as count_postgres
+
+    return await count_postgres()
 
 
 async def list_document_chunks(document_id: str, skip: int = 0, limit: int = 2000) -> dict:

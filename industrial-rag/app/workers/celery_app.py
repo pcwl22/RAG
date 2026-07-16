@@ -29,6 +29,13 @@ def create_celery_app() -> Any | None:
         timezone="Asia/Shanghai",
         enable_utc=True,
         task_track_started=True,
+        task_acks_late=True,
+        task_reject_on_worker_lost=True,
+        worker_prefetch_multiplier=1,
+        task_soft_time_limit=1800,
+        task_time_limit=1860,
+        result_expires=86400,
+        broker_connection_retry_on_startup=True,
     )
     app.autodiscover_tasks(["app.workers"])
     return app

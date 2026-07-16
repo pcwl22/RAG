@@ -21,6 +21,11 @@ server {
         proxy_set_header Host $host;
     }
 
+    location = /health/ready {
+        proxy_pass ${RAG_API_UPSTREAM}/health/ready;
+        proxy_set_header Host $host;
+    }
+
     location / {
         try_files $uri $uri/ /index.html;
     }

@@ -1,6 +1,10 @@
-FROM python:3.11-slim
+FROM pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime
 
 WORKDIR /app
+
+ENV PIP_DEFAULT_TIMEOUT=1000 \
+    PIP_RETRIES=10 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -12,12 +16,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libreoffice \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml README.md ./
+COPY pyproject.toml README.md constraints-docker.txt ./
 COPY app/ ./app/
+
+RUN pip install --no-cache-dir --timeout 1000 --retries 10 \
+        --constraint constraints-docker.txt . gunicorn
+
+# Runtime-only configuration changes must not invalidate the dependency layer.
 COPY prompts/ ./prompts/
 COPY config/ ./config/
-
-RUN pip install --no-cache-dir . gunicorn
 
 RUN mkdir -p /app/data /app/models
 
@@ -27,7 +34,7 @@ USER appuser
 EXPOSE 8000
 
 CMD ["gunicorn", "app.main:app", \
-     "--workers", "4", \
+     "--workers", "1", \
      "--worker-class", "uvicorn.workers.UvicornWorker", \
      "--bind", "0.0.0.0:8000", \
      "--timeout", "120", \

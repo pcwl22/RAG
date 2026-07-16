@@ -38,6 +38,7 @@ class RagasSample:
     response: str
     retrieved_contexts: list[str]
     reference: str
+    source_context_count: int
 
     def metric_input(self, fields: Iterable[str] | None = None) -> dict[str, Any]:
         values = {
@@ -86,6 +87,7 @@ def build_ragas_sample(record: dict[str, Any], line_number: int | None = None) -
     if not isinstance(raw_contexts, list):
         raise ValueError(f"Evaluation sample{location} contexts must be a list")
     contexts = [text for item in raw_contexts if (text := _context_text(item))]
+    source_context_count = len(contexts)
     case_metadata = (record.get("metadata") or {}).get("case_metadata") or {}
     if case_metadata.get("category") == "comparison" and contexts:
         # Ragas 0.4 judges each context independently. A comparison needs both
@@ -98,7 +100,14 @@ def build_ragas_sample(record: dict[str, Any], line_number: int | None = None) -
         or record.get("reference")
     )
     case_id = _text(record.get("id")) or f"case-{line_number or 1}"
-    return RagasSample(case_id, user_input, response, contexts, reference)
+    return RagasSample(
+        case_id=case_id,
+        user_input=user_input,
+        response=response,
+        retrieved_contexts=contexts,
+        reference=reference,
+        source_context_count=source_context_count,
+    )
 
 
 def load_ragas_samples(path: Path) -> list[RagasSample]:
@@ -190,6 +199,7 @@ def evaluate_samples(
             "id": sample.case_id,
             "question": sample.user_input,
             "context_count": len(sample.retrieved_contexts),
+            "source_context_count": sample.source_context_count,
             "has_reference": bool(sample.reference),
             "scores": {},
             "reasons": {},

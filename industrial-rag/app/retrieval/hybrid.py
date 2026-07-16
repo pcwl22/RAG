@@ -3,6 +3,7 @@
 import re
 
 from app.embedding.embedder import encode_query
+from app.retrieval.domain_signal_map import is_known_out_of_scope
 from app.retrieval.reranker import rerank_documents
 from app.utils.config import get_settings
 from app.utils.inference import run_inference
@@ -11,35 +12,50 @@ from app.vectorstore import storage_adapter
 
 logger = get_logger(__name__)
 
-_LAW_NAMES = [
-    "中华人民共和国劳动合同法实施条例",
-    "中华人民共和国劳动合同法",
-    "中华人民共和国民法典",
-    "中华人民共和国刑法",
-]
+_LAW_ALIASES = {
+    "中华人民共和国劳动合同法实施条例": (
+        "中华人民共和国劳动合同法实施条例",
+        "劳动合同法实施条例",
+        "实施条例",
+    ),
+    "中华人民共和国劳动合同法": (
+        "中华人民共和国劳动合同法",
+        "劳动合同法",
+    ),
+    "中华人民共和国民法典": ("中华人民共和国民法典", "民法典"),
+    "中华人民共和国刑法": ("中华人民共和国刑法", "刑法"),
+}
 
-# Topics that overlap lexically with indexed criminal provisions but ask for
-# administrative rules outside the configured civil/criminal/labor corpus.
-_OUT_OF_SCOPE_SIGNAL_GROUPS = [
-    (("增值税专用发票", "出口退税"), ("抵扣期限", "备案材料")),
-    (("无线电频率", "无线电"), ("许可", "审批", "申请")),
-]
+def _explicit_legal_citations(query: str) -> list[tuple[str, str]]:
+    """Preserve the law-to-article relationship expressed in query order."""
+    law_spans: list[tuple[int, int, str]] = []
+    for canonical_law, aliases in _LAW_ALIASES.items():
+        for alias in aliases:
+            law_spans.extend(
+                (match.start(), match.end(), canonical_law)
+                for match in re.finditer(re.escape(alias), query)
+            )
+    selected_laws: list[tuple[int, int, str]] = []
+    for span in sorted(law_spans, key=lambda item: (item[0], -(item[1] - item[0]))):
+        if any(span[0] < kept[1] and kept[0] < span[1] for kept in selected_laws):
+            continue
+        selected_laws.append(span)
 
+    article_pattern = r"第[一二三四五六七八九十百千万零〇两0-9]+条(?:之[一二三四五六七八九十0-9]+)?"
+    tokens: list[tuple[int, str, str]] = [
+        (start, "law", law) for start, _end, law in selected_laws
+    ]
+    tokens.extend((match.start(), "article", match.group()) for match in re.finditer(article_pattern, query))
+    tokens.sort(key=lambda item: item[0])
 
-def _is_known_out_of_scope(query: str) -> bool:
-    return any(
-        all(any(term in query for term in group) for group in groups)
-        for groups in _OUT_OF_SCOPE_SIGNAL_GROUPS
-    )
-
-
-def _explicit_legal_citations(query: str) -> tuple[list[str], list[str]]:
-    articles = list(
-        dict.fromkeys(re.findall(r"第[一二三四五六七八九十百千万零〇两0-9]+条(?:之[一二三四五六七八九十0-9]+)?", query))
-    )
-    matched_laws = [law for law in _LAW_NAMES if law in query]
-    laws = [law for law in matched_laws if not any(law != other and law in other for other in matched_laws)]
-    return articles, laws
+    current_law: str | None = None
+    pairs: list[tuple[str, str]] = []
+    for _position, token_type, value in tokens:
+        if token_type == "law":
+            current_law = value
+        elif current_law is not None and (current_law, value) not in pairs:
+            pairs.append((current_law, value))
+    return pairs
 
 
 def _retrieval_config() -> dict:
@@ -99,8 +115,9 @@ class HybridRetrievalEngine:
         partition: str | None = None,
         enable_rrf: bool | None = None,
         enable_dynamic_topk: bool | None = None,
+        enable_exact_citations: bool = True,
     ) -> list[dict]:
-        if _is_known_out_of_scope(query):
+        if is_known_out_of_scope(query):
             logger.info("Query is outside the configured corpus scope")
             return []
         if top_k is None:
@@ -138,10 +155,10 @@ class HybridRetrievalEngine:
         max_per_document = int(self.config.get("max_chunks_per_document", 6))
         filtered = _deduplicate_results(filtered, max_per_document)
 
-        article_numbers, law_names = _explicit_legal_citations(query)
+        citation_pairs = _explicit_legal_citations(query) if enable_exact_citations else []
         exact_docs = (
-            await storage_adapter.get_documents_by_citations(article_numbers, law_names, partition)
-            if article_numbers and law_names
+            await storage_adapter.get_documents_by_citations(citation_pairs, partition)
+            if citation_pairs
             else []
         )
 

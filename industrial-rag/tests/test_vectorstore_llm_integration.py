@@ -71,7 +71,11 @@ def test_openai_compatible_llm_client_with_fake_client():
                 raise StopAsyncIteration from exc
 
     class FakeCompletions:
+        def __init__(self):
+            self.calls = []
+
         async def create(self, **kwargs):
+            self.calls.append(kwargs)
             if kwargs.get("stream"):
                 return AsyncStream(
                     [
@@ -86,13 +90,18 @@ def test_openai_compatible_llm_client_with_fake_client():
     client = LLMClient.__new__(LLMClient)
     client.provider = "openai_compatible"
     client.config = {"model_name": "fake-model", "temperature": 0.1, "max_tokens": 64}
-    client._client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    completions = FakeCompletions()
+    client._client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
 
     async def run():
         answer = await client.generate("prompt", system_prompt="system")
         stream = "".join([chunk async for chunk in client.generate_stream("prompt")])
+        deterministic = await client.generate("prompt", temperature=0, max_tokens=0)
 
         assert answer == "complete answer"
         assert stream == "hello world"
+        assert deterministic == "complete answer"
+        assert completions.calls[-1]["temperature"] == 0
+        assert completions.calls[-1]["max_tokens"] == 0
 
     asyncio.run(run())

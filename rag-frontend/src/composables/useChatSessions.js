@@ -1,6 +1,6 @@
 import { computed, nextTick, ref } from 'vue'
-import { normalizeProcessTrace } from '../utils/processTrace'
-import { saveSessions } from '../utils/chatStorage'
+import { normalizeProcessTrace } from '../utils/processTrace.js'
+import { saveSessions } from '../utils/chatStorage.js'
 
 const STORAGE_KEY = 'rag_chat_sessions'
 
@@ -16,8 +16,11 @@ const normalizeStoredMessages = (items = []) =>
     }
   })
 
+const createSessionId = () =>
+  globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`
+
 const createSession = (index) => ({
-  id: Date.now().toString(),
+  id: createSessionId(),
   title: `对话 ${index + 1}`,
   messages: [],
   messageCount: 0,
@@ -52,7 +55,7 @@ export const useChatSessions = ({ onAfterSwitch } = {}) => {
     if (!session) return
 
     currentSessionId.value = sessionId
-    session.messages = normalizeStoredMessages(session.messages || [])
+    session.messages = session.messages || []
     messages.value = session.messages
     nextTick(() => onAfterSwitch?.())
   }
@@ -72,16 +75,19 @@ export const useChatSessions = ({ onAfterSwitch } = {}) => {
     saveChats()
   }
 
-  const updateCurrentSession = () => {
-    const session = chatSessions.value.find(s => s.id === currentSessionId.value)
+  const updateCurrentSession = (
+    sessionId = currentSessionId.value,
+    sessionMessages = messages.value
+  ) => {
+    const session = chatSessions.value.find(s => s.id === sessionId)
     if (!session) return
 
-    session.messages = messages.value
-    session.messageCount = messages.value.length
+    session.messages = sessionMessages
+    session.messageCount = sessionMessages.length
     session.updatedAt = new Date().toISOString()
 
     if (session.messageCount > 0 && session.title.startsWith('对话')) {
-      const firstUserMsg = messages.value.find(m => m.role === 'user')
+      const firstUserMsg = sessionMessages.find(m => m.role === 'user')
       if (firstUserMsg) {
         session.title = firstUserMsg.content.substring(0, 20) + (firstUserMsg.content.length > 20 ? '...' : '')
       }

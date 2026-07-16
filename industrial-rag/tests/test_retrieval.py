@@ -1,7 +1,10 @@
 """Retrieval helper tests."""
 import asyncio
 
+import pytest
+
 from app.retrieval import dense, hybrid, reranker
+from app.retrieval.domain_signal_map import is_known_out_of_scope, load_out_of_scope_signal_groups
 from app.retrieval.legal_concept_map import match_legal_concept_articles
 from app.retrieval.result_merge import merge_retrieval_results, result_score
 from app.vectorstore import postgres_store
@@ -115,18 +118,73 @@ def test_controlled_mappings_cover_comparison_and_coerced_accomplice():
 
 
 def test_explicit_legal_citations_extracts_multiple_articles_and_longest_law_name():
-    articles, laws = hybrid._explicit_legal_citations(
+    pairs = hybrid._explicit_legal_citations(
         "对比《中华人民共和国劳动合同法实施条例》第五条与第六条。"
     )
-    assert articles == ["第五条", "第六条"]
-    assert laws == ["中华人民共和国劳动合同法实施条例"]
+    assert pairs == [
+        ("中华人民共和国劳动合同法实施条例", "第五条"),
+        ("中华人民共和国劳动合同法实施条例", "第六条"),
+    ]
+
+
+def test_explicit_legal_citations_preserve_cross_law_pairing():
+    assert hybrid._explicit_legal_citations(
+        "比较《中华人民共和国民法典》第一条与《中华人民共和国刑法》第二条"
+    ) == [
+        ("中华人民共和国民法典", "第一条"),
+        ("中华人民共和国刑法", "第二条"),
+    ]
+
+
+def test_explicit_legal_citations_normalize_common_law_aliases():
+    assert hybrid._explicit_legal_citations(
+        "比较民法典第一条、第二条与刑法第三条"
+    ) == [
+        ("中华人民共和国民法典", "第一条"),
+        ("中华人民共和国民法典", "第二条"),
+        ("中华人民共和国刑法", "第三条"),
+    ]
+    assert hybrid._explicit_legal_citations("劳动合同法实施条例第五条") == [
+        ("中华人民共和国劳动合同法实施条例", "第五条")
+    ]
+
+
+def test_internal_recall_query_cannot_trigger_exact_citation_lookup(monkeypatch):
+    exact_calls = []
+
+    async def fake_hybrid_search(**kwargs):
+        return [{"id": "fuzzy", "score": 0.9, "metadata": {}}]
+
+    async def fake_exact_lookup(citation_pairs, partition=None):
+        exact_calls.append((citation_pairs, partition))
+        return [{"id": "exact", "score": 1.0, "metadata": {}}]
+
+    monkeypatch.setattr(hybrid, "encode_query", lambda query: [0.0])
+    monkeypatch.setattr(hybrid.storage_adapter, "hybrid_search", fake_hybrid_search)
+    monkeypatch.setattr(
+        hybrid.storage_adapter, "get_documents_by_citations", fake_exact_lookup
+    )
+
+    async def run():
+        results = await hybrid.HybridRetrievalEngine().retrieve(
+            "中华人民共和国刑法 第二十八条 胁从犯",
+            enable_rerank=False,
+            similarity_threshold=0.0,
+            enable_exact_citations=False,
+        )
+        assert [doc["id"] for doc in results] == ["fuzzy"]
+
+    asyncio.run(run())
+    assert exact_calls == []
 
 
 def test_out_of_scope_signals_distinguish_procedure_from_criminal_provision():
-    assert hybrid._is_known_out_of_scope("增值税专用发票抵扣期限如何规定") is True
-    assert hybrid._is_known_out_of_scope("出口退税备案材料有哪些") is True
-    assert hybrid._is_known_out_of_scope("无线电频率许可如何申请") is True
-    assert hybrid._is_known_out_of_scope("虚开增值税专用发票如何定罪") is False
+    assert len(load_out_of_scope_signal_groups()) >= 2
+    assert is_known_out_of_scope("增值税专用发票抵扣期限如何规定") is True
+    assert is_known_out_of_scope("出口退税备案材料有哪些") is True
+    assert is_known_out_of_scope("无线电频率许可如何申请") is True
+    assert is_known_out_of_scope("虚开增值税专用发票如何定罪") is False
+    assert is_known_out_of_scope("无线电设备损坏应如何承担侵权责任") is False
 
 
 def test_keyword_search_applies_partition_to_all_or_terms(monkeypatch):
@@ -185,6 +243,38 @@ def test_failed_rollback_discards_connection(monkeypatch):
     postgres_store._return_connection(connection)
 
     assert captured == {"connection": connection, "discarded": True}
+
+
+def test_postgres_initialization_failure_disposes_runtime(monkeypatch):
+    class FakePool:
+        def __init__(self):
+            self.closed = False
+
+        def closeall(self):
+            self.closed = True
+
+    fake_pool = FakePool()
+    monkeypatch.setattr(postgres_store, "_pool", None)
+    monkeypatch.setattr(postgres_store, "_executor", None)
+    monkeypatch.setattr(
+        postgres_store.psycopg2.pool,
+        "ThreadedConnectionPool",
+        lambda *args, **kwargs: fake_pool,
+    )
+
+    async def fail_schema(*args, **kwargs):
+        raise PermissionError("schema denied")
+
+    monkeypatch.setattr(postgres_store, "_execute_sync", fail_schema)
+
+    async def run():
+        with pytest.raises(PermissionError, match="schema denied"):
+            await postgres_store.init_postgres_store()
+
+    asyncio.run(run())
+    assert fake_pool.closed is True
+    assert postgres_store._pool is None
+    assert postgres_store._executor is None
 
 
 def test_retrievers_default_threshold_matches_config_default(monkeypatch):

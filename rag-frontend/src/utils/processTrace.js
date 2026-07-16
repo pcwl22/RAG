@@ -1,5 +1,5 @@
-import { API_BASE } from '../api/ragApi'
-import { formatDuration, truncateText } from './formatters'
+import { API_BASE } from '../api/ragApi.js'
+import { formatDuration, truncateText } from './formatters.js'
 
 const nowLabel = () => new Date().toLocaleTimeString()
 

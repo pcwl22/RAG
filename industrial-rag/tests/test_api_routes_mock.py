@@ -76,6 +76,40 @@ def test_query_response_score_uses_rerank_or_score_before_rrf():
     assert retrieved.score == 0.84
 
 
+def test_standard_query_and_answer_refuse_known_out_of_scope_before_retrieval(monkeypatch):
+    import app.api.query as query_api
+
+    def fail_engine():
+        raise AssertionError("Known out-of-scope queries must not start retrieval")
+
+    monkeypatch.setattr(query_api, "_retrieval_engine", fail_engine)
+
+    async def run():
+        query_response = await _post_json(
+            "/api/v1/query",
+            {"query": "增值税专用发票抵扣期限如何规定？"},
+        )
+        answer_response = await _post_json(
+            "/api/v1/answer",
+            {"query": "增值税专用发票抵扣期限如何规定？"},
+        )
+        stream_response = await _post_json(
+            "/api/v1/answer",
+            {"query": "增值税专用发票抵扣期限如何规定？", "stream": True},
+        )
+
+        assert query_response.status_code == 200
+        assert query_response.json()["documents"] == []
+        assert answer_response.status_code == 200
+        assert answer_response.json()["sources"] == []
+        assert "没有找到足够相关的信息" in answer_response.json()["answer"]
+        assert stream_response.status_code == 200
+        assert '"type": "sources", "data": []' in stream_response.text
+        assert '"type": "done"' in stream_response.text
+
+    asyncio.run(run())
+
+
 def test_simple_query_and_answer_routes_with_mocks(monkeypatch):
     import app.api.query_simple as query_simple_api
     import app.service.chat_service as chat_service
@@ -173,6 +207,7 @@ def test_enhanced_query_route_with_mocked_understanding_retrieval_and_generation
             similarity_threshold=None,
             enable_rerank=True,
             partition=None,
+            enable_exact_citations=True,
         ):
             retrieve_calls.append(
                 {
@@ -232,6 +267,7 @@ def test_enhanced_query_refuses_missing_requested_law_before_decomposed_generati
             similarity_threshold=None,
             enable_rerank=True,
             partition=None,
+            enable_exact_citations=True,
         ):
             return [
                 {
@@ -281,7 +317,9 @@ def test_upload_status_list_and_delete_routes_with_mocks(monkeypatch, tmp_path):
         },
     )
 
-    def fake_process_document_memory(task_id, file_path, filename, partition, metadata):
+    def fake_process_document_memory(
+        task_id, file_path, filename, partition, metadata, app_loop=None
+    ):
         upload_api._task_registry[task_id] = {
             "status": "completed",
             "progress": 100,
@@ -291,9 +329,13 @@ def test_upload_status_list_and_delete_routes_with_mocks(monkeypatch, tmp_path):
 
     async def fake_delete_document(document_id):
         fake_delete_document.deleted = document_id
+        return True
 
     async def fake_list_documents(skip=0, limit=100):
         return [{"document_id": "doc-1", "filename": "demo.txt"}]
+
+    async def fake_count_documents():
+        return 23
 
     async def fake_list_document_chunks(document_id, skip=0, limit=2000):
         fake_list_document_chunks.document_id = document_id
@@ -315,6 +357,7 @@ def test_upload_status_list_and_delete_routes_with_mocks(monkeypatch, tmp_path):
     monkeypatch.setattr(upload_api, "_process_document_memory", fake_process_document_memory)
     monkeypatch.setattr(storage_adapter, "delete_document", fake_delete_document)
     monkeypatch.setattr(storage_adapter, "list_documents", fake_list_documents)
+    monkeypatch.setattr(storage_adapter, "count_documents", fake_count_documents)
     monkeypatch.setattr(storage_adapter, "list_document_chunks", fake_list_document_chunks)
 
     async def run():
@@ -329,6 +372,10 @@ def test_upload_status_list_and_delete_routes_with_mocks(monkeypatch, tmp_path):
                 "/api/v1/documents/ingest",
                 files={"file": ("sample.txt", b"sample content", "text/plain")},
                 data={"metadata": "[]"},
+            )
+            unsupported_file = await client.post(
+                "/api/v1/documents/ingest",
+                files={"file": ("sample.pptx", b"not a presentation", "application/octet-stream")},
             )
             ingest_response = await client.post(
                 "/api/v1/documents/ingest",
@@ -345,10 +392,12 @@ def test_upload_status_list_and_delete_routes_with_mocks(monkeypatch, tmp_path):
 
         assert invalid_json.status_code == 400
         assert non_object_json.status_code == 400
+        assert unsupported_file.status_code == 400
+        assert list_response.json()["total"] == 23
         assert status_response.status_code == 200
         assert status_response.json()["status"] == "completed"
         assert list_response.status_code == 200
-        assert list_response.json()["total"] == 1
+        assert len(list_response.json()["documents"]) == 1
         assert chunks_response.status_code == 200
         assert chunks_response.json()["chunks"][0]["id"] == "chunk-1"
         assert fake_list_document_chunks.document_id == "doc-1"
@@ -356,3 +405,69 @@ def test_upload_status_list_and_delete_routes_with_mocks(monkeypatch, tmp_path):
         assert fake_delete_document.deleted == "doc-1"
 
     asyncio.run(run())
+
+
+def test_memory_upload_keeps_redis_work_on_application_loop(monkeypatch, tmp_path):
+    import app.api.upload as upload_api
+    import app.service.ingest_service as ingest_service
+
+    source = tmp_path / "loop-safe.txt"
+    source.write_text("loop safe upload content", encoding="utf-8")
+    operations = []
+    process_calls = []
+
+    class FakeAppLoop:
+        def is_closed(self):
+            return False
+
+    def fake_run_on_app_loop(app_loop, coroutine, operation):
+        assert isinstance(app_loop, FakeAppLoop)
+        operations.append(operation)
+        coroutine.close()
+        return True
+
+    async def fake_process_document(*args, **kwargs):
+        process_calls.append(kwargs)
+        return {"status": "completed", "total_chunks": 1}
+
+    monkeypatch.setattr(upload_api, "_run_on_app_loop", fake_run_on_app_loop)
+    monkeypatch.setattr(ingest_service, "process_document", fake_process_document)
+
+    upload_api._process_document_memory(
+        task_id="loop-safe-task",
+        file_path=str(source),
+        filename=source.name,
+        partition="general",
+        metadata={},
+        app_loop=FakeAppLoop(),
+    )
+
+    assert process_calls == [{"invalidate_cache": False}]
+    assert any("invalidate semantic cache" in operation for operation in operations)
+    assert upload_api._task_registry["loop-safe-task"]["status"] == "completed"
+    assert not source.exists()
+
+
+def test_failed_memory_upload_is_quarantined(monkeypatch, tmp_path):
+    import app.api.upload as upload_api
+
+    monkeypatch.setattr(
+        upload_api,
+        "config",
+        {"document_processing": {"upload_dir": str(tmp_path)}},
+    )
+    source = tmp_path / "failed.txt"
+    source.write_text("retry me", encoding="utf-8")
+
+    upload_api._quarantine_failed_upload(str(source), "task-1")
+
+    retained = tmp_path / "failed" / "failed.txt"
+    assert retained.read_text(encoding="utf-8") == "retry me"
+    assert not source.exists()
+
+
+def test_queue_provider_environment_override(monkeypatch):
+    import app.api.upload as upload_api
+
+    monkeypatch.setenv("QUEUE_PROVIDER", "celery")
+    assert upload_api._queue_provider() == "celery"

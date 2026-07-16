@@ -18,6 +18,7 @@ logger = get_logger(__name__)
 
 _pool: Any | None = None
 _executor: ThreadPoolExecutor | None = None
+SCHEMA_VERSION = "1"
 
 
 def _postgres_config() -> dict:
@@ -37,18 +38,28 @@ async def init_postgres_store() -> None:
         raise ImportError("psycopg2 is required for PostgreSQL retrieval. Install psycopg2-binary.")
 
     cfg = _postgres_config()
-    _executor = ThreadPoolExecutor(max_workers=int(cfg.get("max_pool_size", 5)))
-    _pool = psycopg2.pool.ThreadedConnectionPool(
-        minconn=int(cfg.get("min_pool_size", 1)),
-        maxconn=int(cfg.get("max_pool_size", 5)),
-        host=cfg.get("host", "localhost"),
-        port=int(cfg.get("port", 5432)),
-        database=cfg.get("database", "rag_db"),
-        user=cfg.get("user", "postgres"),
-        password=cfg.get("password", ""),
-        client_encoding="utf8",
-    )
-    await _execute_sync(_create_schema_sync)
+    try:
+        _executor = ThreadPoolExecutor(max_workers=int(cfg.get("max_pool_size", 5)))
+        _pool = psycopg2.pool.ThreadedConnectionPool(
+            minconn=int(cfg.get("min_pool_size", 1)),
+            maxconn=int(cfg.get("max_pool_size", 5)),
+            host=cfg.get("host", "localhost"),
+            port=int(cfg.get("port", 5432)),
+            database=cfg.get("database", "rag_db"),
+            user=cfg.get("user", "postgres"),
+            password=cfg.get("password", ""),
+            client_encoding="utf8",
+            connect_timeout=int(cfg.get("connect_timeout", 5)),
+            keepalives=1,
+            keepalives_idle=int(cfg.get("keepalives_idle", 30)),
+            keepalives_interval=int(cfg.get("keepalives_interval", 10)),
+            keepalives_count=int(cfg.get("keepalives_count", 3)),
+            options=f"-c statement_timeout={int(cfg.get('command_timeout', 60)) * 1000}",
+        )
+        await _execute_sync(_create_schema_sync)
+    except Exception:
+        _dispose_postgres_runtime()
+        raise
     logger.info("PostgreSQL store initialized")
 
 
@@ -120,12 +131,57 @@ def _create_schema_sync() -> None:
             ON documents ((metadata->>'document_id'));
             """
         )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_documents_source_key
+            ON documents ((metadata->>'source_key'));
+            """
+        )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_documents_metadata ON documents USING gin (metadata);")
         cur.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_documents_embedding_ivfflat
             ON documents USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
             """
+        )
+        cur.execute(
+            """
+            SELECT format_type(attribute.atttypid, attribute.atttypmod)
+            FROM pg_attribute AS attribute
+            WHERE attribute.attrelid = 'public.documents'::regclass
+              AND attribute.attname = 'embedding'
+              AND NOT attribute.attisdropped
+            """
+        )
+        row = cur.fetchone()
+        actual_vector_type = str(row[0]) if row else "missing"
+        expected_vector_type = f"vector({dimension})"
+        if actual_vector_type != expected_vector_type:
+            raise RuntimeError(
+                "PostgreSQL embedding dimension mismatch: "
+                f"expected {expected_vector_type}, found {actual_vector_type}. "
+                "Run an explicit schema migration and re-embed the corpus."
+            )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rag_schema_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+            """
+        )
+        cur.executemany(
+            """
+            INSERT INTO rag_schema_metadata (key, value, updated_at)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (key) DO UPDATE
+            SET value = EXCLUDED.value, updated_at = NOW()
+            """,
+            [
+                ("schema_version", SCHEMA_VERSION),
+                ("embedding_dimension", str(dimension)),
+            ],
         )
         conn.commit()
     finally:
@@ -134,7 +190,7 @@ def _create_schema_sync() -> None:
         _return_connection(conn)
 
 
-async def close_postgres_store() -> None:
+def _dispose_postgres_runtime() -> None:
     global _pool, _executor
     if _pool is not None:
         _pool.closeall()
@@ -142,6 +198,59 @@ async def close_postgres_store() -> None:
     if _executor is not None:
         _executor.shutdown(wait=True)
         _executor = None
+
+
+async def close_postgres_store() -> None:
+    _dispose_postgres_runtime()
+
+
+def _check_postgres_health_sync() -> bool:
+    """Verify that the pool can execute a query, not merely that it exists."""
+    if _pool is None:
+        return False
+    conn = _connection()
+    cur = None
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                to_regclass('public.documents') IS NOT NULL,
+                to_regclass('public.rag_schema_metadata') IS NOT NULL,
+                EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector')
+            """
+        )
+        documents_ready, metadata_ready, vector_ready = cur.fetchone()
+        if not (documents_ready and metadata_ready and vector_ready):
+            return False
+        cur.execute(
+            """
+            SELECT
+                format_type(attribute.atttypid, attribute.atttypmod),
+                (SELECT value FROM rag_schema_metadata WHERE key = 'schema_version'),
+                (SELECT value FROM rag_schema_metadata WHERE key = 'embedding_dimension')
+            FROM pg_attribute AS attribute
+            WHERE attribute.attrelid = 'public.documents'::regclass
+              AND attribute.attname = 'embedding'
+              AND NOT attribute.attisdropped
+            """
+        )
+        row = cur.fetchone()
+        expected_dimension = _embedding_dimension()
+        return bool(
+            row
+            and row[0] == f"vector({expected_dimension})"
+            and row[1] == SCHEMA_VERSION
+            and row[2] == str(expected_dimension)
+        )
+    finally:
+        if cur is not None:
+            cur.close()
+        _return_connection(conn)
+
+
+async def check_postgres_health() -> bool:
+    return await _execute_sync(_check_postgres_health_sync)
 
 
 def _row_to_doc(row: dict, score_key: str = "score") -> dict[str, Any]:
@@ -192,7 +301,8 @@ def _add_documents_sync(
                 content = EXCLUDED.content,
                 embedding = EXCLUDED.embedding,
                 metadata = EXCLUDED.metadata,
-                partition = EXCLUDED.partition;
+                partition = EXCLUDED.partition,
+                created_at = NOW();
             """,
             records,
         )
@@ -212,6 +322,85 @@ async def add_documents(
     partition: str = "general",
 ) -> int:
     return await _execute_sync(_add_documents_sync, ids, embeddings, documents, metadatas, partition)
+
+
+def _replace_document_sync(
+    source_key: str,
+    filename: str,
+    ids: list[str],
+    embeddings: list[list[float]],
+    documents: list[str],
+    metadatas: list[dict],
+    partition: str,
+) -> int:
+    """Replace a source in one transaction, including legacy rows without source_key."""
+    if not (len(ids) == len(embeddings) == len(documents) == len(metadatas)):
+        raise ValueError("Document IDs, embeddings, contents and metadata must have equal lengths")
+
+    conn = _connection()
+    cur = None
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            DELETE FROM documents
+            WHERE metadata->>'source_key' = %s
+               OR (
+                    metadata->>'source_key' IS NULL
+                    AND metadata->>'filename' = %s
+                    AND partition = %s
+               )
+            """,
+            (source_key, filename, partition),
+        )
+        records = [
+            (
+                doc_id,
+                documents[index],
+                f"[{','.join(str(value) for value in embeddings[index])}]",
+                json.dumps(metadatas[index], ensure_ascii=False),
+                partition,
+            )
+            for index, doc_id in enumerate(ids)
+        ]
+        psycopg2.extras.execute_batch(
+            cur,
+            """
+            INSERT INTO documents (id, content, embedding, metadata, partition, created_at)
+            VALUES (%s, %s, %s::vector, %s::jsonb, %s, NOW())
+            """,
+            records,
+        )
+        conn.commit()
+        return len(records)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        if cur is not None:
+            cur.close()
+        _return_connection(conn)
+
+
+async def replace_document(
+    source_key: str,
+    filename: str,
+    ids: list[str],
+    embeddings: list[list[float]],
+    documents: list[str],
+    metadatas: list[dict],
+    partition: str = "general",
+) -> int:
+    return await _execute_sync(
+        _replace_document_sync,
+        source_key,
+        filename,
+        ids,
+        embeddings,
+        documents,
+        metadatas,
+        partition,
+    )
 
 
 def _vector_search_sync(
@@ -258,13 +447,22 @@ def _get_documents_by_ids_sync(ids: list[str], partition: str | None) -> list[di
     cur = None
     try:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        sql = "SELECT id, content, metadata, partition FROM documents WHERE id = ANY(%s)"
-        params: list[Any] = [ids]
+        sql = """
+            SELECT id, content, metadata, partition
+            FROM documents
+            WHERE (id = ANY(%s) OR metadata->>'semantic_chunk_id' = ANY(%s))
+        """
+        params: list[Any] = [ids, ids]
         if partition:
             sql += " AND partition = %s"
             params.append(partition)
-        sql += " ORDER BY array_position(%s::text[], id)"
-        params.append(ids)
+        sql += """
+            ORDER BY COALESCE(
+                array_position(%s::text[], metadata->>'semantic_chunk_id'),
+                array_position(%s::text[], id)
+            )
+        """
+        params.extend([ids, ids])
         cur.execute(sql, params)
         docs = [_row_to_doc(row) for row in cur.fetchall()]
         for doc in docs:
@@ -278,31 +476,40 @@ def _get_documents_by_ids_sync(ids: list[str], partition: str | None) -> list[di
 
 
 async def get_documents_by_ids(ids: list[str], partition: str | None = None) -> list[dict]:
-    """Fetch controlled statute chunks by their exact primary keys."""
+    """Fetch controlled statute chunks by row ID or semantic identity."""
     return await _execute_sync(_get_documents_by_ids_sync, ids, partition)
 
 
 def _get_documents_by_citations_sync(
-    article_numbers: list[str], law_names: list[str], partition: str | None
+    citation_pairs: list[tuple[str, str]], partition: str | None
 ) -> list[dict]:
-    if not article_numbers or not law_names:
+    if not citation_pairs:
         return []
     conn = _connection()
     cur = None
     try:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        sql = """
+        pair_conditions = " OR ".join(
+            "(metadata->>'law_name' = %s AND metadata->>'article_number' = %s)"
+            for _ in citation_pairs
+        )
+        sql = f"""
             SELECT id, content, metadata, partition
             FROM documents
-            WHERE metadata->>'article_number' = ANY(%s)
-              AND metadata->>'law_name' = ANY(%s)
+            WHERE ({pair_conditions})
         """
-        params: list[Any] = [article_numbers, law_names]
+        params: list[Any] = [value for pair in citation_pairs for value in pair]
         if partition:
             sql += " AND partition = %s"
             params.append(partition)
-        sql += " ORDER BY array_position(%s::text[], metadata->>'article_number')"
-        params.append(article_numbers)
+        ordered_keys = [f"{law}\x1f{article}" for law, article in citation_pairs]
+        sql += """
+            ORDER BY array_position(
+                %s::text[],
+                (metadata->>'law_name') || E'\\x1f' || (metadata->>'article_number')
+            )
+        """
+        params.append(ordered_keys)
         cur.execute(sql, params)
         docs = [_row_to_doc(row) for row in cur.fetchall()]
         for doc in docs:
@@ -316,12 +523,10 @@ def _get_documents_by_citations_sync(
 
 
 async def get_documents_by_citations(
-    article_numbers: list[str], law_names: list[str], partition: str | None = None
+    citation_pairs: list[tuple[str, str]], partition: str | None = None
 ) -> list[dict]:
     """Fetch provisions explicitly named by law and article in the query."""
-    return await _execute_sync(
-        _get_documents_by_citations_sync, article_numbers, law_names, partition
-    )
+    return await _execute_sync(_get_documents_by_citations_sync, citation_pairs, partition)
 
 
 def _extract_chinese_keywords(query: str) -> list[str]:
@@ -583,27 +788,32 @@ async def hybrid_search(
     return results
 
 
-def _delete_document_sync(document_id: str) -> None:
+def _delete_document_sync(document_id: str) -> bool:
     conn = _connection()
     cur = None
     try:
         cur = conn.cursor()
         cur.execute("DELETE FROM documents WHERE metadata->>'document_id' = %s", (document_id,))
+        deleted = cur.rowcount > 0
         conn.commit()
+        return deleted
     finally:
         if cur is not None:
             cur.close()
         _return_connection(conn)
 
 
-async def delete_document(document_id: str) -> None:
-    await _execute_sync(_delete_document_sync, document_id)
+async def delete_document(document_id: str) -> bool:
+    deleted = await _execute_sync(_delete_document_sync, document_id)
+    if not deleted:
+        return False
     try:
         from app.utils.cache import invalidate_semantic_cache
 
         await invalidate_semantic_cache()
     except Exception:
         logger.debug("Semantic cache invalidation unavailable", exc_info=True)
+    return True
 
 
 def _list_documents_sync(skip: int, limit: int) -> list[dict]:
@@ -638,6 +848,33 @@ def _list_documents_sync(skip: int, limit: int) -> list[dict]:
 
 async def list_documents(skip: int = 0, limit: int = 100) -> list[dict]:
     return await _execute_sync(_list_documents_sync, skip, limit)
+
+
+def _count_documents_sync() -> int:
+    conn = _connection()
+    cur = None
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM (
+                SELECT metadata->>'document_id', metadata->>'filename', partition
+                FROM documents
+                WHERE metadata->>'document_id' IS NOT NULL
+                GROUP BY metadata->>'document_id', metadata->>'filename', partition
+            ) AS grouped_documents
+            """
+        )
+        return int(cur.fetchone()[0])
+    finally:
+        if cur is not None:
+            cur.close()
+        _return_connection(conn)
+
+
+async def count_documents() -> int:
+    return await _execute_sync(_count_documents_sync)
 
 
 def _row_to_chunk(row: dict) -> dict[str, Any]:

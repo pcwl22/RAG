@@ -306,6 +306,16 @@ def format_missing_law_answer(missing_laws: list[str]) -> str:
 无匹配的请求法律文档。"""
 
 
+def format_no_context_answer() -> str:
+    """Return a deterministic refusal when retrieval produced no evidence."""
+    return """【回答】
+结论：
+当前知识库未检索到足够相关的内容，无法基于当前知识库可靠回答该问题。请补充相关资料或调整问题后重试。
+
+依据：
+无直接支持结论的命中文档。"""
+
+
 def _has_no_supported_conclusion(answer: str) -> bool:
     """Detect answers that explicitly decline due to missing or irrelevant context."""
     normalized = re.sub(r"\s+", "", answer)

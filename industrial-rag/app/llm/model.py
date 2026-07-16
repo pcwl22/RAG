@@ -188,8 +188,8 @@ class LLMClient:
         kwargs: dict[str, Any] = {
             "model": self.config.get("model_name", "claude-sonnet-4-6"),
             "messages": messages,
-            "temperature": temperature or self.config.get("temperature", 0.7),
-            "max_tokens": max_tokens or self.config.get("max_tokens", 4096),
+            "temperature": temperature if temperature is not None else self.config.get("temperature", 0.7),
+            "max_tokens": max_tokens if max_tokens is not None else self.config.get("max_tokens", 4096),
         }
         if system_prompt:
             kwargs["system"] = system_prompt
@@ -204,8 +204,8 @@ class LLMClient:
         kwargs: dict[str, Any] = {
             "model": self.config.get("model_name", "claude-sonnet-4-6"),
             "messages": messages,
-            "temperature": temperature or self.config.get("temperature", 0.7),
-            "max_tokens": max_tokens or self.config.get("max_tokens", 4096),
+            "temperature": temperature if temperature is not None else self.config.get("temperature", 0.7),
+            "max_tokens": max_tokens if max_tokens is not None else self.config.get("max_tokens", 4096),
         }
         if system_prompt:
             kwargs["system"] = system_prompt
@@ -228,8 +228,8 @@ class LLMClient:
         response = await self._client.chat.completions.create(
             model=self.config.get("model_name", "deepseek-chat"),
             messages=messages,
-            temperature=temperature or self.config.get("temperature", 0.7),
-            max_tokens=max_tokens or self.config.get("max_tokens", 4096),
+            temperature=temperature if temperature is not None else self.config.get("temperature", 0.7),
+            max_tokens=max_tokens if max_tokens is not None else self.config.get("max_tokens", 4096),
         )
         return response.choices[0].message.content or ""
 
@@ -244,8 +244,8 @@ class LLMClient:
         stream = await self._client.chat.completions.create(
             model=self.config.get("model_name", "deepseek-chat"),
             messages=messages,
-            temperature=temperature or self.config.get("temperature", 0.7),
-            max_tokens=max_tokens or self.config.get("max_tokens", 4096),
+            temperature=temperature if temperature is not None else self.config.get("temperature", 0.7),
+            max_tokens=max_tokens if max_tokens is not None else self.config.get("max_tokens", 4096),
             stream=True,
         )
         async for chunk in stream:
@@ -270,8 +270,8 @@ class LLMClient:
             response = self._client.chat.completions.create(
                 model=self.config.get("model_name", "glm-4-plus"),
                 messages=messages,
-                temperature=temperature or self.config.get("temperature", 0.7),
-                max_tokens=max_tokens or self.config.get("max_tokens", 4096),
+                temperature=temperature if temperature is not None else self.config.get("temperature", 0.7),
+                max_tokens=max_tokens if max_tokens is not None else self.config.get("max_tokens", 4096),
             )
             return response.choices[0].message.content or ""
 
@@ -292,8 +292,8 @@ class LLMClient:
             response = self._client.chat.completions.create(
                 model=self.config.get("model_name", "glm-4-plus"),
                 messages=messages,
-                temperature=temperature or self.config.get("temperature", 0.7),
-                max_tokens=max_tokens or self.config.get("max_tokens", 4096),
+                temperature=temperature if temperature is not None else self.config.get("temperature", 0.7),
+                max_tokens=max_tokens if max_tokens is not None else self.config.get("max_tokens", 4096),
                 stream=True,
             )
             for chunk in response:

@@ -1,6 +1,6 @@
 """Parser and chunker tests."""
 from app.parser.chunk import chunk_text_recursive
-from app.parser.document_parser import parse_document
+from app.parser.document_parser import SUPPORTED_EXTENSIONS, parse_document
 from app.parser.legal_parser import build_legal_article_chunks
 from app.parser.parent_child_chunker import ParentChildChunker
 from app.parser.parent_child_chunking import chunk_text_parent_child
@@ -11,6 +11,10 @@ def test_parse_text_document(tmp_path):
     document.write_text("hello\nworld\n", encoding="utf-8")
 
     assert parse_document(str(document)) == "hello\nworld\n"
+
+
+def test_supported_extensions_match_implemented_parsers():
+    assert SUPPORTED_EXTENSIONS == {"pdf", "docx", "xlsx", "txt", "md"}
 
 
 def test_recursive_chunking_produces_chunks():

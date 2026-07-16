@@ -1,12 +1,11 @@
 """
-简化的查询路由 - 绕过 Pydantic 验证问题
-修复中文编码问题
+兼容旧客户端的简化查询路由。
 """
-import json
 import time
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 from app.api.retrieval_params import resolve_retrieval_params
 from app.retrieval.dense import RetrievalEngine
@@ -16,35 +15,27 @@ logger = get_logger(__name__)
 router_simple = APIRouter()
 
 
+class SimpleQueryRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=1000)
+    top_k: int | None = Field(default=None, ge=1, le=50)
+    similarity_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    enable_rerank: bool | None = None
+
+
 @router_simple.post("/query_simple")
-async def query_simple(request: Request):
+async def query_simple(request: SimpleQueryRequest):
     """
-    简化的查询端点 - 直接解析 JSON
-    修复中文编码问题
+    保留旧路径的简化查询端点，并复用统一的请求边界校验。
     """
     start_time = time.time()
 
     try:
-        # 直接从 request 解析 JSON（确保 UTF-8）
-        body_bytes = await request.body()
-        body_str = body_bytes.decode('utf-8')
-        body = json.loads(body_str)
-
-        query = body.get("query")
-        top_k = body.get("top_k")
-        similarity_threshold = body.get("similarity_threshold")
-        enable_rerank = body.get("enable_rerank")
-
-        if not query:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "query field is required"}
-            )
+        query = request.query
 
         params = resolve_retrieval_params(
-            top_k=top_k,
-            similarity_threshold=similarity_threshold,
-            enable_rerank=enable_rerank,
+            top_k=request.top_k,
+            similarity_threshold=request.similarity_threshold,
+            enable_rerank=request.enable_rerank,
         )
 
         logger.info(f"Simple query: {query}, top_k: {params.top_k}")
@@ -94,34 +85,19 @@ async def query_simple(request: Request):
 
 
 @router_simple.post("/answer_simple")
-async def answer_simple(request: Request):
+async def answer_simple(request: SimpleQueryRequest):
     """
-    简化的问答端点 - 直接解析 JSON
-    修复中文编码问题
+    保留旧路径的简化问答端点，并复用统一的请求边界校验。
     """
     start_time = time.time()
 
     try:
-        # 直接从 request 解析 JSON（确保 UTF-8）
-        body_bytes = await request.body()
-        body_str = body_bytes.decode('utf-8')
-        body = json.loads(body_str)
-
-        query = body.get("query")
-        top_k = body.get("top_k")
-        similarity_threshold = body.get("similarity_threshold")
-        enable_rerank = body.get("enable_rerank")
-
-        if not query:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "query field is required"}
-            )
+        query = request.query
 
         params = resolve_retrieval_params(
-            top_k=top_k,
-            similarity_threshold=similarity_threshold,
-            enable_rerank=enable_rerank,
+            top_k=request.top_k,
+            similarity_threshold=request.similarity_threshold,
+            enable_rerank=request.enable_rerank,
         )
 
         logger.info(f"Simple answer: {query}, top_k: {params.top_k}")

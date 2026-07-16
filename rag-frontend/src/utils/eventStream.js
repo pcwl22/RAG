@@ -111,6 +111,7 @@ export const readEventStream = async (res, handlers = {}) => {
 
     buffer += decoder.decode()
     if (!finished && buffer.trim()) handleEvent(buffer)
+    if (!finished) throw new Error('流式响应意外中断')
   } finally {
     reader.releaseLock()
   }

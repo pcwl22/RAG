@@ -14,6 +14,7 @@ from app.retrieval.result_merge import merge_retrieval_results
 from app.service.chat_service import (
     Generator,
     format_missing_law_answer,
+    format_no_context_answer,
     missing_requested_laws,
 )
 from app.utils.config import get_settings
@@ -338,6 +339,10 @@ class EnhancedQueryService:
                 similarity_threshold=options.similarity_threshold,
                 enable_rerank=options.enable_rerank,
                 partition=options.partition,
+                # Only the user-supported resolved query may make cited
+                # provisions exclusive. Rewrites and controlled recall queries
+                # can contain generated article numbers and are recall aids.
+                enable_exact_citations=query == understanding["resolved_query"],
             )
             for query in retrieval_queries
         ]
@@ -471,6 +476,8 @@ class EnhancedQueryService:
         missing_laws = missing_requested_laws(understanding["resolved_query"], merged_results)
         if missing_laws:
             return format_missing_law_answer(missing_laws), []
+        if not merged_results:
+            return format_no_context_answer(), []
 
         if not understanding["is_decomposed"]:
             answer = await self.generator.generate(
@@ -516,6 +523,9 @@ class EnhancedQueryService:
         missing_laws = missing_requested_laws(understanding["resolved_query"], merged_results)
         if missing_laws:
             yield {"type": "chunk", "data": format_missing_law_answer(missing_laws)}
+            return
+        if not merged_results:
+            yield {"type": "chunk", "data": format_no_context_answer()}
             return
 
         if not understanding["is_decomposed"]:

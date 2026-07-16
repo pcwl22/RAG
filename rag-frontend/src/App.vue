@@ -149,7 +149,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, nextTick } from 'vue'
+import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import ChatSidebar from './components/ChatSidebar.vue'
 import DocumentsModal from './components/DocumentsModal.vue'
 import ProcessTrace from './components/ProcessTrace.vue'
@@ -159,6 +159,7 @@ import UploadModal from './components/UploadModal.vue'
 import {
   ENDPOINTS,
   fetchDocumentChunks,
+  fetchDocumentStatus,
   fetchDocuments,
   fetchHealth,
   ingestDocument,
@@ -202,6 +203,8 @@ const {
 const userInput = ref('')
 const isLoading = ref(false)
 const messagesContainer = ref(null)
+const activeRequestController = ref(null)
+let healthIntervalId = null
 
 const showUpload = ref(false)
 const selectedFile = ref(null)
@@ -213,6 +216,10 @@ const options = ref({
   enableUnderstanding: true,
   stream: true
 })
+
+const UPLOAD_POLL_INTERVAL_MS = 1000
+const UPLOAD_MAX_POLLS = 300
+const delay = (milliseconds) => new Promise(resolve => setTimeout(resolve, milliseconds))
 
 const hasActiveStreamingMessage = computed(() =>
   messages.value.some(msg => msg.role === 'assistant' && msg.streaming)
@@ -276,27 +283,35 @@ const handleSend = async () => {
 
   const query = userInput.value.trim()
   userInput.value = ''
-  const chatHistory = messages.value.slice(-6).map(m => ({
+  const originSessionId = currentSessionId.value
+  const originMessages = messages.value
+  const scrollOriginToBottom = () => {
+    if (currentSessionId.value === originSessionId) scrollToBottom()
+  }
+  const chatHistory = originMessages.slice(-6).map(m => ({
     role: m.role,
     content: m.content
   }))
 
   // 添加用户消息
-  messages.value.push({
+  originMessages.push({
     role: 'user',
     content: query,
     originalQuery: query  // 保存原始查询供后续使用
   })
 
   isLoading.value = true
-  scrollToBottom()
+  scrollOriginToBottom()
 
   let streamingMessage = null
   let streamWriter = null
   let activeProcessTrace = null
+  let requestController = null
 
   try {
     if (options.value.stream) {
+      requestController = new AbortController()
+      activeRequestController.value = requestController
       const endpoint = options.value.enableUnderstanding ? ENDPOINTS.enhancedQuery : ENDPOINTS.answer
       const payload = options.value.enableUnderstanding
         ? {
@@ -327,15 +342,15 @@ const handleSend = async () => {
         showUnderstanding: false,
         query: query
       }
-      messages.value.push(assistantMessage)
-      streamingMessage = messages.value[messages.value.length - 1]
+      originMessages.push(assistantMessage)
+      streamingMessage = originMessages[originMessages.length - 1]
       streamWriter = createStreamWriter((text) => {
         streamingMessage.streamingStatus = ''
         streamingMessage.content += text
-        scrollToBottom()
+        scrollOriginToBottom()
       })
 
-      const res = await postStream(endpoint, payload)
+      const res = await postStream(endpoint, payload, { signal: requestController.signal })
       await readEventStream(res, {
         onEvent: (payload) => {
           addProcessEvent(streamingMessage.process, payload)
@@ -443,7 +458,7 @@ const handleSend = async () => {
     // 过滤置信度≥0.8的文档
     const highConfidenceContexts = response.contexts?.filter(ctx => ctx.score >= 0.8) || []
 
-    messages.value.push({
+    originMessages.push({
       role: 'assistant',
       content: response.content,
       contexts: response.contexts,
@@ -482,12 +497,12 @@ const handleSend = async () => {
         finishProcess(activeProcessTrace)
       }
 
-      const lastMessage = messages.value[messages.value.length - 1]
+      const lastMessage = originMessages[originMessages.length - 1]
       if (lastMessage?.role === 'assistant' && !lastMessage.content) {
         lastMessage.content = '抱歉，查询失败: ' + error.message
         lastMessage.process = activeProcessTrace
       } else {
-        messages.value.push({
+        originMessages.push({
           role: 'assistant',
           content: '抱歉，查询失败: ' + error.message,
           contexts: [],
@@ -499,9 +514,12 @@ const handleSend = async () => {
       }
     }
   } finally {
+    if (activeRequestController.value === requestController) {
+      activeRequestController.value = null
+    }
     isLoading.value = false
-    updateCurrentSession()  // 保存对话
-    scrollToBottom()
+    updateCurrentSession(originSessionId, originMessages)
+    scrollOriginToBottom()
   }
 }
 
@@ -513,14 +531,30 @@ const handleUpload = async () => {
   uploadProgress.value = 0
 
   try {
-    await ingestDocument(selectedFile.value, uploadPartition.value)
-    uploadProgress.value = 100
-    setTimeout(() => {
-      showUpload.value = false
-      selectedFile.value = null
-      uploadProgress.value = 0
-      loadDocuments()
-    }, 500)
+    const submitted = await ingestDocument(selectedFile.value, uploadPartition.value)
+    if (!submitted?.task_id) throw new Error('上传接口未返回任务 ID')
+
+    uploadProgress.value = 10
+    let completed = false
+    for (let attempt = 0; attempt < UPLOAD_MAX_POLLS; attempt += 1) {
+      const status = await fetchDocumentStatus(submitted.task_id)
+      if (status.status === 'completed') {
+        uploadProgress.value = 100
+        completed = true
+        break
+      }
+      if (status.status === 'failed') {
+        throw new Error(status.error || '文档处理失败')
+      }
+      uploadProgress.value = Math.max(10, Math.min(95, status.progress || 50))
+      await delay(UPLOAD_POLL_INTERVAL_MS)
+    }
+    if (!completed) throw new Error('文档处理超时，请稍后在文档库中确认任务状态')
+
+    await loadDocuments()
+    showUpload.value = false
+    selectedFile.value = null
+    uploadProgress.value = 0
   } catch (error) {
     alert('上传失败: ' + error.message)
   } finally {
@@ -540,7 +574,13 @@ onMounted(() => {
   initChats()  // 初始化对话历史
   checkHealth()
   loadDocuments()
-  setInterval(checkHealth, 30000)
+  healthIntervalId = setInterval(checkHealth, 30000)
+})
+
+onUnmounted(() => {
+  activeRequestController.value?.abort()
+  activeRequestController.value = null
+  if (healthIntervalId !== null) clearInterval(healthIntervalId)
 })
 </script>
 

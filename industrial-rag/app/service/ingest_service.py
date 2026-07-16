@@ -1,4 +1,5 @@
 """Document ingestion workflow service."""
+import hashlib
 import time
 import uuid
 from typing import Any
@@ -24,9 +25,16 @@ def _chunking_config() -> dict:
 
 
 def _storage_backend():
-    from app.vectorstore.storage_adapter import add_documents
+    from app.vectorstore.storage_adapter import replace_document
 
-    return add_documents
+    return replace_document
+
+
+def _source_key(filename: str, partition: str, metadata: dict[str, Any]) -> str:
+    """Build a stable source identity for document-level replacement."""
+    explicit = str(metadata.get("source_id") or "").strip()
+    material = explicit or f"{partition.strip().casefold()}\0{filename.strip().casefold()}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
 def _dedupe_chunk_id(base_id: str, seen: set[str]) -> str:
@@ -44,6 +52,8 @@ async def process_document(
     filename: str,
     partition: str = "general",
     metadata: dict | None = None,
+    *,
+    invalidate_cache: bool = True,
 ) -> dict[str, Any]:
     """Parse, chunk, embed and store a document."""
     logger.info("Processing document: %s", filename)
@@ -80,6 +90,8 @@ async def process_document(
             raise ValueError("No chunks generated")
 
         document_id = str(uuid.uuid4())
+        base_metadata = dict(metadata or {})
+        source_key = _source_key(filename, partition, base_metadata)
         batch_size = int(_doc_processing_config().get("batch_size", 16))
         embeddings: list[list[float]] = []
         embedding_runtime = get_embedding_runtime_info()
@@ -105,7 +117,6 @@ async def process_document(
 
         embedding_elapsed = time.perf_counter() - embedding_start
 
-        base_metadata = metadata or {}
         chunk_ids: list[str] = []
         chunk_metadatas: list[dict[str, Any]] = []
         seen_chunk_ids: set[str] = set()
@@ -120,12 +131,15 @@ async def process_document(
                 "chunk_length": len(chunk),
                 "chunk_strategy": effective_strategy,
                 "partition": partition,
+                "source_key": source_key,
             }
 
             if chunk_metadata_overrides:
                 chunk_meta.update(chunk_metadata_overrides[index])
 
-            chunk_id_base = str(chunk_meta.get("semantic_chunk_id") or f"{document_id}_chunk_{index}")
+            # Database row IDs are version-specific. Stable legal identities
+            # remain in metadata.semantic_chunk_id for controlled exact recall.
+            chunk_id_base = f"{document_id}_chunk_{index}"
             chunk_id = _dedupe_chunk_id(chunk_id_base, seen_chunk_ids)
             chunk_ids.append(chunk_id)
             chunk_meta["chunk_id"] = chunk_id
@@ -144,20 +158,23 @@ async def process_document(
 
             chunk_metadatas.append(chunk_meta)
 
-        add_documents = _storage_backend()
-        await add_documents(
+        replace_document = _storage_backend()
+        await replace_document(
+            source_key=source_key,
+            filename=filename,
             ids=chunk_ids,
             embeddings=embeddings,
             documents=chunks,
             metadatas=chunk_metadatas,
             partition=partition,
         )
-        try:
-            from app.utils.cache import invalidate_semantic_cache
+        if invalidate_cache:
+            try:
+                from app.utils.cache import invalidate_semantic_cache
 
-            await invalidate_semantic_cache()
-        except Exception:
-            logger.debug("Semantic cache invalidation unavailable", exc_info=True)
+                await invalidate_semantic_cache()
+            except Exception:
+                logger.debug("Semantic cache invalidation unavailable", exc_info=True)
 
         total_elapsed = time.perf_counter() - pipeline_start
         logger.info(
@@ -175,7 +192,12 @@ async def process_document(
                 "embedding_gpu_name": embedding_runtime["gpu_name"],
             },
         )
-        return {"document_id": document_id, "total_chunks": len(chunks), "status": "completed"}
+        return {
+            "document_id": document_id,
+            "source_key": source_key,
+            "total_chunks": len(chunks),
+            "status": "completed",
+        }
 
     except Exception as exc:
         logger.error("Document processing failed: %s", exc, exc_info=True)

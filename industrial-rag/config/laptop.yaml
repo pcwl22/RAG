@@ -84,7 +84,7 @@ queue:
 
 document_processing:
   upload_dir: "./data/uploads"
-  supported_formats: ["pdf", "txt", "md", "docx", "doc", "xlsx", "xls"]
+  supported_formats: ["pdf", "txt", "md", "docx", "xlsx"]
   max_file_size: 52428800
   batch_size: 16
   pdf:

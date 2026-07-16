@@ -8,7 +8,7 @@ services:
       RAG_API_UPSTREAM: ${RAG_API_UPSTREAM:-http://api:8000}
       RAG_API_KEY: ${RAG_API_KEY:-}
     ports:
-      - "5173:80"
+      - "${RAG_BIND_ADDRESS:-127.0.0.1}:5173:80"
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
@@ -19,12 +19,52 @@ services:
       context: ./industrial-rag
       dockerfile: docker/api/Dockerfile
     container_name: rag-api
+    gpus: all
     env_file:
       - ./industrial-rag/.env
     environment:
       RAG_ENV: base
+      QUEUE_PROVIDER: ${QUEUE_PROVIDER:-memory}
+      RAG_API_KEY: ${RAG_API_KEY:?Set RAG_API_KEY in industrial-rag/.env}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
     ports:
-      - "${RAG_API_PORT:-18000}:8000"
+      - "${RAG_BIND_ADDRESS:-127.0.0.1}:${RAG_API_PORT:-18000}:8000"
+    volumes:
+      - ./models:/app/models:ro
+      - ./industrial-rag/data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+    security_opt:
+      - no-new-privileges:true
+
+  worker:
+    profiles: ["worker"]
+    build:
+      context: ./industrial-rag
+      dockerfile: docker/worker/Dockerfile
+    container_name: rag-worker
+    env_file:
+      - ./industrial-rag/.env
+    environment:
+      RAG_ENV: base
+      QUEUE_PROVIDER: ${QUEUE_PROVIDER:-celery}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      EMBEDDING_DEVICE: cpu
+      RERANKER_DEVICE: cpu
     volumes:
       - ./models:/app/models:ro
       - ./industrial-rag/data:/app/data
@@ -45,7 +85,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: rag_db
     ports:
-      - "${RAG_POSTGRES_PORT:-15432}:5432"
+      - "${RAG_BIND_ADDRESS:-127.0.0.1}:${RAG_POSTGRES_PORT:-15432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     restart: unless-stopped
@@ -61,7 +101,7 @@ services:
     image: redis:7-alpine
     container_name: rag-redis
     ports:
-      - "16379:6379"
+      - "${RAG_BIND_ADDRESS:-127.0.0.1}:16379:6379"
     volumes:
       - redis_data:/data
     restart: unless-stopped

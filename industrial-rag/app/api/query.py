@@ -8,6 +8,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.api.retrieval_params import resolve_retrieval_params
+from app.retrieval.domain_signal_map import is_known_out_of_scope
 from app.retrieval.result_merge import result_score
 from app.service.chat_service import Generator
 from app.utils.config import get_settings
@@ -91,14 +92,17 @@ async def query_documents(request: QueryRequest) -> QueryResponse:
             similarity_threshold=request.similarity_threshold,
             enable_rerank=request.enable_rerank,
         )
-        engine = _retrieval_engine()
-        results = await engine.retrieve(
-            query=request.query,
-            top_k=params.top_k,
-            similarity_threshold=params.similarity_threshold,
-            enable_rerank=params.enable_rerank,
-            partition=request.partition,
-        )
+        if is_known_out_of_scope(request.query):
+            results = []
+        else:
+            engine = _retrieval_engine()
+            results = await engine.retrieve(
+                query=request.query,
+                top_k=params.top_k,
+                similarity_threshold=params.similarity_threshold,
+                enable_rerank=params.enable_rerank,
+                partition=request.partition,
+            )
         documents = [_to_retrieved_document(doc) for doc in results]
         return QueryResponse(
             query=request.query,
@@ -125,14 +129,17 @@ async def answer_question(request: AnswerRequest) -> AnswerResponse | StreamingR
             async def stream_generator():
                 try:
                     yield f"data: {json.dumps({'type': 'status', 'data': '正在检索相关文档...'}, ensure_ascii=False)}\n\n"
-                    engine = _retrieval_engine()
-                    results = await engine.retrieve(
-                        query=request.query,
-                        top_k=params.top_k,
-                        similarity_threshold=params.similarity_threshold,
-                        enable_rerank=params.enable_rerank,
-                        partition=request.partition,
-                    )
+                    if is_known_out_of_scope(request.query):
+                        results = []
+                    else:
+                        engine = _retrieval_engine()
+                        results = await engine.retrieve(
+                            query=request.query,
+                            top_k=params.top_k,
+                            similarity_threshold=params.similarity_threshold,
+                            enable_rerank=params.enable_rerank,
+                            partition=request.partition,
+                        )
 
                     sources = [_to_retrieved_document(doc).model_dump() for doc in results]
                     yield f"data: {json.dumps({'type': 'sources', 'data': sources}, ensure_ascii=False)}\n\n"
@@ -155,14 +162,17 @@ async def answer_question(request: AnswerRequest) -> AnswerResponse | StreamingR
                 headers=SSE_HEADERS,
             )
 
-        engine = _retrieval_engine()
-        results = await engine.retrieve(
-            query=request.query,
-            top_k=params.top_k,
-            similarity_threshold=params.similarity_threshold,
-            enable_rerank=params.enable_rerank,
-            partition=request.partition,
-        )
+        if is_known_out_of_scope(request.query):
+            results = []
+        else:
+            engine = _retrieval_engine()
+            results = await engine.retrieve(
+                query=request.query,
+                top_k=params.top_k,
+                similarity_threshold=params.similarity_threshold,
+                enable_rerank=params.enable_rerank,
+                partition=request.partition,
+            )
 
         if not results:
             answer = "抱歉，我在知识库中没有找到足够相关的信息来回答这个问题。"

@@ -5,16 +5,22 @@
 - "memory"（笔记本默认）：使用 FastAPI BackgroundTasks + 内存状态表。
 - "rabbitmq" / "celery"：延迟导入 Celery 任务。
 """
+import asyncio
 import json
 import os
+import threading
 import uuid
 from pathlib import Path
+from typing import Annotated
 
-from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 
+from app.parser.document_parser import SUPPORTED_EXTENSIONS
 from app.utils.config import get_settings
 from app.utils.logger import get_logger
+from app.utils.upload_files import quarantine_failed_upload
+from app.vectorstore import storage_adapter
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -27,13 +33,15 @@ config = get_settings()
 # 结构: {task_id: {"status": str, "progress": int, "total_chunks": int, "error": str | None}}
 _task_registry: dict[str, dict] = {}
 _MAX_IN_MEMORY_TASKS = 1000
+_task_registry_lock = threading.RLock()
 
 
 def _remember_task(task_id: str, state: dict) -> None:
     """Keep the local fallback bounded; distributed deployments should use Celery."""
-    _task_registry[task_id] = state
-    while len(_task_registry) > _MAX_IN_MEMORY_TASKS:
-        _task_registry.pop(next(iter(_task_registry)))
+    with _task_registry_lock:
+        _task_registry[task_id] = state
+        while len(_task_registry) > _MAX_IN_MEMORY_TASKS:
+            _task_registry.pop(next(iter(_task_registry)))
 
 
 async def _persist_task_state(task_id: str, state: dict) -> None:
@@ -47,7 +55,8 @@ async def _persist_task_state(task_id: str, state: dict) -> None:
 
 
 async def _load_task_state(task_id: str) -> dict | None:
-    state = _task_registry.get(task_id)
+    with _task_registry_lock:
+        state = _task_registry.get(task_id)
     if state is not None:
         return state
     try:
@@ -71,16 +80,74 @@ def _get_upload_dir() -> Path:
     return path
 
 
+def _quarantine_failed_upload(file_path: str, task_id: str) -> None:
+    """Retain failed memory-mode inputs for an operator or retry job."""
+    try:
+        processing = config.get("document_processing", {})
+        destination = quarantine_failed_upload(
+            file_path,
+            retention_seconds=int(processing.get("failed_upload_retention_seconds", 604800)),
+            max_files=int(processing.get("failed_upload_max_files", 100)),
+        )
+        if destination is not None:
+            logger.warning("Failed upload retained for retry: %s", destination)
+    except OSError:
+        logger.warning("Could not retain failed upload: %s", file_path, exc_info=True)
+
+
 def _queue_provider() -> str:
-    return config.get("queue", {}).get("provider", "memory").lower()
+    return (
+        os.getenv("QUEUE_PROVIDER")
+        or config.get("queue", {}).get("provider", "memory")
+    ).lower()
+
+
+def _run_on_app_loop(
+    app_loop: asyncio.AbstractEventLoop | None,
+    coroutine,
+    operation: str,
+) -> bool:
+    """Run Redis-bound work on the FastAPI loop, never on the worker loop."""
+    if app_loop is None or app_loop.is_closed():
+        coroutine.close()
+        logger.warning("Skipped %s because the application loop is unavailable", operation)
+        return False
+    try:
+        future = asyncio.run_coroutine_threadsafe(coroutine, app_loop)
+        future.result(timeout=10)
+        return True
+    except Exception:
+        logger.warning("Failed to %s on the application loop", operation, exc_info=True)
+        return False
+
+
+def _publish_task_state(
+    task_id: str,
+    state: dict,
+    app_loop: asyncio.AbstractEventLoop | None,
+) -> None:
+    """Publish immediately in memory and persist through the owning async loop."""
+    _remember_task(task_id, state)
+    if app_loop is not None:
+        _run_on_app_loop(
+            app_loop,
+            _persist_task_state(task_id, state),
+            f"persist task state for {task_id}",
+        )
 
 
 def _process_document_memory(
-    task_id: str, file_path: str, filename: str, partition: str, metadata: dict
+    task_id: str,
+    file_path: str,
+    filename: str,
+    partition: str,
+    metadata: dict,
+    app_loop: asyncio.AbstractEventLoop | None = None,
 ) -> None:
     """内存模式下的后台文档处理。"""
     import asyncio
 
+    completed = False
     state = {
         "status": "processing",
         "progress": 0,
@@ -89,43 +156,61 @@ def _process_document_memory(
     }
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    loop.run_until_complete(_persist_task_state(task_id, state))
+    _publish_task_state(task_id, state, app_loop)
     try:
         # 调用处理流水线
         from app.service.ingest_service import process_document
 
         # 在新的事件循环中运行异步任务
         result = loop.run_until_complete(
-            process_document(file_path, filename, partition, metadata)
+            process_document(
+                file_path,
+                filename,
+                partition,
+                metadata,
+                invalidate_cache=False,
+            )
         )
         if result["status"] == "completed":
-            loop.run_until_complete(_persist_task_state(task_id, {
+            completed = True
+            if app_loop is not None:
+                from app.utils.cache import invalidate_semantic_cache
+
+                _run_on_app_loop(
+                    app_loop,
+                    invalidate_semantic_cache(),
+                    "invalidate semantic cache after ingestion",
+                )
+            _publish_task_state(task_id, {
                 "status": "completed",
                 "progress": 100,
                 "total_chunks": result["total_chunks"],
                 "error": None,
-            }))
+            }, app_loop)
             logger.info(f"Document processed: {task_id}, {result['total_chunks']} chunks")
         else:
-            loop.run_until_complete(_persist_task_state(task_id, {
+            _publish_task_state(task_id, {
                 "status": "failed",
                 "progress": 0,
                 "total_chunks": 0,
                 "error": result.get("error", "Unknown error"),
-            }))
+            }, app_loop)
     except Exception as e:
         logger.error(f"Document processing failed for task {task_id}: {e}")
-        loop.run_until_complete(_persist_task_state(task_id, {
+        _publish_task_state(task_id, {
             "status": "failed",
             "progress": 0,
             "total_chunks": 0,
             "error": str(e),
-        }))
+        }, app_loop)
     finally:
-        try:
-            os.unlink(file_path)
-        except FileNotFoundError:
-            pass
+        if completed:
+            try:
+                os.unlink(file_path)
+            except FileNotFoundError:
+                pass
+        else:
+            _quarantine_failed_upload(file_path, task_id)
         loop.close()
 
 
@@ -152,8 +237,8 @@ class DocumentStatus(BaseModel):
 async def ingest_document(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    partition: str = Form(default="text"),
-    metadata: str = Form(default="{}"),
+    partition: str = Form(default="text", max_length=100),
+    metadata: str = Form(default="{}", max_length=65536),
 ) -> DocumentIngestResponse:
     """
     摄入文档
@@ -170,7 +255,11 @@ async def ingest_document(
     # 验证文件类型
     safe_filename = Path(file.filename or "unknown").name
     file_ext = Path(safe_filename).suffix.removeprefix(".").lower()
-    supported_formats = config["document_processing"]["supported_formats"]
+    configured_formats = {
+        str(item).lower()
+        for item in config["document_processing"].get("supported_formats", [])
+    }
+    supported_formats = sorted(configured_formats & SUPPORTED_EXTENSIONS)
 
     if file_ext not in supported_formats:
         raise HTTPException(
@@ -239,12 +328,14 @@ async def ingest_document(
             raise HTTPException(status_code=503, detail="Document queue unavailable") from exc
     else:
         # 内存模式：FastAPI 后台任务
-        _remember_task(task_id, {
+        initial_state = {
             "status": "pending",
             "progress": 0,
             "total_chunks": 0,
             "error": None,
-        })
+        }
+        await _persist_task_state(task_id, initial_state)
+        app_loop = asyncio.get_running_loop()
         background_tasks.add_task(
             _process_document_memory,
             task_id=task_id,
@@ -252,6 +343,7 @@ async def ingest_document(
             filename=safe_filename,
             partition=partition,
             metadata=metadata_dict,
+            app_loop=app_loop,
         )
 
     logger.info(f"Document ingest task submitted: {task_id}", extra={"task_id": task_id})
@@ -278,9 +370,11 @@ async def get_document_status(task_id: str) -> DocumentStatus:
     provider = _queue_provider()
 
     if provider in ("rabbitmq", "celery"):
-        from celery.result import AsyncResult
+        from app.workers.celery_app import celery_app
 
-        result = AsyncResult(task_id)
+        if celery_app is None:
+            raise HTTPException(status_code=503, detail="Document queue unavailable")
+        result = celery_app.AsyncResult(task_id)
 
         status_map = {
             "PENDING": "pending",
@@ -333,15 +427,22 @@ async def delete_document(document_id: str) -> dict:
     from app.vectorstore.storage_adapter import delete_document
 
     try:
-        await delete_document(document_id)
+        deleted = await delete_document(document_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Document not found")
         return {"status": "success", "message": f"Document {document_id} deleted"}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to delete document {document_id}: {e}")
         raise HTTPException(status_code=500, detail="Document deletion failed") from e
 
 
 @router.get("/documents")
-async def list_documents(skip: int = 0, limit: int = 100) -> dict:
+async def list_documents(
+    skip: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=500)] = 100,
+) -> dict:
     """
     列出所有文档
 
@@ -352,11 +453,12 @@ async def list_documents(skip: int = 0, limit: int = 100) -> dict:
     Returns:
         文档列表
     """
-    from app.vectorstore.storage_adapter import list_documents as list_docs
-
     try:
-        documents = await list_docs(skip=skip, limit=limit)
-        return {"total": len(documents), "documents": documents}
+        documents, total = await asyncio.gather(
+            storage_adapter.list_documents(skip=skip, limit=limit),
+            storage_adapter.count_documents(),
+        )
+        return {"total": total, "documents": documents}
     except Exception as e:
         logger.error(f"Failed to list documents: {e}")
         raise HTTPException(status_code=500, detail="Document listing failed") from e
@@ -365,8 +467,8 @@ async def list_documents(skip: int = 0, limit: int = 100) -> dict:
 @router.get("/documents/{document_id}/chunks")
 async def list_document_chunks(
     document_id: str,
-    skip: int = 0,
-    limit: int = 2000,
+    skip: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=5000)] = 2000,
 ) -> dict:
     """
     列出某个文档真实入库切片。

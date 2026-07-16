@@ -7,6 +7,8 @@ environment, so device selection is controlled by config and can use GPU.
 """
 from __future__ import annotations
 
+import os
+
 from app.utils.config import get_settings
 from app.utils.logger import get_logger
 
@@ -36,7 +38,7 @@ def resolve_torch_device(configured_device: str | None) -> str:
 def get_embedding_runtime_info() -> dict[str, str | bool | None]:
     """Return runtime device information for the embedding model."""
     config = get_settings()
-    device = config.get("embedding", {}).get("device", "cuda")
+    device = os.getenv("EMBEDDING_DEVICE") or config.get("embedding", {}).get("device", "cuda")
     resolved_config_device = resolve_torch_device(device)
     info: dict[str, str | bool | None] = {
         "configured_device": device,
@@ -92,7 +94,9 @@ def load_embedding_model():
 
     # Device selection is driven by embedding.device in config, with a local
     # CPU fallback for environments where torch was installed without CUDA.
-    device = resolve_torch_device(embed_config.get("device", "cuda"))
+    device = resolve_torch_device(
+        os.getenv("EMBEDDING_DEVICE") or embed_config.get("device", "cuda")
+    )
 
     logger.info(f"Loading embedding model: {model_path} (device={device})")
 

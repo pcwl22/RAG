@@ -1,9 +1,17 @@
 """Mocked API route tests for retrieval, generation, and document routes."""
 import asyncio
+import os
 
 import httpx
+import pytest
 
 from app.main import app
+
+
+@pytest.fixture(autouse=True)
+def disable_oidc_for_route_mocks(monkeypatch):
+    """Route mocks exercise handlers, not an external identity provider."""
+    monkeypatch.setenv("OIDC_ENABLED", "false")
 
 DOC = {
     "id": "doc-1",
@@ -15,8 +23,11 @@ DOC = {
 
 async def _post_json(path: str, payload: dict) -> httpx.Response:
     transport = httpx.ASGITransport(app=app)
+    headers = {}
+    if api_key := os.getenv("RAG_API_KEY"):
+        headers["X-API-Key"] = api_key
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-        return await client.post(path, json=payload)
+        return await client.post(path, json=payload, headers=headers)
 
 
 def test_query_and_answer_routes_with_mocked_engine_and_generator(monkeypatch):
@@ -110,6 +121,35 @@ def test_standard_query_and_answer_refuse_known_out_of_scope_before_retrieval(mo
     asyncio.run(run())
 
 
+def test_answer_stream_emits_terminal_event_after_failure(monkeypatch):
+    import app.api.query as query_api
+
+    class FakeEngine:
+        async def retrieve(self, **kwargs):
+            return [DOC]
+
+    class FailingGenerator:
+        async def generate_stream(self, **kwargs):
+            if False:
+                yield ""
+            raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr(query_api, "_retrieval_engine", lambda: FakeEngine())
+    monkeypatch.setattr(query_api, "Generator", FailingGenerator)
+
+    async def run():
+        response = await _post_json(
+            "/api/v1/answer",
+            {"query": "what happened", "stream": True},
+        )
+
+        assert response.status_code == 200
+        assert '"type": "error"' in response.text
+        assert '"type": "done", "error": true' in response.text
+
+    asyncio.run(run())
+
+
 def test_simple_query_and_answer_routes_with_mocks(monkeypatch):
     import app.api.query_simple as query_simple_api
     import app.service.chat_service as chat_service
@@ -125,7 +165,7 @@ def test_simple_query_and_answer_routes_with_mocks(monkeypatch):
         async def generate(self, query, context_docs, use_cache=True):
             return f"answer for {query}"
 
-    monkeypatch.setattr(query_simple_api, "RetrievalEngine", FakeEngine)
+    monkeypatch.setattr(query_simple_api, "build_retrieval_engine", FakeEngine)
     monkeypatch.setattr(chat_service, "Generator", FakeGenerator)
 
     async def run():
@@ -227,7 +267,7 @@ def test_enhanced_query_route_with_mocked_understanding_retrieval_and_generation
             return "enhanced answer"
 
     monkeypatch.setattr(enhanced_service, "QueryUnderstanding", FakeUnderstanding)
-    monkeypatch.setattr(enhanced_service, "HybridRetrievalEngine", FakeEngine)
+    monkeypatch.setattr(enhanced_service, "build_retrieval_engine", FakeEngine)
     monkeypatch.setattr(enhanced_service, "Generator", FakeGenerator)
 
     async def run():
@@ -282,7 +322,7 @@ def test_enhanced_query_refuses_missing_requested_law_before_decomposed_generati
             raise AssertionError("Generator should not run when requested law is missing")
 
     monkeypatch.setattr(enhanced_service, "QueryUnderstanding", FakeUnderstanding)
-    monkeypatch.setattr(enhanced_service, "HybridRetrievalEngine", FakeEngine)
+    monkeypatch.setattr(enhanced_service, "build_retrieval_engine", FakeEngine)
     monkeypatch.setattr(enhanced_service, "Generator", FakeGenerator)
 
     async def run():
@@ -303,6 +343,7 @@ def test_upload_status_list_and_delete_routes_with_mocks(monkeypatch, tmp_path):
     import app.api.upload as upload_api
     import app.vectorstore.storage_adapter as storage_adapter
 
+    monkeypatch.setenv("RAG_SERVICE_ROLES", "viewer,editor,admin")
     upload_api._task_registry.clear()
     monkeypatch.setattr(
         upload_api,
@@ -318,14 +359,14 @@ def test_upload_status_list_and_delete_routes_with_mocks(monkeypatch, tmp_path):
     )
 
     def fake_process_document_memory(
-        task_id, file_path, filename, partition, metadata, app_loop=None
+        task_id, file_path, filename, partition, metadata, tenant_id=None, app_loop=None
     ):
-        upload_api._task_registry[task_id] = {
+        upload_api._remember_task(task_id, {
             "status": "completed",
             "progress": 100,
             "total_chunks": 2,
             "error": None,
-        }
+        }, tenant_id)
 
     async def fake_delete_document(document_id):
         fake_delete_document.deleted = document_id
@@ -362,33 +403,40 @@ def test_upload_status_list_and_delete_routes_with_mocks(monkeypatch, tmp_path):
 
     async def run():
         transport = httpx.ASGITransport(app=app)
+        headers = {}
+        if api_key := os.getenv("RAG_API_KEY"):
+            headers["X-API-Key"] = api_key
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
             invalid_json = await client.post(
                 "/api/v1/documents/ingest",
                 files={"file": ("sample.txt", b"sample content", "text/plain")},
                 data={"metadata": "{invalid"},
+                headers=headers,
             )
             non_object_json = await client.post(
                 "/api/v1/documents/ingest",
                 files={"file": ("sample.txt", b"sample content", "text/plain")},
                 data={"metadata": "[]"},
+                headers=headers,
             )
             unsupported_file = await client.post(
                 "/api/v1/documents/ingest",
                 files={"file": ("sample.pptx", b"not a presentation", "application/octet-stream")},
+                headers=headers,
             )
             ingest_response = await client.post(
                 "/api/v1/documents/ingest",
                 files={"file": ("sample.txt", b"sample content", "text/plain")},
                 data={"partition": "text", "metadata": '{"source":"test"}'},
+                headers=headers,
             )
             assert ingest_response.status_code == 200
             task_id = ingest_response.json()["task_id"]
 
-            status_response = await client.get(f"/api/v1/documents/status/{task_id}")
-            list_response = await client.get("/api/v1/documents")
-            chunks_response = await client.get("/api/v1/documents/doc-1/chunks")
-            delete_response = await client.delete("/api/v1/documents/doc-1")
+            status_response = await client.get(f"/api/v1/documents/status/{task_id}", headers=headers)
+            list_response = await client.get("/api/v1/documents", headers=headers)
+            chunks_response = await client.get("/api/v1/documents/doc-1/chunks", headers=headers)
+            delete_response = await client.delete("/api/v1/documents/doc-1", headers=headers)
 
         assert invalid_json.status_code == 400
         assert non_object_json.status_code == 400
@@ -403,6 +451,36 @@ def test_upload_status_list_and_delete_routes_with_mocks(monkeypatch, tmp_path):
         assert fake_list_document_chunks.document_id == "doc-1"
         assert delete_response.status_code == 200
         assert fake_delete_document.deleted == "doc-1"
+
+    asyncio.run(run())
+
+
+def test_simple_query_and_answer_refuse_known_out_of_scope(monkeypatch):
+    import app.api.query_simple as query_simple_api
+
+    class ScopeAwareEngine:
+        async def retrieve(self, *, query, **kwargs):
+            from app.retrieval.domain_signal_map import is_known_out_of_scope
+
+            assert is_known_out_of_scope(query)
+            return []
+
+    monkeypatch.setattr(query_simple_api, "build_retrieval_engine", ScopeAwareEngine)
+
+    async def run():
+        query_response = await _post_json(
+            "/api/v1/query_simple",
+            {"query": "增值税专用发票抵扣期限如何规定？"},
+        )
+        answer_response = await _post_json(
+            "/api/v1/answer_simple",
+            {"query": "增值税专用发票抵扣期限如何规定？"},
+        )
+
+        assert query_response.status_code == 200
+        assert query_response.json()["documents"] == []
+        assert answer_response.status_code == 200
+        assert answer_response.json()["sources"] == []
 
     asyncio.run(run())
 
@@ -442,9 +520,16 @@ def test_memory_upload_keeps_redis_work_on_application_loop(monkeypatch, tmp_pat
         app_loop=FakeAppLoop(),
     )
 
-    assert process_calls == [{"invalidate_cache": False}]
+    assert process_calls == [
+        {
+            "invalidate_cache": False,
+            "tenant_id": "00000000-0000-0000-0000-000000000001",
+        }
+    ]
     assert any("invalidate semantic cache" in operation for operation in operations)
-    assert upload_api._task_registry["loop-safe-task"]["status"] == "completed"
+    assert upload_api._task_registry[
+        ("00000000-0000-0000-0000-000000000001", "loop-safe-task")
+    ]["status"] == "completed"
     assert not source.exists()
 
 
@@ -466,8 +551,70 @@ def test_failed_memory_upload_is_quarantined(monkeypatch, tmp_path):
     assert not source.exists()
 
 
+def test_public_task_state_redacts_internal_failure_details():
+    import app.api.upload as upload_api
+
+    state = upload_api._public_task_state(
+        {
+            "status": "failed",
+            "progress": 0,
+            "total_chunks": 0,
+            "error": "database password appeared in an internal exception",
+        }
+    )
+
+    assert state["error"] == "Document ingestion failed"
+    assert state["error_code"] == "DOCUMENT_INGESTION_FAILED"
+    assert "password" not in state["error"]
+
+
 def test_queue_provider_environment_override(monkeypatch):
     import app.api.upload as upload_api
 
     monkeypatch.setenv("QUEUE_PROVIDER", "celery")
     assert upload_api._queue_provider() == "celery"
+
+
+def test_queue_provider_typo_does_not_fall_back_to_memory(monkeypatch):
+    import app.api.upload as upload_api
+
+    monkeypatch.setenv("QUEUE_PROVIDER", "celrey")
+    with pytest.raises(ValueError, match="Unsupported queue provider"):
+        upload_api._queue_provider()
+
+
+def test_task_registry_evicts_least_recently_used_not_first_inserted(monkeypatch):
+    """Both writing and polling a task must protect it from eviction.
+
+    A plain dict keeps its original insertion order when a key is reassigned, so
+    an in-flight task would be dropped ahead of untouched completed entries and
+    its status poll would return 404.
+    """
+    import app.api.upload as upload_api
+
+    tenant = "00000000-0000-0000-0000-000000000001"
+    upload_api._task_registry.clear()
+    monkeypatch.setattr(upload_api, "_MAX_IN_MEMORY_TASKS", 3)
+
+    def remember(task_id):
+        upload_api._remember_task(task_id, {"status": "processing"}, tenant)
+
+    def tracked():
+        return [task_id for _, task_id in upload_api._task_registry]
+
+    for task_id in ("task-0", "task-1", "task-2"):
+        remember(task_id)
+    assert tracked() == ["task-0", "task-1", "task-2"]
+
+    # Writing task-0 again makes it the newest, so task-1 is the eviction target.
+    remember("task-0")
+    remember("task-3")
+    assert tracked() == ["task-2", "task-0", "task-3"]
+
+    # task-2 is now the eviction target; reading it must reprieve it, leaving
+    # task-0 (untouched the longest) as the one that goes.
+    assert asyncio.run(upload_api._load_task_state("task-2", tenant)) is not None
+    remember("task-4")
+    assert tracked() == ["task-3", "task-2", "task-4"]
+
+    upload_api._task_registry.clear()

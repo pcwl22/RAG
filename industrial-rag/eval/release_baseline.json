@@ -1,0 +1,47 @@
+{
+  "schema_version": 2,
+  "evaluated_at": "2026-08-05T12:00:00+08:00",
+  "datasets": {
+    "legal_expanded_240.jsonl": {
+      "sha256": "de0e57badf0f24d320b8847f5b975ef6aa370ff50f51e419530d5f14c2fc8fa2",
+      "sample_count": 240
+    },
+    "legal_expanded_ragas_40.jsonl": {
+      "sha256": "d281d3f037070b5cc5ad65f8a6506e0ac6c8fa88ada7c8b854ba7230c411c56b",
+      "sample_count": 40
+    }
+  },
+  "implementation": {
+    "paths": [
+      "app/api/retrieval_params.py",
+      "app/embedding/embedder.py",
+      "app/evaluation",
+      "app/llm",
+      "app/parser",
+      "app/retrieval",
+      "app/service/chat_service.py",
+      "app/service/enhanced_query_service.py",
+      "app/vectorstore/postgres_store.py",
+      "app/vectorstore/storage_adapter.py",
+      "config/base.yaml",
+      "prompts/system.txt"
+    ],
+    "sha256": "bde834a409b7cd2d9a733562ec365eed0134b8430a4d65580aa7fdbe2313ceef"
+  },
+  "evaluation_contract": {
+    "retrieval_top_k": 5,
+    "ragas_version": "0.4.3",
+    "judge_model": "deepseek-chat"
+  },
+  "checks": {
+    "in_domain_citation_recall": {"value": 1.0, "minimum": 0.95},
+    "adversarial_citation_recall": {"value": 1.0, "minimum": 0.85},
+    "comparison_citation_recall": {"value": 1.0, "minimum": 0.85},
+    "no_answer_abstention_rate": {"value": 1.0, "minimum": 0.90},
+    "answer_accuracy": {"value": 0.9375, "minimum": 0.70},
+    "faithfulness": {"value": 0.8650138468616729, "minimum": 0.80},
+    "context_precision": {"value": 0.9999999999, "minimum": 0.60},
+    "context_recall": {"value": 1.0, "minimum": 0.70},
+    "citation_mrr": {"value": 0.875, "minimum": 0.70}
+  }
+}

@@ -1,7 +1,18 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { compactSessions, saveSessions } from '../src/utils/chatStorage.js'
+import { buildChatStorageKey, compactSessions, saveSessions } from '../src/utils/chatStorage.js'
+
+test('chat persistence is scoped by tenant and authenticated subject', () => {
+  const alice = buildChatStorageKey({ profile: { tenant_id: 'tenant-a', sub: 'alice' } })
+  const bob = buildChatStorageKey({ profile: { tenant_id: 'tenant-a', sub: 'bob' } })
+  const otherTenant = buildChatStorageKey({ profile: { tenant_id: 'tenant-b', sub: 'alice' } })
+
+  assert.equal(alice, 'rag_chat_sessions:tenant-a:alice')
+  assert.notEqual(alice, bob)
+  assert.notEqual(alice, otherTenant)
+  assert.equal(buildChatStorageKey(), 'rag_chat_sessions:local')
+})
 
 test('chat persistence drops heavy traces and bounds history', () => {
   const messages = Array.from({ length: 105 }, (_, index) => ({

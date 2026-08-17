@@ -1,6 +1,7 @@
 """Query understanding: coreference resolution and decomposition."""
 import json
 import re
+from typing import Any
 
 from app.llm.model import get_llm_client
 from app.retrieval.domain_signal_map import build_domain_signal_queries
@@ -8,7 +9,7 @@ from app.retrieval.legal_concept_map import (
     build_concept_article_queries,
     match_legal_concept_articles,
 )
-from app.utils.config import get_settings
+from app.utils.config import get_config_section
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -72,13 +73,8 @@ FACT_TRIGGERED_SIGNAL_TERMS = {
 }
 
 
-def _query_understanding_config() -> dict:
-    return (
-        get_settings()
-        .get("rag", {})
-        .get("retrieval", {})
-        .get("query_understanding", {})
-    )
+def _query_understanding_config() -> dict[str, Any]:
+    return get_config_section("rag", "retrieval", "query_understanding")
 
 
 def _clean_numbered_line(text: str) -> str:
@@ -115,7 +111,7 @@ def _extract_json_object(text: str) -> dict:
         return {}
 
 
-def _normalize_signal_values(value) -> list[str]:
+def _normalize_signal_values(value: Any) -> list[str]:
     if isinstance(value, str):
         raw_values = re.split(r"[，,、;/；\n]+", value)
     elif isinstance(value, list):
@@ -156,7 +152,7 @@ def _drop_untriggered_signal_terms(value: str, query: str) -> str:
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
-def _normalize_signal_values_for_query(value, query: str) -> list[str]:
+def _normalize_signal_values_for_query(value: Any, query: str) -> list[str]:
     allowed_articles = set(_article_terms(query))
     values: list[str] = []
     for item in _normalize_signal_values(value):
@@ -228,7 +224,7 @@ def _is_related_rewrite(original: str, rewritten: str) -> bool:
 class QueryUnderstanding:
     """LLM-backed query understanding module."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.llm = get_llm_client()
         self.config = _query_understanding_config()
 

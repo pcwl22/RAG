@@ -1,6 +1,15 @@
 export const MAX_STORED_SESSIONS = 20
 export const MAX_STORED_MESSAGES = 100
 const MAX_CONTENT_LENGTH = 20000
+const STORAGE_PREFIX = 'rag_chat_sessions'
+
+const storageSegment = value => encodeURIComponent(String(value || 'unknown'))
+
+export const buildChatStorageKey = (user = null) => {
+  const profile = user?.profile || {}
+  if (!profile.sub) return `${STORAGE_PREFIX}:local`
+  return `${STORAGE_PREFIX}:${storageSegment(profile.tenant_id)}:${storageSegment(profile.sub)}`
+}
 
 const compactMessage = (message = {}) => ({
   role: message.role,

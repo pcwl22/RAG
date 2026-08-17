@@ -13,7 +13,7 @@ Industrial RAG 是一个面向中文法律文本的本地知识库问答项目�
 
 > 本项目用于知识检索和技术验证，不构成法律意见。正式业务使用时，应由具备资质的专业人员复核法律依据、法规时效和个案事实。
 
-## 当前质量状态
+## 质量基线（需发布前重新验证）
 
 当前评估集包含 240 条分层样本：140 条常规法条、40 条对抗性表达、20 条跨法条比较和 40 条无答案问题。
 
@@ -26,10 +26,14 @@ Industrial RAG 是一个面向中文法律文本的本地知识库问答项目�
 | 无答案拒答率 | 1.0000 |
 | Ragas Answer Accuracy | 0.9625 |
 | Ragas Faithfulness | 0.9141 |
-| Ragas Context Precision | 1.0000 |
+| Ragas Context Precision | 1.0000（历史基线） |
 | Ragas Context Recall | 1.0000 |
 
-后端目前有 108 项自动化测试（包含真实 pgvector 集成测试），覆盖率约 68%，并通过 Ruff、前端测试、生产构建和 Compose 配置验证。
+上述数字是历史评估基线，不代表当前工作树的实时结果。发布前必须重新生成完整检索报告、
+Ragas 报告和 release gate；生成报告位于被忽略的 `industrial-rag/data/`，应在 CI artifact
+或评估存储中保留数据集、模型、提示词和代码版本信息。
+
+后端目前收集 166 项自动化测试（包含真实 pgvector 集成测试），覆盖率约 69%，并通过 Ruff、评估集完整性门禁、前端测试、生产构建和 Compose 配置验证。
 
 ## 主要功能
 
@@ -168,8 +172,14 @@ Copy-Item industrial-rag\.env.example industrial-rag\.env
 
 ```dotenv
 RAG_ENV=laptop
-RAG_API_KEY=replace-with-a-long-random-value
+RAG_SERVICE_TENANT_ID=00000000-0000-0000-0000-000000000001
+RAG_SERVICE_ROLES=viewer
 POSTGRES_PASSWORD=replace-with-a-strong-password
+POSTGRES_RUNTIME_USER=rag_runtime
+POSTGRES_APP_PASSWORD=replace-with-a-different-strong-password
+REDIS_PASSWORD=replace-with-a-third-strong-password
+REDIS_URL=redis://:replace-with-a-third-strong-password@localhost:16379/0
+COMPOSE_REDIS_URL=redis://:replace-with-a-third-strong-password@redis:6379/0
 DEEPSEEK_API_KEY=replace-with-your-key
 ```
 
@@ -247,7 +257,65 @@ npm run dev
 
 访问 <http://127.0.0.1:5173>。
 
-开发模式下 Vite 将 `/api` 和 `/health` 代理到后端。生产环境中 API Key 应由 Nginx/BFF 注入，不能放进 `VITE_*` 环境变量。
+开发模式下 Vite 将 `/api` 和 `/health` 代理到后端。未配置
+`VITE_OIDC_ISSUER`/`VITE_OIDC_CLIENT_ID` 时保持本地免登录模式；配置后前端自动使用
+Authorization Code + PKCE 登录，并为 API 请求附加 Bearer access token。永久 API Key
+绝不能放进 `VITE_*` 环境变量。
+
+### 8. 启用 Keycloak OIDC 与多租户
+
+仓库内置 Keycloak `identity` profile 和 `industrial-rag` Realm。后端只依赖标准
+OIDC/JWT，因此也可以替换为 Entra ID、Okta 或 Authentik。
+
+先在 `industrial-rag/.env` 增加以下非示例值；管理员密码必须自行生成：
+
+```dotenv
+KEYCLOAK_ADMIN=admin
+KEYCLOAK_ADMIN_PASSWORD=replace-with-a-strong-admin-password
+OIDC_ENABLED=true
+COMPOSE_OIDC_ENABLED=true
+OIDC_ISSUER=http://localhost:18080/realms/industrial-rag
+OIDC_AUDIENCE=rag-api
+OIDC_JWKS_URL=http://localhost:18080/realms/industrial-rag/protocol/openid-connect/certs
+OIDC_INTERNAL_JWKS_URL=http://keycloak:8080/realms/industrial-rag/protocol/openid-connect/certs
+VITE_OIDC_ISSUER=http://localhost:18080/realms/industrial-rag
+VITE_OIDC_CLIENT_ID=rag-frontend
+VITE_OIDC_AUDIENCE=rag-api
+OIDC_CONNECT_SRC=http://localhost:18080
+```
+
+启动身份、API 和前端：
+
+```powershell
+docker compose --env-file industrial-rag\.env `
+  --profile identity `
+  --profile api `
+  --profile frontend `
+  up -d --build
+```
+
+打开 <http://localhost:18080/admin/>，切换到 `industrial-rag` Realm 后创建用户：
+
+1. 在用户 Attributes 中设置 `tenant_id`，值必须是已登记的 UUID；默认租户为
+   `00000000-0000-0000-0000-000000000001`。
+2. 在 Role mapping 中至少分配 `viewer`；允许上传时分配 `editor`，允许删除时分配
+   `admin`。
+3. 设置非临时密码，然后访问 <http://localhost:5173> 完成 PKCE 登录。
+
+新增租户时，先登记数据库租户，再把同一个 UUID 写入对应 Keycloak 用户属性：
+
+```powershell
+Set-Location industrial-rag
+python scripts\provision_tenant.py `
+  --tenant-id 11111111-1111-1111-1111-111111111111 `
+  --name "示例租户"
+```
+
+现有语料在 schema v1→v3 首次迁移时自动回填到默认租户。数据库访问同时使用应用层
+`tenant_id` 条件和 PostgreSQL RLS；文档摄入、Celery 任务状态、答案缓存与知识库版本
+也都按租户隔离。API Key 仅用于服务调用，并映射到
+`RAG_SERVICE_TENANT_ID`/`RAG_SERVICE_ROLES`。服务账号默认只有 `viewer`；自动上传任务
+需要显式设置 `RAG_SERVICE_ROLES=viewer,editor`，删除任务才应授予 `admin`。
 
 ## 可选：使用 Docker Compose 启动完整服务
 
@@ -260,7 +328,13 @@ Compose 默认只将前端、API、PostgreSQL 和 Redis 绑定到 `127.0.0.1`。
 需要局域网访问并已配置防火墙、强密钥和数据库访问控制时，才应在 `.env` 中设置
 `RAG_BIND_ADDRESS=0.0.0.0`。
 
-API、前端和 Celery worker 通过 profile 提供，PostgreSQL/Redis 默认启动：
+API、前端和 Celery worker 通过 profile 提供，PostgreSQL/Redis 默认启动。启用
+`api` 或 `frontend` profile 时，本地 Keycloak 与 Realm 配置任务也会自动启动，保证
+OIDC 前后端配置一致。主 `docker-compose.yml` 是可移植的 CPU 配置：
+
+启用 `api`/`worker` profile 时，Compose 会先运行一次性 `migrate` 服务。迁移服务使用
+`POSTGRES_PASSWORD` 完成 DDL，并创建或轮换 `rag_runtime`；API 和 worker 只使用
+`POSTGRES_APP_PASSWORD` 对应的非所有者账号。两个密码必须不同。
 
 ```powershell
 docker compose --env-file industrial-rag\.env `
@@ -269,13 +343,25 @@ docker compose --env-file industrial-rag\.env `
   up -d --build
 ```
 
-需要 Celery 摄入队列时，在 `.env` 设置 `QUEUE_PROVIDER=celery`，并额外启用 worker：
+使用 NVIDIA GPU 时叠加 GPU 覆盖文件：
+
+```powershell
+docker compose `
+  -f docker-compose.yml `
+  -f docker-compose.gpu.yml `
+  --env-file industrial-rag\.env `
+  --profile api `
+  --profile frontend `
+  up -d --build
+```
+
+生产 Compose 必须在 `.env` 中明确设置 `QUEUE_PROVIDER=celery`；启用 `api` profile 时会
+一并启动 worker。`industrial-rag/.env.example` 保留 `memory` 仅用于本机直接运行 API。
 
 ```powershell
 docker compose --env-file industrial-rag\.env `
   --profile api `
   --profile frontend `
-  --profile worker `
   up -d --build
 ```
 
@@ -285,7 +371,10 @@ docker compose --env-file industrial-rag\.env `
 - API：<http://127.0.0.1:18000>
 - API 文档：<http://127.0.0.1:18000/docs>
 
-API/worker 镜像基于官方 PyTorch 2.4.0 + CUDA 12.1 runtime，避免构建时下载超大 Torch wheel；API 使用单 GPU 推理进程，worker 通过环境变量强制 CPU，避免在单张显卡上重复加载模型。模型目录以只读方式挂载到 `/app/models`。如果只运行前端容器并把 API 运行在主机，请设置：
+API 镜像基于官方 PyTorch 2.4.0 + CUDA 12.1 runtime，但主 Compose 默认以 CPU
+运行；GPU 覆盖文件才申请 NVIDIA 设备。worker 保持 CPU，避免在单张显卡上重复
+加载模型。模型目录以只读方式挂载到 `/app/models`。如果只运行前端容器并把 API
+运行在主机，请设置：
 
 首次构建需要拉取较大的官方 PyTorch runtime 基础镜像。API 和 worker 共享同一基础层，建议顺序构建以充分复用本地镜像缓存。
 
@@ -297,10 +386,13 @@ RAG_API_UPSTREAM=http://host.docker.internal:8000
 
 ### 通过 API 上传
 
+默认 `laptop` 配置仅监听 `127.0.0.1` 且关闭 API Key/OIDC，使用本地管理身份，
+因此下面的主机直连示例不需要认证头。`base`/Compose 模式启用 API Key 或 OIDC；
+此时自动化调用应按已配置的认证方式附加凭据。
+
 PowerShell 7 示例：
 
 ```powershell
-$headers = @{ "X-API-Key" = "your-rag-api-key" }
 $form = @{
   file = Get-Item "E:\documents\example.docx"
   partition = "legal"
@@ -310,7 +402,6 @@ $form = @{
 Invoke-RestMethod `
   -Uri "http://127.0.0.1:8000/api/v1/documents/ingest" `
   -Method Post `
-  -Headers $headers `
   -Form $form
 ```
 
@@ -333,9 +424,25 @@ conda run -n industrial-rag python scripts\ingest_evaluation_sources.py
 
 脚本会先验证结构化法条 ID，再摄入 PostgreSQL；重复运行默认不会重复摄入。
 
+### 幂等重处理已上传文档
+
+重处理脚本复用正式摄入链路，并通过来源键替换同一租户中的旧版本。租户 UUID 为必填项，
+避免把本地上传目录误写入默认租户：
+
+```powershell
+Set-Location industrial-rag
+conda run -n industrial-rag python scripts\reprocess_documents.py `
+  --tenant-id 00000000-0000-0000-0000-000000000001 `
+  --upload-dir data\uploads `
+  --pattern "*.pdf"
+```
+
+只读服务账号不能调用上传 API；脚本直接运行时仍应使用目标租户对应的受控运维身份和数据库凭据。
+
 ## API 概览
 
-除根路径、健康检查和 OpenAPI 文档外，启用鉴权时 `/api/*` 请求需要：
+除根路径和健康检查外，启用鉴权时 API、OpenAPI 文档及运维端点都需要认证。API Key
+服务调用使用：
 
 ```http
 X-API-Key: <RAG_API_KEY>
@@ -409,6 +516,7 @@ Invoke-RestMethod `
 - `rag.retrieval.top_k`：默认最终上下文数量。
 - `rag.retrieval.similarity_threshold`：首轮检索最低分。
 - `reranker.score_threshold`：交叉编码器绝对相关性阈值。
+- `reranker.failure_mode=closed`：重排模型不可用或推理失败时返回空上下文，避免绕过质量门禁；仅在接受降级召回风险时改为 `open`。
 - `queue.provider`：`memory` 使用进程内后台任务；`celery` 使用外部队列。
 - `security.api_key.enabled`：是否要求 `X-API-Key`。
 - `security.cors`：允许访问 API 的浏览器来源。
@@ -431,7 +539,9 @@ Invoke-RestMethod `
 
 ```powershell
 Set-Location industrial-rag
-python scripts\build_expanded_eval.py --output eval\legal_expanded_240.jsonl
+python scripts\build_expanded_eval.py `
+  --tenant-id 00000000-0000-0000-0000-000000000001 `
+  --output eval\legal_expanded_240.jsonl
 python scripts\sample_eval_suite.py `
   --input eval\legal_expanded_240.jsonl `
   --output eval\legal_expanded_ragas_40.jsonl
@@ -531,12 +641,54 @@ docker compose --env-file industrial-rag\.env --profile api --profile frontend c
 
 GitHub Actions 会自动执行后端测试、Ruff、前端测试、前端构建和 Compose 配置检查。
 
+### 生产配置预检
+
+生产环境应由 Secret Manager、Kubernetes Secret 或同等级系统注入凭据。渲染部署环境后，
+在启动服务前运行：
+
+```powershell
+Set-Location industrial-rag
+python scripts\validate_production_env.py --env-file .env
+```
+
+该门禁要求非占位强密钥、独立的数据库管理员/运行时密码、Celery、OIDC HTTPS 和
+`rediss://`。本地 Keycloak/Redis 验收可显式附加 `--allow-local-http`；此参数不应用于生产。
+
+### PostgreSQL 备份与恢复
+
+备份脚本生成 PostgreSQL custom-format 归档，先写临时文件再原子发布。建议通过 `PGHOST`、
+`PGPORT`、`PGDATABASE`、`PGUSER`、`PGPASSWORD` 注入受限备份账号：
+
+```powershell
+Set-Location industrial-rag
+python scripts\backup_postgres.py --port 15432
+```
+
+恢复前先创建隔离的目标数据库并完成变更审批。脚本会先用 `pg_restore --list` 校验归档，
+且确认值必须与目标数据库完全一致：
+
+```powershell
+python scripts\restore_postgres.py `
+  --input data\backups\postgres\rag_db-20260730T000000Z.dump `
+  --database rag_restore_test `
+  --confirm-database rag_restore_test
+```
+
+覆盖已有对象还需显式增加 `--clean`。完整的 IdP、Secrets、HA、恢复演练和发布证据要求见
+[生产部署清单](industrial-rag/deploy/production-checklist.md)。
+
 ## 安全说明
 
 - `.env`、本地模型、数据库卷和运行评估报告已加入 `.gitignore`。
-- API Key 使用恒定时间比较，并只保护 `/api/*`；健康检查和 OpenAPI 文档保持公开。
-- 前端 JavaScript 不应包含永久 API Key。生产容器通过 Nginx 服务端注入 `X-API-Key`。
-- `RAG_API_KEY` 是服务级凭据，不是完整的多用户身份系统。多租户部署仍需接入 OAuth/OIDC、用户权限和审计。
+- API Key 使用恒定时间比较；OIDC access token 校验签名、issuer、audience、过期时间、
+  必需的 `tenant_id` 和角色。健康检查保持公开，其他运维与 API 路径受认证保护。
+- 前端使用 OIDC Authorization Code + PKCE，不包含或由 Nginx 注入永久管理员 API Key。
+- 角色分为 `viewer`、`editor` 和 `admin`；上传需要 editor/admin，删除需要 admin。API Key
+  服务账号默认仅有 viewer，额外权限必须通过 `RAG_SERVICE_ROLES` 显式授予。
+- PostgreSQL 采用共享 schema 的 `tenant_id` 显式过滤与强制 RLS 双重隔离；Redis
+  答案缓存、corpus version 和任务状态均使用租户命名空间。
+- Keycloak `start-dev` profile 仅适用于本地和验收环境。生产环境应使用 TLS、外部
+  HA PostgreSQL/Redis、生产 IdP、离站备份，并接入集中审计与密钥轮换。
 - 生产模式下，如果启用了 API Key 却未配置安全值，应用会拒绝启动。
 - 错误响应不会向客户端返回底层异常和数据库细节。
 - 上传文件名会被规范化，metadata 必须是合法 JSON 对象，文件大小和格式均受限制。
@@ -544,11 +696,29 @@ GitHub Actions 会自动执行后端测试、Ruff、前端测试、前端构建�
 ## 监控与健康检查
 
 - `/health/live` 只表示进程存活。
-- `/health/ready` 只有在 PostgreSQL和 Embedding 模型就绪时才返回 200。
+- `/health/ready` 只有在 PostgreSQL、Embedding、LLM、启用的 Reranker，以及 Celery 模式所需的 Redis 就绪时才返回 200。
 - `/health` 返回依赖状态，启动未完成时不会误报 healthy。
 - 安装 `prometheus-fastapi-instrumentator` 且配置启用后，应用暴露 Prometheus 指标端点。
 
 生产编排应使用 `/health/ready` 作为就绪探针，使用 `/health/live` 作为存活探针。
+
+Prometheus 指标默认只在 `/internal/metrics` 暴露。生产环境应设置独立的
+`RAG_METRICS_TOKEN`，并通过 `X-Metrics-Token` 请求头抓取；生产启动校验会拒绝缺失、
+不足 32 字符、占位符或与 `RAG_API_KEY` 相同的指标 token。除通用 HTTP 指标外，系统还
+暴露低基数的 `rag_llm_*`、`rag_embedding_*`、`rag_retrieval_*` 和 `rag_cache_*` 指标。
+数据库 schema v3 的迁移历史记录在 `rag_schema_migrations`，迁移由一次性 `migrate`
+服务执行，API/worker 不拥有 DDL 权限。新增迁移必须使用
+`industrial-rag/app/vectorstore/migrations/versions` 下的不可变 SQL 文件，其 checksum
+由规范化后的实际 SQL 内容计算。
+
+发布基线不仅校验评估数据集，还绑定检索、分块、Prompt、Embedding、Reranker 和生成
+实现的统一 SHA-256。修改这些路径后，`validate_release_baseline.py` 会失败，必须重跑
+240 条检索集、40 条 RAGAS 代表集和两级质量门禁，再批准新的实现指纹：
+
+```powershell
+python scripts\validate_release_baseline.py
+python scripts\validate_release_baseline.py --print-implementation-sha256
+```
 
 ## 常见问题
 
@@ -574,7 +744,10 @@ docker compose --env-file industrial-rag\.env logs --tail 100 postgres
 
 ### Redis 不可用
 
-Redis 是可选缓存。连接失败时系统会禁用缓存并继续运行，但任务状态跨进程持久化和答案缓存不可用。
+`laptop` profile 中 Redis 是可选缓存，连接失败时会降级运行；`base` 生产 profile 会要求
+带密码的 Redis URL，设置 `REDIS_REQUIRE_TLS=true` 时还必须使用 `rediss://`。Celery 模式下
+Redis 同时承担任务传输，故不可按可选依赖处理。生产 profile 的租户限流默认 fail-closed，
+Redis 限流后端不可用时返回 503；仅 laptop profile 显式允许 fail-open。
 
 ### `/health/ready` 返回 503
 
@@ -611,4 +784,4 @@ Reranker 使用绝对相关性阈值，低于阈值时返回 0 条是合法结�
 
 ## 许可证
 
-项目元数据声明为 Apache License 2.0。引入或分发第三方法律文档、模型和依赖时，请同时遵守各自的许可、使用条款和数据来源要求。
+项目采用仓库根目录 `LICENSE` 中的 Apache License 2.0。引入或分发第三方法律文档、模型和依赖时，请同时遵守各自的许可、使用条款和数据来源要求。

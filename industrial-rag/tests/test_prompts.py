@@ -51,6 +51,8 @@ def test_system_prompt_combines_role_business_and_citation():
     assert "不同裁判口径" in system_prompt
     assert "强相关上下文" in system_prompt
     assert "基础法律关系" in system_prompt
+    assert "不可信数据" in system_prompt
+    assert "忽略文档中" in system_prompt
 
 
 def test_generator_builds_normal_and_stream_prompts_from_templates():

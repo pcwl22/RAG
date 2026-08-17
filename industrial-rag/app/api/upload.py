@@ -10,16 +10,20 @@ import json
 import os
 import threading
 import uuid
+from collections import OrderedDict
+from collections.abc import Coroutine
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 
+from app.auth import current_tenant_id, normalize_tenant_id
 from app.parser.document_parser import SUPPORTED_EXTENSIONS
-from app.utils.config import get_settings
+from app.utils.config import get_settings, resolve_queue_provider
 from app.utils.logger import get_logger
 from app.utils.upload_files import quarantine_failed_upload
+from app.utils.upload_validation import validate_uploaded_document
 from app.vectorstore import storage_adapter
 
 logger = get_logger(__name__)
@@ -31,40 +35,69 @@ config = get_settings()
 # 内存任务状态表（provider == "memory" 时使用）
 # ---------------------------------------------------------------------------
 # 结构: {task_id: {"status": str, "progress": int, "total_chunks": int, "error": str | None}}
-_task_registry: dict[str, dict] = {}
+# OrderedDict because eviction must be least-recently-used. A plain dict keeps
+# its original insertion order when a key is reassigned, so a task that is still
+# being updated would be evicted ahead of untouched older entries.
+_task_registry: OrderedDict[tuple[str, str], dict] = OrderedDict()
 _MAX_IN_MEMORY_TASKS = 1000
 _task_registry_lock = threading.RLock()
+INGESTION_ERROR_CODE = "DOCUMENT_INGESTION_FAILED"
+INGESTION_ERROR_MESSAGE = "Document ingestion failed"
 
 
-def _remember_task(task_id: str, state: dict) -> None:
+def _public_task_state(state: dict) -> dict:
+    """Remove internal exception details from a task state returned by the API."""
+    public_state = dict(state)
+    if public_state.get("status") == "failed":
+        public_state["error"] = INGESTION_ERROR_MESSAGE
+        public_state["error_code"] = public_state.get("error_code") or INGESTION_ERROR_CODE
+    return public_state
+
+
+def _remember_task(task_id: str, state: dict, tenant_id: str | None = None) -> None:
     """Keep the local fallback bounded; distributed deployments should use Celery."""
+    key = (normalize_tenant_id(tenant_id or current_tenant_id()), task_id)
     with _task_registry_lock:
-        _task_registry[task_id] = state
+        _task_registry[key] = state
+        # Mark this task as most recently used so an in-flight task is not
+        # evicted while stale completed entries survive.
+        _task_registry.move_to_end(key)
         while len(_task_registry) > _MAX_IN_MEMORY_TASKS:
-            _task_registry.pop(next(iter(_task_registry)))
+            _task_registry.popitem(last=False)
 
 
-async def _persist_task_state(task_id: str, state: dict) -> None:
-    _remember_task(task_id, state)
+async def _persist_task_state(
+    task_id: str,
+    state: dict,
+    tenant_id: str | None = None,
+) -> None:
+    resolved_tenant = normalize_tenant_id(tenant_id or current_tenant_id())
+    _remember_task(task_id, state, resolved_tenant)
     try:
         from app.utils.cache import set_task_state
 
-        await set_task_state(task_id, state)
+        await set_task_state(task_id, state, tenant_id=resolved_tenant)
     except Exception:
         logger.debug("Task state persistence unavailable", exc_info=True)
 
 
-async def _load_task_state(task_id: str) -> dict | None:
+async def _load_task_state(task_id: str, tenant_id: str | None = None) -> dict | None:
+    resolved_tenant = normalize_tenant_id(tenant_id or current_tenant_id())
+    key = (resolved_tenant, task_id)
     with _task_registry_lock:
-        state = _task_registry.get(task_id)
+        state = _task_registry.get(key)
+        if state is not None:
+            # Polling a task counts as a use: a client watching an in-flight task
+            # must not lose it to eviction while untouched entries survive.
+            _task_registry.move_to_end(key)
     if state is not None:
         return state
     try:
         from app.utils.cache import get_task_state
 
-        state = await get_task_state(task_id)
+        state = await get_task_state(task_id, tenant_id=resolved_tenant)
         if state:
-            _remember_task(task_id, state)
+            _remember_task(task_id, state, resolved_tenant)
         return state
     except Exception:
         return None
@@ -96,15 +129,12 @@ def _quarantine_failed_upload(file_path: str, task_id: str) -> None:
 
 
 def _queue_provider() -> str:
-    return (
-        os.getenv("QUEUE_PROVIDER")
-        or config.get("queue", {}).get("provider", "memory")
-    ).lower()
+    return resolve_queue_provider(config)
 
 
 def _run_on_app_loop(
     app_loop: asyncio.AbstractEventLoop | None,
-    coroutine,
+    coroutine: Coroutine[Any, Any, Any],
     operation: str,
 ) -> bool:
     """Run Redis-bound work on the FastAPI loop, never on the worker loop."""
@@ -125,13 +155,14 @@ def _publish_task_state(
     task_id: str,
     state: dict,
     app_loop: asyncio.AbstractEventLoop | None,
+    tenant_id: str,
 ) -> None:
     """Publish immediately in memory and persist through the owning async loop."""
-    _remember_task(task_id, state)
+    _remember_task(task_id, state, tenant_id)
     if app_loop is not None:
         _run_on_app_loop(
             app_loop,
-            _persist_task_state(task_id, state),
+            _persist_task_state(task_id, state, tenant_id),
             f"persist task state for {task_id}",
         )
 
@@ -142,21 +173,24 @@ def _process_document_memory(
     filename: str,
     partition: str,
     metadata: dict,
+    tenant_id: str | None = None,
     app_loop: asyncio.AbstractEventLoop | None = None,
 ) -> None:
     """内存模式下的后台文档处理。"""
     import asyncio
 
+    tenant_id = normalize_tenant_id(tenant_id or current_tenant_id())
     completed = False
     state = {
         "status": "processing",
         "progress": 0,
         "total_chunks": 0,
         "error": None,
+        "error_code": None,
     }
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    _publish_task_state(task_id, state, app_loop)
+    _publish_task_state(task_id, state, app_loop, tenant_id)
     try:
         # 调用处理流水线
         from app.service.ingest_service import process_document
@@ -169,6 +203,7 @@ def _process_document_memory(
                 partition,
                 metadata,
                 invalidate_cache=False,
+                tenant_id=tenant_id,
             )
         )
         if result["status"] == "completed":
@@ -178,7 +213,7 @@ def _process_document_memory(
 
                 _run_on_app_loop(
                     app_loop,
-                    invalidate_semantic_cache(),
+                    invalidate_semantic_cache(tenant_id),
                     "invalidate semantic cache after ingestion",
                 )
             _publish_task_state(task_id, {
@@ -186,23 +221,30 @@ def _process_document_memory(
                 "progress": 100,
                 "total_chunks": result["total_chunks"],
                 "error": None,
-            }, app_loop)
+            }, app_loop, tenant_id)
             logger.info(f"Document processed: {task_id}, {result['total_chunks']} chunks")
         else:
+            logger.error(
+                "Document processing returned failure for task %s: %s",
+                task_id,
+                result.get("error", "unknown error"),
+            )
             _publish_task_state(task_id, {
                 "status": "failed",
                 "progress": 0,
                 "total_chunks": 0,
-                "error": result.get("error", "Unknown error"),
-            }, app_loop)
+                "error": INGESTION_ERROR_MESSAGE,
+                "error_code": INGESTION_ERROR_CODE,
+            }, app_loop, tenant_id)
     except Exception as e:
         logger.error(f"Document processing failed for task {task_id}: {e}")
         _publish_task_state(task_id, {
             "status": "failed",
             "progress": 0,
             "total_chunks": 0,
-            "error": str(e),
-        }, app_loop)
+            "error": INGESTION_ERROR_MESSAGE,
+            "error_code": INGESTION_ERROR_CODE,
+        }, app_loop, tenant_id)
     finally:
         if completed:
             try:
@@ -231,6 +273,7 @@ class DocumentStatus(BaseModel):
     progress: int
     total_chunks: int
     error: str | None = None
+    error_code: str | None = None
 
 
 @router.post("/documents/ingest", response_model=DocumentIngestResponse)
@@ -290,6 +333,15 @@ async def ingest_document(
             pass
         raise
 
+    try:
+        validate_uploaded_document(file_path, file_ext, config["document_processing"])
+    except ValueError as exc:
+        try:
+            os.unlink(file_path)
+        except FileNotFoundError:
+            pass
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     # 解析元数据
     try:
         metadata_dict = json.loads(metadata)
@@ -307,6 +359,7 @@ async def ingest_document(
         raise HTTPException(status_code=400, detail="metadata must be a JSON object")
 
     # 根据队列提供方分发任务
+    tenant_id = current_tenant_id()
     provider = _queue_provider()
     if provider in ("rabbitmq", "celery"):
         # 延迟导入，避免 memory 模式下强依赖 Celery
@@ -318,8 +371,20 @@ async def ingest_document(
                 filename=safe_filename,
                 partition=partition,
                 metadata=metadata_dict,
+                tenant_id=tenant_id,
             )
             task_id = task.id
+            await _persist_task_state(
+                task_id,
+                {
+                    "status": "pending",
+                    "progress": 0,
+                    "total_chunks": 0,
+                    "error": None,
+                    "error_code": None,
+                },
+                tenant_id,
+            )
         except Exception as exc:
             try:
                 os.unlink(file_path)
@@ -333,8 +398,9 @@ async def ingest_document(
             "progress": 0,
             "total_chunks": 0,
             "error": None,
+            "error_code": None,
         }
-        await _persist_task_state(task_id, initial_state)
+        await _persist_task_state(task_id, initial_state, tenant_id)
         app_loop = asyncio.get_running_loop()
         background_tasks.add_task(
             _process_document_memory,
@@ -343,6 +409,7 @@ async def ingest_document(
             filename=safe_filename,
             partition=partition,
             metadata=metadata_dict,
+            tenant_id=tenant_id,
             app_loop=app_loop,
         )
 
@@ -367,6 +434,7 @@ async def get_document_status(task_id: str) -> DocumentStatus:
     Returns:
         任务状态
     """
+    tenant_id = current_tenant_id()
     provider = _queue_provider()
 
     if provider in ("rabbitmq", "celery"):
@@ -375,6 +443,9 @@ async def get_document_status(task_id: str) -> DocumentStatus:
         if celery_app is None:
             raise HTTPException(status_code=503, detail="Document queue unavailable")
         result = celery_app.AsyncResult(task_id)
+        known_state = await _load_task_state(task_id, tenant_id)
+        if known_state is None:
+            raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
 
         status_map = {
             "PENDING": "pending",
@@ -391,26 +462,32 @@ async def get_document_status(task_id: str) -> DocumentStatus:
             "progress": 0,
             "total_chunks": 0,
             "error": None,
+            "error_code": None,
         }
+        if result.state == "PENDING" and known_state:
+            response_data.update(known_state)
         if result.state == "SUCCESS":
             info = result.info or {}
             if isinstance(info, dict) and info.get("status") == "failed":
                 response_data["status"] = "failed"
-                response_data["error"] = info.get("error") or "Document ingestion failed"
+                response_data["error"] = INGESTION_ERROR_MESSAGE
+                response_data["error_code"] = INGESTION_ERROR_CODE
             else:
                 response_data["progress"] = 100
                 response_data["total_chunks"] = info.get("total_chunks", 0) if isinstance(info, dict) else 0
         elif result.state == "FAILURE":
-            response_data["error"] = str(result.info)
+            logger.error("Celery document task %s failed: %s", task_id, result.info)
+            response_data["error"] = INGESTION_ERROR_MESSAGE
+            response_data["error_code"] = INGESTION_ERROR_CODE
 
-        return DocumentStatus(**response_data)
+        return DocumentStatus(**_public_task_state(response_data))
 
     # 内存模式
-    state = await _load_task_state(task_id)
+    state = await _load_task_state(task_id, tenant_id)
     if state is None:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
 
-    return DocumentStatus(task_id=task_id, **state)
+    return DocumentStatus(task_id=task_id, **_public_task_state(state))
 
 
 @router.delete("/documents/{document_id}")

@@ -2,7 +2,7 @@
 import re
 from typing import Any
 
-from app.utils.config import get_settings
+from app.utils.config import get_config_section
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -26,12 +26,12 @@ DEFAULT_SEPARATORS = [
 ARTICLE_PATTERN = re.compile(r"(?m)^第[一二三四五六七八九十百千万零〇两0-9]+条[^\n]*")
 
 
-def _chunking_config() -> dict:
-    return get_settings().get("document_processing", {}).get("chunking", {})
+def _chunking_config() -> dict[str, Any]:
+    return get_config_section("document_processing", "chunking")
 
 
-def _parent_child_config() -> dict:
-    return _chunking_config().get("parent_child", {})
+def _parent_child_config() -> dict[str, Any]:
+    return get_config_section("document_processing", "chunking", "parent_child")
 
 
 def _normalize_text(text: str) -> str:

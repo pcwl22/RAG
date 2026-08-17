@@ -1,32 +1,171 @@
 """PostgreSQL + pgvector storage with hybrid retrieval."""
 import asyncio
+import contextvars
+import functools
+import hashlib
 import json
+import os
+from asyncio import Future
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from pathlib import Path
+from typing import Any, TypeVar
 
+from app.auth import DEFAULT_TENANT_ID, current_tenant_id
+from app.utils.config import get_config_section, get_settings
+from app.utils.logger import get_logger
+
+# Optional at import time so the module can be imported without the driver;
+# every entry point raises RuntimeError if the store was never initialized.
+psycopg2: Any
+sql: Any
 try:
     import psycopg2
     import psycopg2.extras
     import psycopg2.pool
+    from psycopg2 import sql
 except ImportError:
     psycopg2 = None
-
-from app.utils.config import get_settings
-from app.utils.logger import get_logger
+    sql = None
 
 logger = get_logger(__name__)
 
+_T = TypeVar("_T")
 _pool: Any | None = None
 _executor: ThreadPoolExecutor | None = None
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "3"
+LEGACY_SCHEMA_MIGRATION_REVISIONS = (
+    ("20260731_01_tenant_rls", "v1"),
+    ("20260731_02_composite_document_key", "v1"),
+    ("20260731_03_search_indexes", "v1"),
+)
+LEGACY_SCHEMA_MIGRATIONS = tuple(
+    (
+        migration_id,
+        "sha256:" + hashlib.sha256(f"{migration_id}:{revision}".encode()).hexdigest(),
+    )
+    for migration_id, revision in LEGACY_SCHEMA_MIGRATION_REVISIONS
+)
+MIGRATION_VERSIONS_DIR = Path(__file__).with_name("migrations") / "versions"
 
 
-def _postgres_config() -> dict:
-    return get_settings().get("postgres", {})
+def _load_content_migrations() -> tuple[tuple[str, str, str], ...]:
+    """Load immutable SQL migrations and derive checksums from their exact bytes."""
+    migrations: list[tuple[str, str, str]] = []
+    for path in sorted(MIGRATION_VERSIONS_DIR.glob("*.sql")):
+        # Normalize checkout-specific line endings so Windows and Linux derive
+        # the same immutable migration checksum.
+        sql_text = path.read_text(encoding="utf-8").replace("\r\n", "\n").replace("\r", "\n")
+        raw = sql_text.encode("utf-8")
+        migrations.append(
+            (
+                path.stem,
+                "sha256:" + hashlib.sha256(raw).hexdigest(),
+                sql_text,
+            )
+        )
+    return tuple(migrations)
+
+
+CONTENT_SCHEMA_MIGRATIONS = _load_content_migrations()
+SCHEMA_MIGRATIONS = LEGACY_SCHEMA_MIGRATIONS + tuple(
+    (migration_id, checksum)
+    for migration_id, checksum, _sql_text in CONTENT_SCHEMA_MIGRATIONS
+)
+SEARCH_TEXT_EXPRESSION = """(
+    content || ' ' ||
+    COALESCE(metadata->>'filename', '') || ' ' ||
+    COALESCE(metadata->>'law_name', '') || ' ' ||
+    COALESCE(metadata->>'legal_citation', '') || ' ' ||
+    COALESCE(metadata->>'semantic_chunk_id', '')
+)"""
+
+
+def _postgres_config() -> dict[str, Any]:
+    return get_config_section("postgres")
 
 
 def _embedding_dimension() -> int:
-    return int(get_settings().get("embedding", {}).get("dimension", 1024))
+    return int(get_config_section("embedding").get("dimension", 1024))
+
+
+def _auto_migrate_enabled() -> bool:
+    value = os.getenv("POSTGRES_AUTO_MIGRATE")
+    if value is None:
+        value = _postgres_config().get("auto_migrate", False)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _fingerprint(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _runtime_schema_metadata() -> dict[str, str]:
+    settings = get_settings()
+    embedding = settings.get("embedding", {})
+    chunking = settings.get("document_processing", {}).get("chunking", {})
+    embedding_identity = {
+        "model_name": embedding.get("model_name"),
+        "model_revision": embedding.get("model_revision"),
+        "dimension": _embedding_dimension(),
+        "normalize_embeddings": bool(embedding.get("normalize_embeddings", True)),
+        "max_length": embedding.get("max_length"),
+    }
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "embedding_dimension": str(_embedding_dimension()),
+        "embedding_fingerprint": _fingerprint(embedding_identity),
+        "chunking_fingerprint": _fingerprint(chunking),
+    }
+
+
+def _validate_schema_metadata(existing: dict[str, str], document_count: int) -> None:
+    expected = _runtime_schema_metadata()
+    schema_version = existing.get("schema_version")
+    supported_upgrade = (schema_version, SCHEMA_VERSION) in {("1", "3"), ("2", "3")}
+    if schema_version is not None and schema_version != SCHEMA_VERSION and not supported_upgrade:
+        raise RuntimeError(
+            f"PostgreSQL schema version mismatch: expected {SCHEMA_VERSION}, "
+            f"found {schema_version}. Run an explicit schema migration."
+        )
+    for key in ("embedding_dimension", "embedding_fingerprint", "chunking_fingerprint"):
+        actual = existing.get(key)
+        if actual is not None and actual != expected[key] and document_count > 0:
+            raise RuntimeError(
+                f"PostgreSQL corpus fingerprint mismatch for {key}. "
+                "Rebuild the corpus with an explicit re-embedding migration before startup."
+            )
+
+
+def _migration_required(cur: Any, migration_id: str, checksum: str) -> bool:
+    """Return whether a migration must run, rejecting edited applied migrations."""
+    cur.execute(
+        "SELECT checksum FROM rag_schema_migrations WHERE migration_id = %s",
+        (migration_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return True
+    if str(row[0]) != checksum:
+        raise RuntimeError(
+            f"PostgreSQL migration checksum mismatch for {migration_id}. "
+            "Applied migrations are immutable; add a new migration instead."
+        )
+    return False
+
+
+def _record_migration(cur: Any, migration_id: str, checksum: str) -> None:
+    cur.execute(
+        """
+        INSERT INTO rag_schema_migrations (migration_id, checksum)
+        VALUES (%s, %s)
+        ON CONFLICT (migration_id) DO NOTHING
+        """,
+        (migration_id, checksum),
+    )
 
 
 async def init_postgres_store() -> None:
@@ -56,21 +195,27 @@ async def init_postgres_store() -> None:
             keepalives_count=int(cfg.get("keepalives_count", 3)),
             options=f"-c statement_timeout={int(cfg.get('command_timeout', 60)) * 1000}",
         )
-        await _execute_sync(_create_schema_sync)
+        if _auto_migrate_enabled():
+            await _execute_sync(_create_schema_sync)
+        else:
+            await _execute_sync(_require_schema_ready_sync)
     except Exception:
         _dispose_postgres_runtime()
         raise
     logger.info("PostgreSQL store initialized")
 
 
-def _execute_sync(func, *args, **kwargs):
+def _execute_sync(func: Callable[..., _T], *args: Any, **kwargs: Any) -> "Future[_T]":
+    """Run a blocking DB callable on the pool executor, preserving its result type."""
     if _executor is None:
         raise RuntimeError("PostgreSQL store is not initialized")
-    loop = asyncio.get_event_loop()
-    return loop.run_in_executor(_executor, func, *args, **kwargs)
+    loop = asyncio.get_running_loop()
+    context = contextvars.copy_context()
+    callback = functools.partial(func, *args, **kwargs)
+    return loop.run_in_executor(_executor, context.run, callback)
 
 
-def _connection():
+def _connection() -> Any:
     if _pool is None:
         raise RuntimeError("PostgreSQL store is not initialized")
     return _pool.getconn()
@@ -91,58 +236,314 @@ def _return_connection(conn: Any) -> None:
     _pool.putconn(conn, close=discard)
 
 
+def _set_tenant(cur: Any, tenant_id: str | None = None) -> str:
+    """Bind this transaction to one tenant for PostgreSQL RLS."""
+    resolved = tenant_id or current_tenant_id()
+    # Connections may use an administrative migration account. Drop its
+    # BYPASSRLS/superuser privileges for every application data transaction.
+    cur.execute("SET LOCAL ROLE rag_app", ())
+    cur.execute("SELECT set_config('app.tenant_id', %s, true)", (resolved,))
+    return resolved
+
+
+def _provision_runtime_role(cur: Any) -> None:
+    """Provision the non-owner login used by API and worker containers."""
+    runtime_user = str(os.getenv("POSTGRES_RUNTIME_USER") or "").strip()
+    runtime_password = os.getenv("POSTGRES_RUNTIME_PASSWORD")
+    if not runtime_user and not runtime_password:
+        return
+    if not runtime_user or not runtime_password:
+        raise RuntimeError(
+            "POSTGRES_RUNTIME_USER and POSTGRES_RUNTIME_PASSWORD must be configured together"
+        )
+    if runtime_user in {"postgres", "rag_app"}:
+        raise RuntimeError("PostgreSQL runtime user must be a dedicated non-owner role")
+    if sql is None:
+        raise RuntimeError("psycopg2 SQL helpers are unavailable")
+
+    cur.execute("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %s)", (runtime_user,))
+    if cur.fetchone()[0]:
+        cur.execute(
+            sql.SQL(
+                "ALTER ROLE {} LOGIN PASSWORD %s NOSUPERUSER NOCREATEDB "
+                "NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS"
+            ).format(sql.Identifier(runtime_user)),
+            (runtime_password,),
+        )
+    else:
+        cur.execute(
+            sql.SQL(
+                "CREATE ROLE {} LOGIN PASSWORD %s NOSUPERUSER NOCREATEDB "
+                "NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS"
+            ).format(sql.Identifier(runtime_user)),
+            (runtime_password,),
+        )
+    cur.execute(sql.SQL("GRANT rag_app TO {}").format(sql.Identifier(runtime_user)))
+
+
 def _create_schema_sync() -> None:
     conn = _connection()
     cur = None
     try:
         cur = conn.cursor()
+        cur.execute("SELECT pg_advisory_xact_lock(hashtext('industrial-rag-schema-v3'))")
         dimension = _embedding_dimension()
         cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
         cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm;")
         cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rag_schema_migrations (
+                migration_id TEXT PRIMARY KEY,
+                checksum TEXT NOT NULL,
+                applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rag_tenants (
+                id UUID PRIMARY KEY,
+                name TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        cur.execute(
+            """
+            INSERT INTO rag_tenants (id, name)
+            VALUES (%s::uuid, 'Default tenant')
+            ON CONFLICT (id) DO NOTHING
+            """,
+            (DEFAULT_TENANT_ID,),
+        )
+        cur.execute(
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rag_app') THEN
+                    CREATE ROLE rag_app NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+                        NOINHERIT NOREPLICATION NOBYPASSRLS;
+                END IF;
+            END
+            $$
+            """
+        )
+        cur.execute(
+            """
+            ALTER ROLE rag_app NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+                NOINHERIT NOREPLICATION NOBYPASSRLS
+            """
+        )
+        cur.execute("GRANT SELECT ON rag_schema_migrations TO rag_app")
+        _provision_runtime_role(cur)
+        cur.execute(
+            """
+            DO $$
+            BEGIN
+                IF current_user <> 'rag_app' THEN
+                    EXECUTE format('GRANT rag_app TO %I', current_user);
+                END IF;
+            END
+            $$
+            """
+        )
+        cur.execute(
             f"""
             CREATE TABLE IF NOT EXISTS documents (
-                id TEXT PRIMARY KEY,
+                id TEXT NOT NULL,
+                tenant_id UUID NOT NULL DEFAULT '{DEFAULT_TENANT_ID}'::uuid
+                    REFERENCES rag_tenants(id),
                 content TEXT NOT NULL,
                 embedding vector({dimension}),
                 metadata JSONB DEFAULT '{{}}',
                 partition TEXT DEFAULT 'general',
-                created_at TIMESTAMP DEFAULT NOW()
+                created_at TIMESTAMP DEFAULT NOW(),
+                PRIMARY KEY (tenant_id, id)
             );
             """
         )
+        # Upgrade schema v1 in place. Existing rows belong to the documented
+        # default tenant; no corpus rebuild or destructive migration is needed.
+        cur.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS tenant_id UUID")
+        cur.execute(
+            "UPDATE documents SET tenant_id = %s::uuid WHERE tenant_id IS NULL",
+            (DEFAULT_TENANT_ID,),
+        )
+        cur.execute(
+            f"ALTER TABLE documents ALTER COLUMN tenant_id SET DEFAULT '{DEFAULT_TENANT_ID}'::uuid"
+        )
+        cur.execute("ALTER TABLE documents ALTER COLUMN tenant_id SET NOT NULL")
         cur.execute(
             """
-            CREATE INDEX IF NOT EXISTS idx_documents_content_trgm
-            ON documents USING gin (content gin_trgm_ops);
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname = 'documents_tenant_id_fkey'
+                      AND conrelid = 'public.documents'::regclass
+                ) THEN
+                    ALTER TABLE documents
+                    ADD CONSTRAINT documents_tenant_id_fkey
+                    FOREIGN KEY (tenant_id) REFERENCES rag_tenants(id);
+                END IF;
+            END
+            $$
             """
         )
-        # Match the exact expression used by keyword retrieval, including metadata.
-        cur.execute(
+        tenant_migration = SCHEMA_MIGRATIONS[0]
+        composite_key_migration = SCHEMA_MIGRATIONS[1]
+        index_migration = SCHEMA_MIGRATIONS[2]
+
+        if _migration_required(cur, *composite_key_migration):
+            # Schema v3 removes the cross-tenant availability coupling created by
+            # the legacy global id primary key. The block also handles databases
+            # whose primary-key constraint was renamed.
+            cur.execute(
+                """
+            DO $$
+            DECLARE
+                current_pk TEXT;
+            BEGIN
+                SELECT constraint_name INTO current_pk
+                FROM information_schema.table_constraints
+                WHERE table_schema = 'public'
+                  AND table_name = 'documents'
+                  AND constraint_type = 'PRIMARY KEY';
+
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_constraint AS constraint_row
+                    WHERE constraint_row.conrelid = 'public.documents'::regclass
+                      AND constraint_row.contype = 'p'
+                      AND (
+                        SELECT array_agg(attribute.attname ORDER BY key_column.ordinality)
+                        FROM unnest(constraint_row.conkey) WITH ORDINALITY AS key_column(attnum, ordinality)
+                        JOIN pg_attribute AS attribute
+                          ON attribute.attrelid = constraint_row.conrelid
+                         AND attribute.attnum = key_column.attnum
+                      ) = ARRAY['tenant_id', 'id']::name[]
+                ) THEN
+                    IF current_pk IS NOT NULL THEN
+                        EXECUTE format('ALTER TABLE public.documents DROP CONSTRAINT %I', current_pk);
+                    END IF;
+                    ALTER TABLE public.documents
+                    ADD CONSTRAINT documents_pkey PRIMARY KEY (tenant_id, id);
+                END IF;
+            END
+            $$
             """
-            CREATE INDEX IF NOT EXISTS idx_documents_search_trgm
-            ON documents USING gin ((content || ' ' || COALESCE(metadata::text, '')) gin_trgm_ops);
+            )
+            _record_migration(cur, *composite_key_migration)
+
+        if _migration_required(cur, *index_migration):
+            # Index creation can scan the full corpus. Keep it behind a migration
+            # record so routine migration jobs do not repeat catalog-heavy DDL.
+            cur.execute(
+                f"""
+                CREATE INDEX IF NOT EXISTS idx_documents_search_fields_trgm
+                ON documents USING gin ({SEARCH_TEXT_EXPRESSION} gin_trgm_ops)
+                """
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_documents_tenant ON documents (tenant_id)"
+            )
+            cur.execute(
+                """
+            CREATE INDEX IF NOT EXISTS idx_documents_tenant_partition
+            ON documents (tenant_id, partition)
             """
-        )
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_documents_partition ON documents (partition);")
-        cur.execute(
-            """
+            )
+            # Superseded indexes included the entire metadata JSON (including repeated
+            # parent_content) and duplicated the content trigram index.
+            cur.execute("DROP INDEX IF EXISTS idx_documents_search_trgm")
+            cur.execute("DROP INDEX IF EXISTS idx_documents_content_trgm")
+            cur.execute("DROP INDEX IF EXISTS idx_documents_metadata")
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_documents_partition ON documents (partition)"
+            )
+            cur.execute(
+                """
             CREATE INDEX IF NOT EXISTS idx_documents_document_id
-            ON documents ((metadata->>'document_id'));
+            ON documents ((metadata->>'document_id'))
             """
-        )
-        cur.execute(
-            """
+            )
+            cur.execute(
+                """
             CREATE INDEX IF NOT EXISTS idx_documents_source_key
-            ON documents ((metadata->>'source_key'));
+            ON documents ((metadata->>'source_key'))
             """
-        )
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_documents_metadata ON documents USING gin (metadata);")
-        cur.execute(
+            )
+            cur.execute(
+                """
+            CREATE INDEX IF NOT EXISTS idx_documents_semantic_chunk_id
+            ON documents ((metadata->>'semantic_chunk_id'))
             """
+            )
+            cur.execute(
+                """
+            CREATE INDEX IF NOT EXISTS idx_documents_citation
+            ON documents ((metadata->>'law_name'), (metadata->>'article_number'))
+            """
+            )
+            cur.execute(
+                """
+            CREATE INDEX IF NOT EXISTS idx_documents_tenant_document_id
+            ON documents (tenant_id, (metadata->>'document_id'))
+            """
+            )
+            cur.execute(
+                """
+            CREATE INDEX IF NOT EXISTS idx_documents_tenant_source_key
+            ON documents (tenant_id, (metadata->>'source_key'))
+            """
+            )
+            cur.execute(
+                """
+            CREATE INDEX IF NOT EXISTS idx_documents_tenant_semantic_chunk_id
+            ON documents (tenant_id, (metadata->>'semantic_chunk_id'))
+            """
+            )
+            cur.execute(
+                """
+            CREATE INDEX IF NOT EXISTS idx_documents_tenant_citation
+            ON documents (tenant_id, (metadata->>'law_name'), (metadata->>'article_number'))
+            """
+            )
+            cur.execute(
+                """
             CREATE INDEX IF NOT EXISTS idx_documents_embedding_ivfflat
-            ON documents USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+            ON documents USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)
             """
+            )
+            _record_migration(cur, *index_migration)
+
+        if _migration_required(cur, *tenant_migration):
+            cur.execute("ALTER TABLE documents ENABLE ROW LEVEL SECURITY")
+            cur.execute("ALTER TABLE documents FORCE ROW LEVEL SECURITY")
+            cur.execute("DROP POLICY IF EXISTS documents_tenant_isolation ON documents")
+            cur.execute(
+                """
+            CREATE POLICY documents_tenant_isolation ON documents
+            USING (
+                tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
+            )
+            WITH CHECK (
+                tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
+            )
+            """
+            )
+            _record_migration(cur, *tenant_migration)
+
+        for migration_id, checksum, sql_text in CONTENT_SCHEMA_MIGRATIONS:
+            if _migration_required(cur, migration_id, checksum):
+                cur.execute(sql_text)
+                _record_migration(cur, migration_id, checksum)
+        cur.execute("GRANT USAGE ON SCHEMA public TO rag_app")
+        cur.execute("GRANT SELECT ON rag_tenants TO rag_app")
+        cur.execute("GRANT SELECT, INSERT, UPDATE, DELETE ON documents TO rag_app")
+        cur.execute(
+            "SELECT set_config('app.tenant_id', %s, true)",
+            (DEFAULT_TENANT_ID,),
         )
         cur.execute(
             """
@@ -171,6 +572,12 @@ def _create_schema_sync() -> None:
             )
             """
         )
+        cur.execute("GRANT SELECT ON rag_schema_metadata TO rag_app")
+        cur.execute("SELECT key, value FROM rag_schema_metadata")
+        existing_metadata = {str(key): str(value) for key, value in cur.fetchall()}
+        cur.execute("SELECT COUNT(*) FROM documents")
+        document_count = int(cur.fetchone()[0])
+        _validate_schema_metadata(existing_metadata, document_count)
         cur.executemany(
             """
             INSERT INTO rag_schema_metadata (key, value, updated_at)
@@ -178,10 +585,7 @@ def _create_schema_sync() -> None:
             ON CONFLICT (key) DO UPDATE
             SET value = EXCLUDED.value, updated_at = NOW()
             """,
-            [
-                ("schema_version", SCHEMA_VERSION),
-                ("embedding_dimension", str(dimension)),
-            ],
+            list(_runtime_schema_metadata().items()),
         )
         conn.commit()
     finally:
@@ -204,6 +608,14 @@ async def close_postgres_store() -> None:
     _dispose_postgres_runtime()
 
 
+def _require_schema_ready_sync() -> None:
+    if not _check_postgres_health_sync():
+        raise RuntimeError(
+            "PostgreSQL schema is not ready for the configured runtime. "
+            "Run the database migration job before starting the application."
+        )
+
+
 def _check_postgres_health_sync() -> bool:
     """Verify that the pool can execute a query, not merely that it exists."""
     if _pool is None:
@@ -212,23 +624,66 @@ def _check_postgres_health_sync() -> bool:
     cur = None
     try:
         cur = conn.cursor()
+        _set_tenant(cur)
         cur.execute(
             """
             SELECT
                 to_regclass('public.documents') IS NOT NULL,
                 to_regclass('public.rag_schema_metadata') IS NOT NULL,
+                to_regclass('public.rag_schema_migrations') IS NOT NULL,
+                to_regclass('public.rag_tenants') IS NOT NULL,
                 EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector')
             """
         )
-        documents_ready, metadata_ready, vector_ready = cur.fetchone()
-        if not (documents_ready and metadata_ready and vector_ready):
+        documents_ready, metadata_ready, migrations_ready, tenants_ready, vector_ready = cur.fetchone()
+        if not (
+            documents_ready
+            and metadata_ready
+            and migrations_ready
+            and tenants_ready
+            and vector_ready
+        ):
+            return False
+        cur.execute(
+            "SELECT migration_id, checksum FROM rag_schema_migrations WHERE migration_id = ANY(%s)",
+            ([migration_id for migration_id, _checksum in SCHEMA_MIGRATIONS],),
+        )
+        applied_migrations = {str(migration_id): str(checksum) for migration_id, checksum in cur.fetchall()}
+        if any(applied_migrations.get(migration_id) != checksum for migration_id, checksum in SCHEMA_MIGRATIONS):
             return False
         cur.execute(
             """
             SELECT
                 format_type(attribute.atttypid, attribute.atttypmod),
                 (SELECT value FROM rag_schema_metadata WHERE key = 'schema_version'),
-                (SELECT value FROM rag_schema_metadata WHERE key = 'embedding_dimension')
+                (SELECT value FROM rag_schema_metadata WHERE key = 'embedding_dimension'),
+                (SELECT value FROM rag_schema_metadata WHERE key = 'embedding_fingerprint'),
+                (SELECT value FROM rag_schema_metadata WHERE key = 'chunking_fingerprint'),
+                (SELECT relrowsecurity FROM pg_class WHERE oid = 'documents'::regclass),
+                (SELECT relforcerowsecurity FROM pg_class WHERE oid = 'documents'::regclass),
+                EXISTS (
+                    SELECT 1 FROM pg_roles
+                    WHERE rolname = 'rag_app' AND NOT rolsuper AND NOT rolbypassrls
+                ),
+                EXISTS (
+                    SELECT 1 FROM pg_policies
+                    WHERE schemaname = 'public'
+                      AND tablename = 'documents'
+                      AND policyname = 'documents_tenant_isolation'
+                ),
+                EXISTS (
+                    SELECT 1
+                    FROM pg_constraint AS constraint_row
+                    WHERE constraint_row.conrelid = 'public.documents'::regclass
+                      AND constraint_row.contype = 'p'
+                      AND (
+                        SELECT array_agg(attribute.attname ORDER BY key_column.ordinality)
+                        FROM unnest(constraint_row.conkey) WITH ORDINALITY AS key_column(attnum, ordinality)
+                        JOIN pg_attribute AS attribute
+                          ON attribute.attrelid = constraint_row.conrelid
+                         AND attribute.attnum = key_column.attnum
+                      ) = ARRAY['tenant_id', 'id']::name[]
+                )
             FROM pg_attribute AS attribute
             WHERE attribute.attrelid = 'public.documents'::regclass
               AND attribute.attname = 'embedding'
@@ -237,11 +692,19 @@ def _check_postgres_health_sync() -> bool:
         )
         row = cur.fetchone()
         expected_dimension = _embedding_dimension()
+        runtime_metadata = _runtime_schema_metadata()
         return bool(
             row
             and row[0] == f"vector({expected_dimension})"
             and row[1] == SCHEMA_VERSION
             and row[2] == str(expected_dimension)
+            and row[3] == runtime_metadata["embedding_fingerprint"]
+            and row[4] == runtime_metadata["chunking_fingerprint"]
+            and row[5] is True
+            and row[6] is True
+            and row[7] is True
+            and row[8] is True
+            and row[9] is True
         )
     finally:
         if cur is not None:
@@ -278,6 +741,7 @@ def _add_documents_sync(
     cur = None
     try:
         cur = conn.cursor()
+        tenant_id = _set_tenant(cur)
         metadatas = metadatas or [{} for _ in ids]
         records = []
         for index, doc_id in enumerate(ids):
@@ -285,6 +749,7 @@ def _add_documents_sync(
             records.append(
                 (
                     doc_id,
+                    tenant_id,
                     documents[index],
                     embedding,
                     json.dumps(metadatas[index], ensure_ascii=False),
@@ -295,9 +760,9 @@ def _add_documents_sync(
         psycopg2.extras.execute_batch(
             cur,
             """
-            INSERT INTO documents (id, content, embedding, metadata, partition)
-            VALUES (%s, %s, %s::vector, %s::jsonb, %s)
-            ON CONFLICT (id) DO UPDATE SET
+            INSERT INTO documents (id, tenant_id, content, embedding, metadata, partition)
+            VALUES (%s, %s::uuid, %s, %s::vector, %s::jsonb, %s)
+            ON CONFLICT (tenant_id, id) DO UPDATE SET
                 content = EXCLUDED.content,
                 embedding = EXCLUDED.embedding,
                 metadata = EXCLUDED.metadata,
@@ -341,21 +806,26 @@ def _replace_document_sync(
     cur = None
     try:
         cur = conn.cursor()
+        tenant_id = _set_tenant(cur)
         cur.execute(
             """
             DELETE FROM documents
-            WHERE metadata->>'source_key' = %s
-               OR (
+            WHERE tenant_id = %s::uuid
+              AND (
+                   metadata->>'source_key' = %s
+                   OR (
                     metadata->>'source_key' IS NULL
                     AND metadata->>'filename' = %s
                     AND partition = %s
+                   )
                )
             """,
-            (source_key, filename, partition),
+            (tenant_id, source_key, filename, partition),
         )
         records = [
             (
                 doc_id,
+                tenant_id,
                 documents[index],
                 f"[{','.join(str(value) for value in embeddings[index])}]",
                 json.dumps(metadatas[index], ensure_ascii=False),
@@ -366,8 +836,9 @@ def _replace_document_sync(
         psycopg2.extras.execute_batch(
             cur,
             """
-            INSERT INTO documents (id, content, embedding, metadata, partition, created_at)
-            VALUES (%s, %s, %s::vector, %s::jsonb, %s, NOW())
+            INSERT INTO documents
+                (id, tenant_id, content, embedding, metadata, partition, created_at)
+            VALUES (%s, %s::uuid, %s, %s::vector, %s::jsonb, %s, NOW())
             """,
             records,
         )
@@ -412,13 +883,17 @@ def _vector_search_sync(
     cur = None
     try:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        tenant_id = _set_tenant(cur)
+        probes = max(1, int(_postgres_config().get("ivfflat_probes", 10)))
+        cur.execute("SELECT set_config('ivfflat.probes', %s, true)", (str(probes),))
         embedding = f"[{','.join(str(x) for x in query_embedding)}]"
         sql = """
             SELECT id, content, 1 - (embedding <=> %s::vector) AS score, metadata, partition
             FROM documents
-            WHERE embedding IS NOT NULL
+            WHERE tenant_id = %s::uuid
+              AND embedding IS NOT NULL
         """
-        params: list[Any] = [embedding]
+        params: list[Any] = [embedding, tenant_id]
         if partition:
             sql += " AND partition = %s"
             params.append(partition)
@@ -447,12 +922,14 @@ def _get_documents_by_ids_sync(ids: list[str], partition: str | None) -> list[di
     cur = None
     try:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        tenant_id = _set_tenant(cur)
         sql = """
             SELECT id, content, metadata, partition
             FROM documents
-            WHERE (id = ANY(%s) OR metadata->>'semantic_chunk_id' = ANY(%s))
+            WHERE tenant_id = %s::uuid
+              AND (id = ANY(%s) OR metadata->>'semantic_chunk_id' = ANY(%s))
         """
-        params: list[Any] = [ids, ids]
+        params: list[Any] = [tenant_id, ids, ids]
         if partition:
             sql += " AND partition = %s"
             params.append(partition)
@@ -489,6 +966,7 @@ def _get_documents_by_citations_sync(
     cur = None
     try:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        tenant_id = _set_tenant(cur)
         pair_conditions = " OR ".join(
             "(metadata->>'law_name' = %s AND metadata->>'article_number' = %s)"
             for _ in citation_pairs
@@ -496,9 +974,11 @@ def _get_documents_by_citations_sync(
         sql = f"""
             SELECT id, content, metadata, partition
             FROM documents
-            WHERE ({pair_conditions})
+            WHERE tenant_id = %s::uuid
+              AND ({pair_conditions})
         """
-        params: list[Any] = [value for pair in citation_pairs for value in pair]
+        params: list[Any] = [tenant_id]
+        params.extend(value for pair in citation_pairs for value in pair)
         if partition:
             sql += " AND partition = %s"
             params.append(partition)
@@ -644,11 +1124,12 @@ def _keyword_search_sync(query: str, top_k: int, partition: str | None) -> list[
     cur = None
     try:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        tenant_id = _set_tenant(cur)
         keywords = _extract_chinese_keywords(query)
         if not keywords:
             return []
 
-        search_expr = "(content || ' ' || COALESCE(metadata::text, ''))"
+        search_expr = SEARCH_TEXT_EXPRESSION
         weights = [_keyword_match_weight(keyword) for keyword in keywords]
         score_parts = " + ".join(
             [f"CASE WHEN {search_expr} ILIKE %s THEN {weight} ELSE 0 END" for weight in weights]
@@ -663,10 +1144,13 @@ def _keyword_search_sync(query: str, top_k: int, partition: str | None) -> list[
                 metadata,
                 partition
             FROM documents
-            WHERE ({where_parts})
+            WHERE tenant_id = %s::uuid
+              AND ({where_parts})
         """
 
-        params: list[Any] = [f"%{kw}%" for kw in keywords] + [f"%{kw}%" for kw in keywords]
+        params: list[Any] = [f"%{kw}%" for kw in keywords]
+        params.append(tenant_id)
+        params.extend(f"%{kw}%" for kw in keywords)
         if partition:
             sql += " AND partition = %s"
             params.append(partition)
@@ -793,8 +1277,15 @@ def _delete_document_sync(document_id: str) -> bool:
     cur = None
     try:
         cur = conn.cursor()
-        cur.execute("DELETE FROM documents WHERE metadata->>'document_id' = %s", (document_id,))
-        deleted = cur.rowcount > 0
+        tenant_id = _set_tenant(cur)
+        cur.execute(
+            """
+            DELETE FROM documents
+            WHERE tenant_id = %s::uuid AND metadata->>'document_id' = %s
+            """,
+            (tenant_id, document_id),
+        )
+        deleted: bool = cur.rowcount > 0
         conn.commit()
         return deleted
     finally:
@@ -823,6 +1314,7 @@ def _list_documents_sync(skip: int, limit: int) -> list[dict]:
     cur = None
     try:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        tenant_id = _set_tenant(cur)
         cur.execute(
             """
             SELECT
@@ -832,12 +1324,13 @@ def _list_documents_sync(skip: int, limit: int) -> list[dict]:
                 COUNT(*) AS chunk_count,
                 MAX(created_at) AS updated_at
             FROM documents
-            WHERE metadata->>'document_id' IS NOT NULL
+            WHERE tenant_id = %s::uuid
+              AND metadata->>'document_id' IS NOT NULL
             GROUP BY metadata->>'document_id', metadata->>'filename', partition
             ORDER BY MAX(created_at) DESC
             OFFSET %s LIMIT %s
             """,
-            (skip, limit),
+            (tenant_id, skip, limit),
         )
         return [dict(row) for row in cur.fetchall()]
     finally:
@@ -855,16 +1348,19 @@ def _count_documents_sync() -> int:
     cur = None
     try:
         cur = conn.cursor()
+        tenant_id = _set_tenant(cur)
         cur.execute(
             """
             SELECT COUNT(*)
             FROM (
                 SELECT metadata->>'document_id', metadata->>'filename', partition
                 FROM documents
-                WHERE metadata->>'document_id' IS NOT NULL
+                WHERE tenant_id = %s::uuid
+                  AND metadata->>'document_id' IS NOT NULL
                 GROUP BY metadata->>'document_id', metadata->>'filename', partition
             ) AS grouped_documents
-            """
+            """,
+            (tenant_id,),
         )
         return int(cur.fetchone()[0])
     finally:
@@ -897,13 +1393,15 @@ def _list_document_chunks_sync(document_id: str, skip: int, limit: int) -> dict[
     cur = None
     try:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        tenant_id = _set_tenant(cur)
         cur.execute(
             """
             SELECT COUNT(*) AS total
             FROM documents
-            WHERE metadata->>'document_id' = %s
+            WHERE tenant_id = %s::uuid
+              AND metadata->>'document_id' = %s
             """,
-            (document_id,),
+            (tenant_id, document_id),
         )
         total = int(cur.fetchone()["total"])
 
@@ -911,7 +1409,8 @@ def _list_document_chunks_sync(document_id: str, skip: int, limit: int) -> dict[
             """
             SELECT id, content, metadata, partition, created_at
             FROM documents
-            WHERE metadata->>'document_id' = %s
+            WHERE tenant_id = %s::uuid
+              AND metadata->>'document_id' = %s
             ORDER BY
                 CASE
                     WHEN metadata->>'chunk_index' ~ '^[0-9]+$'
@@ -921,7 +1420,7 @@ def _list_document_chunks_sync(document_id: str, skip: int, limit: int) -> dict[
                 id
             OFFSET %s LIMIT %s
             """,
-            (document_id, skip, limit),
+            (tenant_id, document_id, skip, limit),
         )
         return {
             "total": total,

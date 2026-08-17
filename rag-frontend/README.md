@@ -10,12 +10,21 @@ npm run dev
 Vite proxies `/api` and `/health` to `RAG_API_UPSTREAM`, which defaults to
 `http://127.0.0.1:8000`. Browser requests therefore remain same-origin.
 
-## Production authentication
+## OIDC authentication
 
-Serve the built frontend behind a reverse proxy or BFF using the same paths.
-The proxy should forward `/api/*` to the RAG API and inject `X-API-Key` from a
-server-side secret when API-key authentication is enabled. Do not place the
-key in a `VITE_*` variable because Vite variables are public browser code.
+The browser uses OIDC Authorization Code + PKCE through `oidc-client-ts`.
+Provide these values at build time:
+
+```dotenv
+VITE_OIDC_ISSUER=http://localhost:18080/realms/industrial-rag
+VITE_OIDC_CLIENT_ID=rag-frontend
+VITE_OIDC_AUDIENCE=rag-api
+```
+
+When issuer or client ID is empty, authentication is disabled for laptop
+development. When enabled, startup redirects unauthenticated users to the IdP
+and API requests carry an `Authorization: Bearer` header. Never place a
+permanent API key in a `VITE_*` variable.
 
 Set `VITE_API_BASE` only when the API intentionally uses another public
 origin. The backend CORS allow-list must explicitly include that origin.
@@ -26,6 +35,5 @@ The included container implements this contract. From the repository root:
 docker compose --profile frontend up -d --build
 ```
 
-It reads `RAG_API_UPSTREAM` and `RAG_API_KEY` only at container startup and
-injects the key into proxied `/api/*` requests. Neither value is bundled into
-the frontend JavaScript.
+It reads `RAG_API_UPSTREAM` and `OIDC_CONNECT_SRC` at container startup. Nginx
+proxies `/api/*` but does not inject a shared administrator credential.

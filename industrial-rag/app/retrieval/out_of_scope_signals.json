@@ -12,5 +12,19 @@
       ["无线电频率", "无线电"],
       ["许可", "审批", "申请"]
     ]
+  },
+  {
+    "rule_id": "securities-insider-disclosure",
+    "match_all": [
+      ["证券", "内幕交易"],
+      ["信息披露", "披露"]
+    ]
+  },
+  {
+    "rule_id": "real-estate-registration-fees",
+    "match_all": [
+      ["不动产登记"],
+      ["收费标准", "收费"]
+    ]
   }
 ]

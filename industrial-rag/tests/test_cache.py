@@ -2,6 +2,7 @@
 import asyncio
 
 import app.utils.cache as cache_module
+from app.auth import Principal, reset_current_principal, set_current_principal
 
 
 class FakeRedis:
@@ -18,6 +19,12 @@ class FakeRedis:
         value = int(self.values.get(key, 0)) + 1
         self.values[key] = str(value)
         return value
+
+    async def ping(self):
+        return True
+
+    async def eval(self, _script, _key_count, key, _ttl):
+        return await self.incr(key)
 
 
 def test_answer_cache_binds_context_and_corpus_version(monkeypatch):
@@ -48,5 +55,86 @@ def test_answer_cache_normalizes_query_whitespace(monkeypatch):
 
         await cache.set("劳动合同  解除", context, "answer")
         assert await cache.get("劳动合同 解除", context) == "answer"
+
+    asyncio.run(run())
+
+
+def test_answer_and_task_cache_are_tenant_scoped(monkeypatch):
+    async def run():
+        redis = FakeRedis()
+        monkeypatch.setattr(cache_module, "_redis_client", redis)
+        cache = cache_module.SemanticCache()
+        context = {"documents": [{"id": "shared-id"}]}
+        tenant_a = "00000000-0000-0000-0000-00000000000a"
+        tenant_b = "00000000-0000-0000-0000-00000000000b"
+
+        token = set_current_principal(
+            Principal("user-a", tenant_a, frozenset({"viewer"}), "test")
+        )
+        try:
+            await cache.set("同一个问题", context, "tenant-a-answer")
+            await cache_module.set_task_state("shared-task", {"status": "completed"})
+        finally:
+            reset_current_principal(token)
+
+        token = set_current_principal(
+            Principal("user-b", tenant_b, frozenset({"viewer"}), "test")
+        )
+        try:
+            assert await cache.get("同一个问题", context) is None
+            assert await cache_module.get_task_state("shared-task") is None
+            await cache.set("同一个问题", context, "tenant-b-answer")
+            assert await cache.get("同一个问题", context) == "tenant-b-answer"
+        finally:
+            reset_current_principal(token)
+
+    asyncio.run(run())
+
+
+def test_redis_health_probe_tracks_live_connection(monkeypatch):
+    class UnavailableRedis:
+        async def ping(self):
+            raise ConnectionError("redis unavailable")
+
+    async def run():
+        monkeypatch.setattr(cache_module, "_redis_client", None)
+        assert await cache_module.check_redis_health() is False
+
+        monkeypatch.setattr(cache_module, "_redis_client", FakeRedis())
+        assert await cache_module.check_redis_health() is True
+
+        monkeypatch.setattr(cache_module, "_redis_client", UnavailableRedis())
+        assert await cache_module.check_redis_health() is False
+
+    asyncio.run(run())
+
+
+def test_tenant_rate_limit_is_scoped_and_enforced(monkeypatch):
+    async def run():
+        monkeypatch.setattr(cache_module, "_redis_client", FakeRedis())
+        tenant = "00000000-0000-0000-0000-00000000000a"
+        assert await cache_module.consume_tenant_rate_limit(tenant, limit=2) == (True, 1)
+        assert await cache_module.consume_tenant_rate_limit(tenant, limit=2) == (True, 0)
+        assert await cache_module.consume_tenant_rate_limit(tenant, limit=2) == (False, 0)
+
+    asyncio.run(run())
+
+
+def test_tenant_rate_limit_requires_explicit_fail_open(monkeypatch):
+    async def run():
+        monkeypatch.setattr(cache_module, "_redis_client", None)
+        tenant = "00000000-0000-0000-0000-00000000000a"
+        try:
+            await cache_module.consume_tenant_rate_limit(tenant, limit=2)
+        except ConnectionError as exc:
+            assert "unavailable" in str(exc)
+        else:
+            raise AssertionError("missing Redis backend was allowed in fail-closed mode")
+
+        assert await cache_module.consume_tenant_rate_limit(
+            tenant,
+            limit=2,
+            fail_open=True,
+        ) == (True, 2)
 
     asyncio.run(run())

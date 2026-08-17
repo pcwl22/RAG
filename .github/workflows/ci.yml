@@ -4,9 +4,17 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   backend:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       matrix:
         python-version: ['3.11', '3.12']
@@ -37,58 +45,96 @@ jobs:
       PGDATABASE: rag_test
       PGUSER: postgres
       PGPASSWORD: test-only
+      POSTGRES_RUNTIME_USER: rag_runtime_test
+      POSTGRES_RUNTIME_PASSWORD: runtime-test-only
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
           cache-dependency-path: industrial-rag/requirements-ci.txt
       - run: python -m pip install -r requirements-ci.txt
       - run: python -m pip install -e . --no-deps
+      - run: python -m pip install pip-audit==2.10.1
+      - run: python -m pip_audit --strict -r requirements-ci.txt
       - run: python -m ruff check app tests scripts
-      - run: python -m compileall -q app
+      - run: python -m mypy app scripts
+      - run: python -m compileall -q app scripts
+      - run: python scripts/validate_production_env.py --env-file ../.env.example --allow-placeholders --allow-local-http
+      - run: python scripts/validate_evaluation_assets.py
+      - run: python scripts/validate_release_baseline.py
       - run: python -m pytest tests -q
 
   frontend:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: rag-frontend
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: '22'
           cache: npm
           cache-dependency-path: rag-frontend/package-lock.json
       - run: npm ci
+      - run: npm audit --audit-level=high
       - run: npm test
       - run: npm run build
 
   compose:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
       POSTGRES_PASSWORD: validation-only
+      POSTGRES_APP_PASSWORD: validation-runtime-only
       RAG_API_KEY: validation-only
+      KEYCLOAK_ADMIN_PASSWORD: validation-only
+      REDIS_PASSWORD: validation-redis-only
+      COMPOSE_REDIS_URL: redis://:validation-redis-only@redis:6379/0
     steps:
-      - uses: actions/checkout@v5
-      - run: docker compose -f docker-compose.yml config --quiet
-      - run: docker compose -f industrial-rag/docker-compose.yml config --quiet
-      - run: docker compose -f industrial-rag/docker/docker-compose.yml config --quiet
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Prepare validation-only Compose environment
+        run: cp .env.example industrial-rag/.env
+      - run: docker compose --env-file industrial-rag/.env -f docker-compose.yml config --quiet
+      - run: docker compose --env-file industrial-rag/.env -f docker-compose.yml --profile worker config --quiet
+      - run: docker compose --env-file industrial-rag/.env -f docker-compose.yml --profile api --profile frontend config --quiet
+      - run: docker compose --env-file industrial-rag/.env -f docker-compose.yml -f docker-compose.gpu.yml config --quiet
+      - run: docker compose --env-file industrial-rag/.env -f industrial-rag/docker-compose.yml config --quiet
+      - run: docker compose --env-file industrial-rag/.env -f industrial-rag/docker/docker-compose.yml config --quiet
 
   docker-build:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     strategy:
       matrix:
         image: [api, worker]
     steps:
-      - uses: actions/checkout@v5
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: industrial-rag
           file: industrial-rag/docker/${{ matrix.image }}/Dockerfile
           push: false
+          load: true
+          tags: industrial-rag/${{ matrix.image }}:${{ github.sha }}
           cache-from: type=gha,scope=industrial-rag-${{ matrix.image }}
           cache-to: type=gha,mode=min,scope=industrial-rag-${{ matrix.image }}
+      - name: Scan built image
+        uses: aquasecurity/trivy-action@76071ef0d7ec797419534a183b498b4d6366cf37 # v0.31.0
+        with:
+          image-ref: industrial-rag/${{ matrix.image }}:${{ github.sha }}
+          scanners: vuln,secret,misconfig
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: 1
+      - name: Generate image SBOM
+        uses: anchore/sbom-action@da167eac915b4e86f08b264dbdbc867b61be6f0c # v0.20.5
+        with:
+          image: industrial-rag/${{ matrix.image }}:${{ github.sha }}
+          format: cyclonedx-json
+          artifact-name: industrial-rag-${{ matrix.image }}-sbom.cdx.json
+          output-file: industrial-rag-${{ matrix.image }}-sbom.cdx.json

@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app.api.retrieval_params import resolve_retrieval_params
-from app.retrieval.dense import RetrievalEngine
+from app.retrieval.factory import build_retrieval_engine
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -23,7 +23,7 @@ class SimpleQueryRequest(BaseModel):
 
 
 @router_simple.post("/query_simple")
-async def query_simple(request: SimpleQueryRequest):
+async def query_simple(request: SimpleQueryRequest) -> JSONResponse:
     """
     保留旧路径的简化查询端点，并复用统一的请求边界校验。
     """
@@ -38,10 +38,10 @@ async def query_simple(request: SimpleQueryRequest):
             enable_rerank=request.enable_rerank,
         )
 
-        logger.info(f"Simple query: {query}, top_k: {params.top_k}")
+        logger.info("Simple query received, top_k=%s", params.top_k)
 
         # 初始化检索引擎
-        engine = RetrievalEngine()
+        engine = build_retrieval_engine()
 
         # 执行检索
         results = await engine.retrieve(
@@ -85,7 +85,7 @@ async def query_simple(request: SimpleQueryRequest):
 
 
 @router_simple.post("/answer_simple")
-async def answer_simple(request: SimpleQueryRequest):
+async def answer_simple(request: SimpleQueryRequest) -> JSONResponse:
     """
     保留旧路径的简化问答端点，并复用统一的请求边界校验。
     """
@@ -100,10 +100,10 @@ async def answer_simple(request: SimpleQueryRequest):
             enable_rerank=request.enable_rerank,
         )
 
-        logger.info(f"Simple answer: {query}, top_k: {params.top_k}")
+        logger.info("Simple answer received, top_k=%s", params.top_k)
 
         # 初始化检索引擎
-        engine = RetrievalEngine()
+        engine = build_retrieval_engine()
 
         # 检索相关文档
         results = await engine.retrieve(

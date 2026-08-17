@@ -3,7 +3,7 @@ import os
 from typing import Any
 
 from app.embedding.embedder import resolve_torch_device
-from app.utils.config import get_settings
+from app.utils.config import get_config_section
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -11,8 +11,15 @@ logger = get_logger(__name__)
 _reranker_model: Any = None
 
 
-def _reranker_config() -> dict:
-    return get_settings().get("reranker", {})
+def _reranker_config() -> dict[str, Any]:
+    return get_config_section("reranker")
+
+
+def _fallback(documents: list[dict], top_n: int | None) -> list[dict]:
+    mode = str(_reranker_config().get("failure_mode", "closed")).strip().lower()
+    if mode == "open":
+        return documents[:top_n] if top_n else documents
+    return []
 
 
 def load_reranker() -> Any:
@@ -55,8 +62,8 @@ def rerank_documents(
 
     reranker = load_reranker()
     if not reranker:
-        logger.warning("Reranker not available, returning original order")
-        return documents[:top_n] if top_n else documents
+        logger.error("Reranker unavailable; applying configured failure mode")
+        return _fallback(documents, top_n)
 
     cfg = _reranker_config()
     batch_size = cfg.get("batch_size", 8)
@@ -110,5 +117,5 @@ def rerank_documents(
         )
         return kept
     except Exception as e:
-        logger.error(f"Reranking failed: {e}, falling back to original order")
-        return documents[:top_n] if top_n else documents
+        logger.error("Reranking failed: %s", e, exc_info=True)
+        return _fallback(documents, top_n)

@@ -1,8 +1,10 @@
 """Retrieval engine for vector search and optional reranking."""
+from typing import Any
 
 from app.embedding.embedder import encode_query
+from app.retrieval.domain_signal_map import is_known_out_of_scope
 from app.retrieval.reranker import rerank_documents
-from app.utils.config import get_settings
+from app.utils.config import get_config_section
 from app.utils.inference import run_inference
 from app.utils.logger import get_logger
 from app.vectorstore import storage_adapter
@@ -10,8 +12,8 @@ from app.vectorstore import storage_adapter
 logger = get_logger(__name__)
 
 
-def _retrieval_config() -> dict:
-    return get_settings().get("rag", {}).get("retrieval", {})
+def _retrieval_config() -> dict[str, Any]:
+    return get_config_section("rag", "retrieval")
 
 
 def _candidate_count(top_k: int, enable_rerank: bool, config: dict) -> int:
@@ -53,8 +55,14 @@ def _deduplicate_results(results: list[dict], max_per_document: int) -> list[dic
 class RetrievalEngine:
     """Vector retrieval with optional cross-encoder reranking."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.config = _retrieval_config()
+
+    async def retrieve_by_ids(
+        self, ids: list[str], partition: str | None = None
+    ) -> list[dict]:
+        """Fetch controlled mapping targets without fuzzy ranking."""
+        return await storage_adapter.get_documents_by_ids(ids, partition)
 
     async def retrieve(
         self,
@@ -62,9 +70,15 @@ class RetrievalEngine:
         top_k: int | None = None,
         similarity_threshold: float | None = None,
         enable_rerank: bool | None = None,
-        enable_multimodal: bool = False,
         partition: str | None = None,
+        enable_exact_citations: bool = True,
     ) -> list[dict]:
+        # Accepted for interface parity with HybridRetrievalEngine, which uses it
+        # to scope exact-citation lookups. Dense retrieval has no citation path.
+        del enable_exact_citations
+        if is_known_out_of_scope(query):
+            logger.info("Query is outside the configured corpus scope")
+            return []
         if top_k is None:
             top_k = self.config.get("top_k", 5)
         if similarity_threshold is None:

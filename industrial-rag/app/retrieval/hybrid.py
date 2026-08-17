@@ -1,13 +1,16 @@
 """Hybrid retrieval engine: keyword + vector + RRF."""
 
 import re
+import time
+from typing import Any
 
 from app.embedding.embedder import encode_query
 from app.retrieval.domain_signal_map import is_known_out_of_scope
 from app.retrieval.reranker import rerank_documents
-from app.utils.config import get_settings
+from app.utils.config import get_config_section
 from app.utils.inference import run_inference
 from app.utils.logger import get_logger
+from app.utils.metrics import RETRIEVAL_DURATION, RETRIEVAL_REQUESTS
 from app.vectorstore import storage_adapter
 
 logger = get_logger(__name__)
@@ -58,8 +61,8 @@ def _explicit_legal_citations(query: str) -> list[tuple[str, str]]:
     return pairs
 
 
-def _retrieval_config() -> dict:
-    return get_settings().get("rag", {}).get("retrieval", {})
+def _retrieval_config() -> dict[str, Any]:
+    return get_config_section("rag", "retrieval")
 
 
 def _candidate_count(top_k: int, enable_rerank: bool, config: dict) -> int:
@@ -97,7 +100,7 @@ def _deduplicate_results(results: list[dict], max_per_document: int) -> list[dic
 class HybridRetrievalEngine:
     """PostgreSQL hybrid retriever."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.config = _retrieval_config()
 
     async def retrieve_by_ids(
@@ -107,6 +110,37 @@ class HybridRetrievalEngine:
         return await storage_adapter.get_documents_by_ids(ids, partition)
 
     async def retrieve(
+        self,
+        query: str,
+        top_k: int | None = None,
+        similarity_threshold: float | None = None,
+        enable_rerank: bool | None = None,
+        partition: str | None = None,
+        enable_rrf: bool | None = None,
+        enable_dynamic_topk: bool | None = None,
+        enable_exact_citations: bool = True,
+    ) -> list[dict]:
+        started = time.perf_counter()
+        outcome = "success"
+        try:
+            return await self._retrieve_impl(
+                query=query,
+                top_k=top_k,
+                similarity_threshold=similarity_threshold,
+                enable_rerank=enable_rerank,
+                partition=partition,
+                enable_rrf=enable_rrf,
+                enable_dynamic_topk=enable_dynamic_topk,
+                enable_exact_citations=enable_exact_citations,
+            )
+        except Exception:
+            outcome = "error"
+            raise
+        finally:
+            RETRIEVAL_REQUESTS.labels(outcome=outcome).inc()
+            RETRIEVAL_DURATION.observe(time.perf_counter() - started)
+
+    async def _retrieve_impl(
         self,
         query: str,
         top_k: int | None = None,

@@ -10,6 +10,7 @@ app:
 llm:
   text:
     provider: "openai_compatible"
+    healthcheck_timeout_seconds: 5
     claude:
       model_name: "claude-sonnet-4-6"
       api_key: "${CLAUDE_API_KEY}"
@@ -17,6 +18,7 @@ llm:
       temperature: 0.3
       max_tokens: 4096
       timeout: 60
+      healthcheck_ttl_seconds: 30
     openai_compatible:
       model_name: "deepseek-chat"
       api_key: "${DEEPSEEK_API_KEY}"
@@ -24,12 +26,15 @@ llm:
       temperature: 0.3
       max_tokens: 4096
       timeout: 60
+      healthcheck_ttl_seconds: 30
     zhipu:
       model_name: "glm-4-plus"
       api_key: "${ZHIPU_API_KEY}"
+      base_url: "https://open.bigmodel.cn/api/paas/v4/"
       temperature: 0.3
       max_tokens: 4096
       timeout: 60
+      healthcheck_ttl_seconds: 30
 
   vision:
     enabled: false
@@ -37,6 +42,7 @@ llm:
 # 嵌入模型配置
 embedding:
   model_name: "BAAI/bge-m3"
+  model_revision: "bge-m3-local-2026-06"
   model_path: "/app/models/bge-m3"
   device: "cuda"
   batch_size: 32
@@ -50,6 +56,7 @@ embedding:
 # 重排序模型
 reranker:
   enabled: true
+  failure_mode: "closed"
   model_name: "BAAI/bge-reranker-v2-m3"
   model_path: "/app/models/bge-reranker-v2-m3"
   device: "cuda"
@@ -64,10 +71,12 @@ postgres:
   host: "postgres"
   port: 5432
   database: "rag_db"
-  user: "postgres"
+  user: "${POSTGRES_USER}"
   password: "${POSTGRES_PASSWORD}"
+  auto_migrate: false
   min_pool_size: 1
   max_pool_size: 10
+  ivfflat_probes: 10
   connect_timeout: 5
   command_timeout: 60
   keepalives_idle: 30
@@ -76,9 +85,10 @@ postgres:
 
 # Redis缓存配置
 redis:
-  url: "redis://redis:6379/0"
+  url: "${REDIS_URL}"
   encoding: "utf-8"
   decode_responses: true
+  require_tls: false
   max_connections: 50
 
   # 语义缓存配置
@@ -105,12 +115,15 @@ document_processing:
     - "txt"
 
   max_file_size: 104857600  # 100MB
+  max_archive_entries: 5000
+  max_archive_uncompressed_size: 536870912  # 512MB
+  max_archive_compression_ratio: 200
   failed_upload_retention_seconds: 604800  # 7 days
   failed_upload_max_files: 100
 
   # PDF 解析 - MinerU (magic-pdf)
   pdf:
-    engine: "mineru"
+    engine: "pymupdf"
     parse_method: "auto"       # ocr | txt | auto
     device: "cuda"
     output_format: "md"        # md | md_dollar | json
@@ -195,6 +208,9 @@ monitoring:
   prometheus:
     enabled: true
     port: 9090
+    path: "/internal/metrics"
+    header_name: "X-Metrics-Token"
+    token: "${RAG_METRICS_TOKEN}"
 
   metrics:
     - "request_count"
@@ -218,17 +234,21 @@ logging:
 
 # 安全配置
 security:
+  # Standard OIDC validation; Keycloak is the default local IdP, but any
+  # standards-compliant provider can be used.
+  oidc:
+    enabled: false
+    issuer: "${OIDC_ISSUER}"
+    audience: "${OIDC_AUDIENCE}"
+    jwks_url: "${OIDC_JWKS_URL}"
+    tenant_claim: "tenant_id"
+    roles_claim: "realm_access.roles"
+    algorithms: ["RS256"]
+
   # API认证
   api_key:
     enabled: true
     header_name: "X-API-Key"
-
-  # JWT认证
-  jwt:
-    enabled: false
-    secret_key: "your-secret-key-change-in-production"
-    algorithm: "HS256"
-    access_token_expire_minutes: 30
 
   # CORS
   cors:
@@ -246,9 +266,11 @@ performance:
 
   # 并发控制
   max_concurrent_requests: 100
-  worker_threads: 4
+  tenant_max_concurrent_requests: 10
+  tenant_requests_per_minute: 120
+  tenant_rate_limit_fail_open: false
+  max_tracked_tenants: 10000
+  request_queue_timeout_seconds: 5
+  max_chat_total_chars: 60000
+  max_chat_input_tokens: 16000
   gpu_inference_workers: 1
-
-  # 连接池
-  db_pool_size: 20
-  redis_pool_size: 50

@@ -13,6 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from app.auth import normalize_tenant_id  # noqa: E402
 from app.utils.config import get_settings  # noqa: E402
 
 STANDARD_QUOTAS = {"civil": 50, "criminal": 50, "labor": 40}
@@ -47,27 +48,32 @@ def _domain(law_name: str) -> str | None:
     return None
 
 
-def _load_articles() -> dict[str, list[dict[str, Any]]]:
+def _load_articles(tenant_id: str) -> dict[str, list[dict[str, Any]]]:
     # Keep the database driver optional at module-import time so CI can test
     # the deterministic suite builder without installing PostgreSQL extras.
     import psycopg2
     import psycopg2.extras
 
     cfg = get_settings()["postgres"]
+    tenant_id = normalize_tenant_id(tenant_id)
     connection = psycopg2.connect(
         host=cfg["host"], port=cfg["port"], database=cfg["database"],
         user=cfg["user"], password=cfg["password"], client_encoding="utf8",
     )
     try:
         with connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+            cursor.execute("SET LOCAL ROLE rag_app")
+            cursor.execute("SELECT set_config('app.tenant_id', %s, true)", (tenant_id,))
             cursor.execute(
                 """
                 SELECT id, content, metadata
                 FROM documents
-                WHERE metadata->>'document_type' = 'legal_article'
+                WHERE tenant_id = %s::uuid
+                  AND metadata->>'document_type' = 'legal_article'
                   AND metadata->>'article_number' IS NOT NULL
                 ORDER BY id
-                """
+                """,
+                (tenant_id,),
             )
             grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
             seen: set[tuple[str, str]] = set()
@@ -122,7 +128,7 @@ def build_suite(grouped: dict[str, list[dict[str, Any]]], seed: int = 20260715) 
         rng.shuffle(pools[domain])
 
     cases: list[dict] = []
-    offsets = defaultdict(int)
+    offsets: defaultdict[str, int] = defaultdict(int)
     for category, quotas in (("standard", STANDARD_QUOTAS), ("adversarial", ADVERSARIAL_QUOTAS)):
         for domain, quota in quotas.items():
             selected = pools[domain][offsets[domain] : offsets[domain] + quota]
@@ -175,8 +181,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=Path("eval/legal_expanded_240.jsonl"))
     parser.add_argument("--seed", type=int, default=20260715)
+    parser.add_argument("--tenant-id", required=True, help="Tenant UUID whose corpus will be evaluated")
     args = parser.parse_args()
-    cases = build_suite(_load_articles(), args.seed)
+    cases = build_suite(_load_articles(args.tenant_id), args.seed)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", encoding="utf-8", newline="\n") as handle:
         for case in cases:

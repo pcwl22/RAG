@@ -3,6 +3,8 @@
     <div class="header">
       <h1>🤖 RAG智能问答系统</h1>
       <div class="status">
+        <span v-if="oidcEnabled && authUserName" class="auth-user">{{ authUserName }}</span>
+        <button v-if="oidcEnabled" class="btn-tool" @click="handleSignOut">退出登录</button>
         <span :class="{ online: isOnline }">{{ isOnline ? '在线' : '离线' }}</span>
       </div>
     </div>
@@ -177,8 +179,13 @@ import {
   readEventStream
 } from './utils/eventStream'
 import { useChatSessions } from './composables/useChatSessions'
+import { getAuthenticatedUser, oidcEnabled, signOut } from './auth/oidc.js'
+import { buildChatStorageKey } from './utils/chatStorage.js'
 
 const isOnline = ref(false)
+const authUser = getAuthenticatedUser()
+const authUserName = authUser?.profile?.preferred_username || authUser?.profile?.name || ''
+const chatStorageKey = buildChatStorageKey(authUser)
 const documents = ref([])
 const selectedDoc = ref(null)
 const selectedDocChunks = ref([])
@@ -198,7 +205,18 @@ const {
   initChats,
   switchChat,
   updateCurrentSession
-} = useChatSessions({ onAfterSwitch: () => scrollToBottom() })
+} = useChatSessions({
+  onAfterSwitch: () => scrollToBottom(),
+  storageKey: chatStorageKey
+})
+
+const handleSignOut = async () => {
+  try {
+    localStorage.removeItem(chatStorageKey)
+  } finally {
+    await signOut()
+  }
+}
 
 const userInput = ref('')
 const isLoading = ref(false)

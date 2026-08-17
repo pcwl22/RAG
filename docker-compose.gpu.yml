@@ -1,0 +1,6 @@
+services:
+  api:
+    gpus: all
+    environment:
+      EMBEDDING_DEVICE: cuda
+      RERANKER_DEVICE: cuda

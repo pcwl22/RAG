@@ -1,20 +1,25 @@
 """PDF parsing helpers."""
 from pathlib import Path
+from typing import Any
 
-from app.utils.config import get_settings
+from app.utils.config import get_config_section
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 
-def _doc_processing_config() -> dict:
-    return get_settings().get("document_processing", {})
+def _doc_processing_config() -> dict[str, Any]:
+    return get_config_section("document_processing")
 
 
 def parse_pdf(file_path: str) -> str:
-    """Parse PDF with MinerU first, then fall back to PyMuPDF."""
+    """Parse PDF with the configured engine and a controlled fallback."""
     logger.info("Parsing PDF: %s", file_path)
     cfg = _doc_processing_config().get("pdf", {})
+    engine = str(cfg.get("engine", "auto")).strip().lower()
+
+    if engine == "pymupdf":
+        return _parse_with_pymupdf(file_path)
 
     try:
         from magic_pdf.pipe.UNIPipe import UNIPipe
@@ -31,20 +36,26 @@ def parse_pdf(file_path: str) -> str:
             pipe.pipe_analyze()
             pipe.pipe_parse()
 
-        return pipe.pipe_mk_markdown(
-            "pipe.md",
-            drop_mode="none",
-            md_make_mode=cfg.get("output_format", "md"),
+        return str(
+            pipe.pipe_mk_markdown(
+                "pipe.md",
+                drop_mode="none",
+                md_make_mode=cfg.get("output_format", "md"),
+            )
         )
     except Exception as exc:
         logger.warning("MinerU parsing failed, falling back to PyMuPDF: %s", exc)
-        try:
-            import fitz
+        return _parse_with_pymupdf(file_path)
 
-            doc = fitz.open(file_path)
+
+def _parse_with_pymupdf(file_path: str) -> str:
+    try:
+        import fitz
+
+        with fitz.open(file_path) as doc:
             return "\n".join(page.get_text() for page in doc)
-        except Exception as fallback_exc:
-            raise RuntimeError(f"Failed to parse PDF: {file_path}") from fallback_exc
+    except Exception as exc:
+        raise RuntimeError(f"Failed to parse PDF: {file_path}") from exc
 
 
 __all__ = ["parse_pdf"]

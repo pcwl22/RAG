@@ -36,7 +36,8 @@ def find_source() -> Path:
 
 def verify_parser(source: Path) -> list[str]:
     chunks = build_legal_article_chunks(parse_document(str(source)), source.name)
-    ids = [(item.get("metadata") or {}).get("semantic_chunk_id") for item in chunks]
+    raw_ids = [(item.get("metadata") or {}).get("semantic_chunk_id") for item in chunks]
+    ids = [str(chunk_id) for chunk_id in raw_ids if chunk_id is not None]
     missing = sorted(EXPECTED_IDS - set(ids))
     if missing:
         raise RuntimeError(f"Parser did not produce required article IDs: {missing}; got: {ids}")

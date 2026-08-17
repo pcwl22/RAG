@@ -3,11 +3,14 @@
 检查环境、下载模型、创建必要目录
 """
 import os
+import shutil
 import sys
 from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-def check_python_version():
+
+def check_python_version() -> bool:
     """检查Python版本"""
     version = sys.version_info
     if version.major < 3 or (version.major == 3 and version.minor < 11):
@@ -17,7 +20,7 @@ def check_python_version():
     return True
 
 
-def check_cuda():
+def check_cuda() -> bool:
     """检查CUDA"""
     try:
         import torch
@@ -36,14 +39,15 @@ def check_cuda():
         return False
 
 
-def check_redis():
+def check_redis() -> bool:
     """检查Redis"""
     try:
         import redis
 
-        r = redis.Redis(host="localhost", port=6379, decode_responses=True)
+        redis_url = os.getenv("REDIS_URL", "redis://localhost:16379/0")
+        r = redis.Redis.from_url(redis_url, decode_responses=True)
         r.ping()
-        print("✓ Redis连接成功")
+        print(f"✓ Redis连接成功: {redis_url}")
         return True
     except Exception as e:
         print(f"⚠️  Redis未运行: {e}")
@@ -51,7 +55,7 @@ def check_redis():
         return False
 
 
-def create_directories():
+def create_directories() -> None:
     """创建必要目录"""
     dirs = [
         "data/uploads",
@@ -66,7 +70,7 @@ def create_directories():
         print(f"✓ 创建目录: {d}")
 
 
-def check_models():
+def check_models() -> bool:
     """检查模型"""
     models = {
         "BGE-M3": "E:/RAG/models/bge-m3",
@@ -97,7 +101,7 @@ def check_models():
     return all_exist
 
 
-def check_api_keys():
+def check_api_keys() -> bool:
     """检查API密钥"""
     keys = {
         "CLAUDE_API_KEY": "Claude API",
@@ -126,39 +130,21 @@ def check_api_keys():
     return True
 
 
-def generate_env_template():
+def generate_env_template() -> None:
     """生成.env模板"""
-    env_path = Path(".env")
+    env_path = PROJECT_ROOT / ".env"
     if env_path.exists():
         print("✓ .env 文件已存在")
         return
 
-    template = """# API密钥配置（选择一个）
-
-# Claude API (推荐 - 质量最高)
-# CLAUDE_API_KEY=sk-ant-xxx
-
-# DeepSeek (推荐 - 性价比最高)
-# DEEPSEEK_API_KEY=sk-xxx
-
-# 智谱AI (国内稳定)
-# ZHIPU_API_KEY=xxx
-
-# OpenAI
-# OPENAI_API_KEY=sk-xxx
-
-# Redis配置（可选）
-REDIS_URL=redis://localhost:6379/0
-
-# 日志级别
-LOG_LEVEL=INFO
-"""
-
-    env_path.write_text(template, encoding="utf-8")
+    template_path = PROJECT_ROOT / ".env.example"
+    if not template_path.exists():
+        raise FileNotFoundError(f"Missing environment template: {template_path}")
+    shutil.copyfile(template_path, env_path)
     print("✓ 创建 .env 模板文件，请填入API密钥")
 
 
-def main():
+def main() -> None:
     """主函数"""
     print("=" * 60)
     print("🚀 Industrial RAG System - 环境检查")

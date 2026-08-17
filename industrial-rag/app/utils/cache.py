@@ -8,15 +8,20 @@
 import hashlib
 import json
 import os
+import time
 from typing import Any
+from urllib.parse import urlsplit
 
+from app.auth import current_tenant_id, normalize_tenant_id
+from app.utils.config import get_config_section
+from app.utils.logger import get_logger
+from app.utils.metrics import CACHE_LOOKUPS
+
+aioredis: Any
 try:
     import redis.asyncio as aioredis
 except ImportError:  # Redis is optional; the app can run without semantic cache.
     aioredis = None
-
-from app.utils.config import get_settings
-from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -24,9 +29,9 @@ logger = get_logger(__name__)
 _redis_client: Any | None = None
 
 
-def _redis_config() -> dict:
+def _redis_config() -> dict[str, Any]:
     """获取 Redis 配置。"""
-    return get_settings().get("redis", {})
+    return get_config_section("redis")
 
 
 async def init_redis() -> bool:
@@ -41,7 +46,7 @@ async def init_redis() -> bool:
         return False
 
     cfg = _redis_config()
-    url = cfg.get("url", "redis://localhost:6379/0")
+    url = os.getenv("REDIS_URL") or cfg.get("url", "redis://localhost:6379/0")
     max_connections = cfg.get("max_connections", 20)
 
     try:
@@ -53,7 +58,11 @@ async def init_redis() -> bool:
         )
         # 测试连接
         await _redis_client.ping()
-        logger.info(f"Redis connected: {url}")
+        parsed = urlsplit(str(url))
+        endpoint = f"{parsed.scheme}://{parsed.hostname or 'unknown'}"
+        if parsed.port:
+            endpoint += f":{parsed.port}"
+        logger.info("Redis connected: %s", endpoint)
         return True
     except Exception as e:
         logger.warning(f"Redis connection failed: {e}. Caching will be disabled.")
@@ -75,6 +84,49 @@ def _get_redis() -> Any | None:
     return _redis_client
 
 
+async def check_redis_health() -> bool:
+    """Return whether the configured Redis client can answer a live probe."""
+    client = _get_redis()
+    if client is None:
+        return False
+    try:
+        return bool(await client.ping())
+    except Exception:
+        logger.warning("Redis readiness probe failed", exc_info=True)
+        return False
+
+
+async def consume_tenant_rate_limit(
+    tenant_id: str,
+    *,
+    limit: int,
+    window_seconds: int = 60,
+    fail_open: bool = False,
+) -> tuple[bool, int]:
+    """Consume one request from a Redis-backed, fixed-window tenant quota."""
+    if limit <= 0:
+        return True, 0
+    client = _get_redis()
+    if client is None:
+        if fail_open:
+            # Laptop acceptance may intentionally run without Redis. Production
+            # profiles keep the default fail-closed behavior.
+            return True, limit
+        raise ConnectionError("Redis tenant rate-limit backend is unavailable")
+
+    resolved_tenant = _tenant_key(tenant_id)
+    window = max(1, int(window_seconds))
+    bucket = int(time.time()) // window
+    key = f"rag:{resolved_tenant}:rate:api:{bucket}"
+    script = """
+    local count = redis.call('INCR', KEYS[1])
+    if count == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
+    return count
+    """
+    count = int(await client.eval(script, 1, key, window + 1))
+    return count <= limit, max(0, limit - count)
+
+
 def _hash_payload(query: str, context: dict[str, Any]) -> str:
     payload = {
         "query": " ".join(query.split()),
@@ -84,10 +136,14 @@ def _hash_payload(query: str, context: dict[str, Any]) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _tenant_key(tenant_id: str | None = None) -> str:
+    return normalize_tenant_id(tenant_id or current_tenant_id())
+
+
 class SemanticCache:
     """Versioned deterministic answer cache kept under the legacy class name."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         cfg = _redis_config().get("semantic_cache", {})
         self.enabled = cfg.get("enabled", True)
         self.ttl = cfg.get("ttl", 3600)  # 1小时
@@ -95,28 +151,38 @@ class SemanticCache:
         version = os.getenv("RAG_CACHE_VERSION") or str(cfg.get("cache_version", "1"))
         self.prefix = f"rag:answer-cache:v{version}:"
 
-    async def _corpus_version(self, client: Any) -> str:
-        version = await client.get("rag:corpus-version")
+    async def _corpus_version(self, client: Any, tenant_id: str) -> str:
+        version = await client.get(f"rag:{tenant_id}:corpus-version")
         # Redis INCR creates a missing key at 1, so the pre-ingest namespace is 0.
         return str(version or "0")
 
     async def get(self, query: str, context: dict[str, Any]) -> str | None:
         """Return a cached raw model answer for the exact effective context."""
         if not self.enabled:
+            CACHE_LOOKUPS.labels(outcome="disabled").inc()
             return None
 
         client = _get_redis()
         if not client:
+            CACHE_LOOKUPS.labels(outcome="unavailable").inc()
             return None
 
         try:
-            corpus_version = await self._corpus_version(client)
-            key = f"{self.prefix}c{corpus_version}:{_hash_payload(query, context)}"
-            value = await client.get(key)
+            tenant_id = _tenant_key()
+            corpus_version = await self._corpus_version(client, tenant_id)
+            key = (
+                f"rag:{tenant_id}:{self.prefix}"
+                f"c{corpus_version}:{_hash_payload(query, context)}"
+            )
+            value: str | None = await client.get(key)
             if value:
                 logger.info(f"Cache hit: {key}")
+                CACHE_LOOKUPS.labels(outcome="hit").inc()
+            else:
+                CACHE_LOOKUPS.labels(outcome="miss").inc()
             return value
         except Exception as e:
+            CACHE_LOOKUPS.labels(outcome="error").inc()
             logger.error(f"Cache get failed: {e}")
             return None
 
@@ -130,42 +196,58 @@ class SemanticCache:
             return
 
         try:
-            corpus_version = await self._corpus_version(client)
-            key = f"{self.prefix}c{corpus_version}:{_hash_payload(query, context)}"
+            tenant_id = _tenant_key()
+            corpus_version = await self._corpus_version(client, tenant_id)
+            key = (
+                f"rag:{tenant_id}:{self.prefix}"
+                f"c{corpus_version}:{_hash_payload(query, context)}"
+            )
             await client.set(key, answer, ex=self.ttl)
             logger.info(f"Cache set: {key}")
         except Exception as e:
             logger.error(f"Cache set failed: {e}")
 
 
-async def invalidate_semantic_cache() -> None:
-    """Invalidate all answers in O(1) by advancing the corpus namespace."""
+async def invalidate_semantic_cache(tenant_id: str | None = None) -> None:
+    """Invalidate one tenant's answers in O(1) by advancing its corpus namespace."""
     client = _get_redis()
     if not client:
         return
     try:
-        await client.incr("rag:corpus-version")
+        resolved_tenant = _tenant_key(tenant_id)
+        await client.incr(f"rag:{resolved_tenant}:corpus-version")
     except Exception as exc:
         logger.warning("Semantic cache invalidation failed: %s", exc)
 
 
-async def set_task_state(task_id: str, state: dict[str, Any], ttl: int = 86400) -> None:
+async def set_task_state(
+    task_id: str,
+    state: dict[str, Any],
+    ttl: int = 86400,
+    tenant_id: str | None = None,
+) -> None:
     """Persist upload task state when Redis is available."""
     client = _get_redis()
     if not client:
         return
     try:
-        await client.set(f"rag:task:{task_id}", json.dumps(state, ensure_ascii=False), ex=ttl)
+        resolved_tenant = _tenant_key(tenant_id)
+        await client.set(
+            f"rag:{resolved_tenant}:task:{task_id}",
+            json.dumps(state, ensure_ascii=False),
+            ex=ttl,
+        )
     except Exception as exc:
         logger.debug("Task state write failed: %s", exc)
 
 
-async def get_task_state(task_id: str) -> dict[str, Any] | None:
+async def get_task_state(task_id: str, tenant_id: str | None = None) -> dict[str, Any] | None:
     client = _get_redis()
     if not client:
         return None
     try:
-        value = await client.get(f"rag:task:{task_id}")
+        resolved_tenant = _tenant_key(tenant_id)
+        value = await client.get(f"rag:{resolved_tenant}:task:{task_id}")
         return json.loads(value) if value else None
     except Exception as exc:
         logger.debug("Task state read failed: %s", exc)

@@ -1,8 +1,6 @@
 import { computed, nextTick, ref } from 'vue'
 import { normalizeProcessTrace } from '../utils/processTrace.js'
-import { saveSessions } from '../utils/chatStorage.js'
-
-const STORAGE_KEY = 'rag_chat_sessions'
+import { buildChatStorageKey, saveSessions } from '../utils/chatStorage.js'
 
 const normalizeStoredMessages = (items = []) =>
   items.map(msg => {
@@ -28,7 +26,7 @@ const createSession = (index) => ({
   updatedAt: new Date().toISOString()
 })
 
-export const useChatSessions = ({ onAfterSwitch } = {}) => {
+export const useChatSessions = ({ onAfterSwitch, storageKey = buildChatStorageKey() } = {}) => {
   const chatSessions = ref([])
   const currentSessionId = ref(null)
   const messages = ref([])
@@ -39,7 +37,7 @@ export const useChatSessions = ({ onAfterSwitch } = {}) => {
   })
 
   const saveChats = () => {
-    saveSessions(localStorage, STORAGE_KEY, chatSessions.value)
+    saveSessions(localStorage, storageKey, chatSessions.value)
   }
 
   const createNewChat = () => {
@@ -97,7 +95,7 @@ export const useChatSessions = ({ onAfterSwitch } = {}) => {
   }
 
   const initChats = () => {
-    const saved = localStorage.getItem(STORAGE_KEY)
+    const saved = localStorage.getItem(storageKey)
     if (!saved) {
       createNewChat()
       return

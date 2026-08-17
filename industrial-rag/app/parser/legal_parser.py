@@ -93,7 +93,7 @@ class LegalDocumentParser:
         'tiao': re.compile(rf'^({ARTICLE_NUMBER_PATTERN})\s*', re.MULTILINE),
     }
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.sections: list[LegalSection] = []
         self.current_path: list[str] = []
 
@@ -167,7 +167,7 @@ class LegalDocumentParser:
 
         return self.sections
 
-    def _update_path(self, level: int, number: str, title: str):
+    def _update_path(self, level: int, number: str, title: str) -> None:
         """更新当前路径"""
         # 移除比当前级别更低的路径
         self.current_path = [p for p in self.current_path if self._get_level_from_path(p) < level]

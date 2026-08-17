@@ -7,6 +7,7 @@ must still cite only documents actually retrieved from the knowledge base.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, TypedDict
@@ -134,7 +135,7 @@ def _match_terms(text: str, groups: list[list[str]]) -> tuple[bool, list[str]]:
     return True, list(dict.fromkeys(matched))
 
 
-def _build_recall_query(mapping: dict[str, Any]) -> str:
+def _build_recall_query(mapping: Mapping[str, Any]) -> str:
     terms: list[str] = [mapping["concept"]]
     for article in mapping.get("articles", []):
         terms.extend(

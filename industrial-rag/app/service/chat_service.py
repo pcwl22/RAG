@@ -2,6 +2,7 @@
 import hashlib
 import re
 from collections.abc import AsyncIterator
+from typing import Any
 
 from app.llm.model import get_llm_client
 from app.llm.prompt import (
@@ -12,7 +13,7 @@ from app.llm.prompt import (
 )
 from app.retrieval.result_merge import result_score
 from app.utils.cache import SemanticCache
-from app.utils.config import get_settings
+from app.utils.config import get_config_section, get_settings
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -33,8 +34,8 @@ KNOWN_LAW_TITLES = [
 ]
 
 
-def _generation_config() -> dict:
-    return get_settings().get("rag", {}).get("generation", {})
+def _generation_config() -> dict[str, Any]:
+    return get_config_section("rag", "generation")
 
 
 def _doc_debug_summary(docs: list[dict], max_items: int = 5, preview_len: int = 120) -> list[dict]:
@@ -352,7 +353,7 @@ def _has_no_supported_conclusion(answer: str) -> bool:
 class Generator:
     """Build RAG prompts and call the configured LLM."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.config = _generation_config()
         self.llm = get_llm_client()
         self.cache = SemanticCache()
@@ -493,7 +494,7 @@ class Generator:
         logger.info(
             "Generating answer with retrieved contexts",
             extra={
-                "query": query,
+                "query_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest(),
                 "context_doc_count": len(context_docs),
                 "context_docs": _doc_debug_summary(context_docs),
             },

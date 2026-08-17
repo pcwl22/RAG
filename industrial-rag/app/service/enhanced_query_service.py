@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.llm.model import get_llm_client
+from app.retrieval.factory import build_retrieval_engine
 from app.retrieval.hybrid import HybridRetrievalEngine
 from app.retrieval.query_understanding import QueryUnderstanding
 from app.retrieval.reranker import rerank_documents
@@ -312,7 +313,7 @@ class EnhancedQueryService:
         generator: Generator | None = None,
     ) -> None:
         self.query_understanding = query_understanding or QueryUnderstanding()
-        self.retrieval_engine = retrieval_engine or HybridRetrievalEngine()
+        self.retrieval_engine = retrieval_engine or build_retrieval_engine()
         self.generator = generator or Generator()
 
     async def understand(self, options: EnhancedQueryOptions) -> dict[str, Any]:

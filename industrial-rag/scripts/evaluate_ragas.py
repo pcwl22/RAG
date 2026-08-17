@@ -7,6 +7,7 @@ import os
 import sys
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -29,7 +30,7 @@ def _package_version() -> str | None:
         return None
 
 
-def _build_llm(args: argparse.Namespace):
+def _build_llm(args: argparse.Namespace) -> Any:
     try:
         from dotenv import load_dotenv
         from openai import AsyncOpenAI

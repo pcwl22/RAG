@@ -20,12 +20,12 @@ class _Chunk:
 
 
 class _Completions:
-    def create(self, **kwargs):
+    async def create(self, **kwargs):
         assert kwargs["stream"] is True
 
-        def _chunks():
+        async def _chunks():
             yield _Chunk("第一段")
-            time.sleep(0.25)
+            await asyncio.sleep(0.25)
             yield _Chunk("第二段")
 
         return _chunks()
@@ -35,17 +35,17 @@ class _Chat:
     completions = _Completions()
 
 
-class _ZhipuClient:
+class _OpenAICompatibleClient:
     chat = _Chat()
 
 
-def test_zhipu_stream_yields_first_chunk_without_buffering_entire_response():
+def test_openai_compatible_stream_yields_first_chunk_without_buffering_entire_response():
     client = object.__new__(LLMClient)
     client.config = {"model_name": "glm-4-plus"}
-    client._client = _ZhipuClient()
+    client._client = _OpenAICompatibleClient()
 
     async def collect():
-        stream = client._generate_zhipu_stream("prompt", None, 0.1, 128)
+        stream = client._generate_openai_stream("prompt", None, 0.1, 128)
         start = time.perf_counter()
         first = await anext(stream)
         first_elapsed = time.perf_counter() - start
@@ -57,3 +57,67 @@ def test_zhipu_stream_yields_first_chunk_without_buffering_entire_response():
     assert first == "第一段"
     assert first_elapsed < 0.15
     assert rest == ["第二段"]
+
+
+def test_llm_health_probe_is_cached():
+    class Models:
+        def __init__(self):
+            self.calls = 0
+
+        async def list(self):
+            self.calls += 1
+            return []
+
+    client = object.__new__(LLMClient)
+    client.provider = "openai_compatible"
+    client.config = {"healthcheck_ttl_seconds": 30}
+    client._client = type("Client", (), {"models": Models()})()
+    client._health_lock = asyncio.Lock()
+    client._health_checked_at = 0.0
+    client._health_available = False
+
+    async def probe():
+        assert await client.check_health() is True
+        assert await client.check_health() is True
+
+    asyncio.run(probe())
+    assert client._client.models.calls == 1
+
+
+def test_generation_failure_requires_probe_instead_of_poisoning_readiness():
+    class Models:
+        def __init__(self):
+            self.calls = 0
+
+        async def list(self):
+            self.calls += 1
+            return []
+
+    class Completions:
+        async def create(self, **_kwargs):
+            raise ValueError("request context is invalid")
+
+    client = object.__new__(LLMClient)
+    client.provider = "openai_compatible"
+    client.config = {"healthcheck_ttl_seconds": 30}
+    client._client = type(
+        "Client",
+        (),
+        {"models": Models(), "chat": type("Chat", (), {"completions": Completions()})()},
+    )()
+    client._health_lock = asyncio.Lock()
+    client._health_checked_at = time.monotonic()
+    client._health_available = True
+
+    async def run():
+        try:
+            await client.generate("bad request")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("generation failure was swallowed")
+        assert client._health_checked_at == 0.0
+        assert await client.check_health() is True
+
+    asyncio.run(run())
+    assert client._client.models.calls == 1

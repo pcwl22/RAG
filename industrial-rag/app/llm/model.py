@@ -8,33 +8,36 @@ LLM 模型接口封装
 
 统一接口：generate() / generate_stream()，根据配置自动选择 Provider。
 """
+import asyncio
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
-from app.utils.config import get_settings
+from app.utils.config import get_config_section
 from app.utils.logger import get_logger
+from app.utils.metrics import LLM_DURATION, LLM_REQUESTS
 
 logger = get_logger(__name__)
 
 # 全局 LLM 客户端实例
-_llm_client: Any = None
+_llm_client: "LLMClient | None" = None
 
 
-def _llm_config() -> dict:
+def _llm_config() -> dict[str, Any]:
     """获取 LLM 配置。"""
-    return get_settings().get("llm", {}).get("text", {})
+    return get_config_section("llm", "text")
 
 
 def _get_provider() -> str:
     """获取当前配置的 Provider。"""
     cfg = _llm_config()
-    return cfg.get("provider", "claude").lower()
+    return str(cfg.get("provider", "claude")).lower()
 
 
 class LLMClient:
     """LLM 客户端，根据配置选择不同的 Provider。"""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.provider = _get_provider()
         self.config = _llm_config().get(self.provider, {})
 
@@ -45,15 +48,47 @@ class LLMClient:
 
         logger.info(f"Initializing LLM client: {self.provider}")
         self._client = self._init_client()
+        self._health_lock = asyncio.Lock()
+        self._health_checked_at = 0.0
+        self._health_available: bool = False
+
+    def _record_health(self, available: bool) -> None:
+        self._health_available = available
+        self._health_checked_at = time.monotonic()
+
+    def _invalidate_health(self) -> None:
+        """Require a live probe without treating every request error as an outage."""
+        self._health_checked_at = 0.0
+
+    async def check_health(self, *, force: bool = False) -> bool:
+        """Check upstream availability while caching the result for readiness probes."""
+        ttl = max(1.0, float(self.config.get("healthcheck_ttl_seconds", 30)))
+        now = time.monotonic()
+        if not force and self._health_checked_at and now - self._health_checked_at < ttl:
+            return self._health_available
+
+        async with self._health_lock:
+            now = time.monotonic()
+            if not force and self._health_checked_at and now - self._health_checked_at < ttl:
+                return self._health_available
+            try:
+                if self.provider == "claude":
+                    await self._client.models.list(limit=1)
+                else:
+                    await self._client.models.list()
+            except Exception:
+                self._record_health(False)
+                logger.warning("LLM upstream health probe failed", exc_info=True)
+                return False
+            self._record_health(True)
+            return True
 
     def _init_client(self) -> Any:
         """根据 Provider 初始化对应的客户端。"""
         if self.provider == "claude":
             return self._init_claude()
-        elif self.provider in ("openai_compatible", "deepseek"):
+        elif self.provider in ("openai_compatible", "deepseek", "zhipu"):
             return self._init_openai_compatible()
-        elif self.provider == "zhipu":
-            return self._init_zhipu()
         else:
             raise ValueError(f"Unsupported LLM provider: {self.provider}")
 
@@ -97,22 +132,6 @@ class LLMClient:
             timeout=self.config.get("timeout", 60),
         )
 
-    def _init_zhipu(self) -> Any:
-        """初始化智谱 AI 客户端。"""
-        try:
-            from zhipuai import ZhipuAI
-        except ImportError as exc:
-            raise ImportError("zhipuai package not installed. Run: pip install zhipuai") from exc
-
-        api_key = self.config.get("api_key")
-        if not api_key or api_key.startswith("${"):
-            raise ValueError(
-                "ZHIPU_API_KEY not set. Please set it in .env or environment."
-            )
-
-        # 智谱 AI SDK 可能是同步的，这里做个简单封装
-        return ZhipuAI(api_key=api_key)
-
     async def generate(
         self,
         prompt: str,
@@ -132,14 +151,36 @@ class LLMClient:
         Returns:
             生成的文本
         """
-        if self.provider == "claude":
-            return await self._generate_claude(prompt, system_prompt, temperature, max_tokens)
-        elif self.provider in ("openai_compatible", "deepseek"):
-            return await self._generate_openai(prompt, system_prompt, temperature, max_tokens)
-        elif self.provider == "zhipu":
-            return await self._generate_zhipu(prompt, system_prompt, temperature, max_tokens)
+        started = time.perf_counter()
+        outcome = "success"
+        try:
+            if self.provider == "claude":
+                result = await self._generate_claude(prompt, system_prompt, temperature, max_tokens)
+            elif self.provider in ("openai_compatible", "deepseek", "zhipu"):
+                result = await self._generate_openai(prompt, system_prompt, temperature, max_tokens)
+            else:
+                raise ValueError(f"Unsupported provider: {self.provider}")
+        except Exception:
+            outcome = "error"
+            # A request can fail because of user input, context limits, content
+            # policy, or provider-side validation. Those are not readiness
+            # signals. Force the next readiness check to perform its own bounded
+            # upstream probe instead of taking the whole instance out of service.
+            self._invalidate_health()
+            raise
         else:
-            raise ValueError(f"Unsupported provider: {self.provider}")
+            self._record_health(True)
+            return result
+        finally:
+            LLM_REQUESTS.labels(
+                provider=self.provider,
+                operation="generate",
+                outcome=outcome,
+            ).inc()
+            LLM_DURATION.labels(
+                provider=self.provider,
+                operation="generate",
+            ).observe(time.perf_counter() - started)
 
     async def generate_stream(
         self,
@@ -160,23 +201,37 @@ class LLMClient:
         Yields:
             生成的文本片段
         """
-        if self.provider == "claude":
-            async for chunk in self._generate_claude_stream(
-                prompt, system_prompt, temperature, max_tokens
-            ):
-                yield chunk
-        elif self.provider in ("openai_compatible", "deepseek"):
-            async for chunk in self._generate_openai_stream(
-                prompt, system_prompt, temperature, max_tokens
-            ):
-                yield chunk
-        elif self.provider == "zhipu":
-            async for chunk in self._generate_zhipu_stream(
-                prompt, system_prompt, temperature, max_tokens
-            ):
-                yield chunk
+        started = time.perf_counter()
+        outcome = "success"
+        try:
+            if self.provider == "claude":
+                async for chunk in self._generate_claude_stream(
+                    prompt, system_prompt, temperature, max_tokens
+                ):
+                    yield chunk
+            elif self.provider in ("openai_compatible", "deepseek", "zhipu"):
+                async for chunk in self._generate_openai_stream(
+                    prompt, system_prompt, temperature, max_tokens
+                ):
+                    yield chunk
+            else:
+                raise ValueError(f"Unsupported provider: {self.provider}")
+        except Exception:
+            outcome = "error"
+            self._invalidate_health()
+            raise
         else:
-            raise ValueError(f"Unsupported provider: {self.provider}")
+            self._record_health(True)
+        finally:
+            LLM_REQUESTS.labels(
+                provider=self.provider,
+                operation="stream",
+                outcome=outcome,
+            ).inc()
+            LLM_DURATION.labels(
+                provider=self.provider,
+                operation="stream",
+            ).observe(time.perf_counter() - started)
 
     # --------------------------------------------------------------------------
     # Claude 实现
@@ -195,7 +250,7 @@ class LLMClient:
             kwargs["system"] = system_prompt
 
         response = await self._client.messages.create(**kwargs)
-        return response.content[0].text
+        return str(response.content[0].text)
 
     async def _generate_claude_stream(
         self, prompt: str, system_prompt: str | None, temperature: float | None, max_tokens: int | None
@@ -251,85 +306,6 @@ class LLMClient:
         async for chunk in stream:
             if chunk.choices[0].delta.content:
                 yield chunk.choices[0].delta.content
-
-    # --------------------------------------------------------------------------
-    # 智谱 AI 实现
-    # --------------------------------------------------------------------------
-    async def _generate_zhipu(
-        self, prompt: str, system_prompt: str | None, temperature: float | None, max_tokens: int | None
-    ) -> str:
-        """智谱 AI SDK 是同步的，这里用 asyncio.to_thread 包装。"""
-        import asyncio
-
-        messages = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": prompt})
-
-        def _call():
-            response = self._client.chat.completions.create(
-                model=self.config.get("model_name", "glm-4-plus"),
-                messages=messages,
-                temperature=temperature if temperature is not None else self.config.get("temperature", 0.7),
-                max_tokens=max_tokens if max_tokens is not None else self.config.get("max_tokens", 4096),
-            )
-            return response.choices[0].message.content or ""
-
-        return await asyncio.to_thread(_call)
-
-    async def _generate_zhipu_stream(
-        self, prompt: str, system_prompt: str | None, temperature: float | None, max_tokens: int | None
-    ) -> AsyncIterator[str]:
-        """智谱 AI 流式输出（若 SDK 支持）。"""
-        import asyncio
-
-        messages = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": prompt})
-
-        def _stream():
-            response = self._client.chat.completions.create(
-                model=self.config.get("model_name", "glm-4-plus"),
-                messages=messages,
-                temperature=temperature if temperature is not None else self.config.get("temperature", 0.7),
-                max_tokens=max_tokens if max_tokens is not None else self.config.get("max_tokens", 4096),
-                stream=True,
-            )
-            for chunk in response:
-                if chunk.choices[0].delta.content:
-                    yield chunk.choices[0].delta.content
-
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[Any] = asyncio.Queue()
-        sentinel = object()
-
-        def _worker() -> None:
-            try:
-                for chunk in _stream():
-                    loop.call_soon_threadsafe(queue.put_nowait, chunk)
-            except Exception as exc:
-                loop.call_soon_threadsafe(queue.put_nowait, exc)
-            finally:
-                loop.call_soon_threadsafe(queue.put_nowait, sentinel)
-
-        worker = asyncio.create_task(asyncio.to_thread(_worker))
-        completed = False
-        try:
-            while True:
-                item = await queue.get()
-                if item is sentinel:
-                    completed = True
-                    break
-                if isinstance(item, Exception):
-                    raise item
-                yield item
-        finally:
-            if completed or worker.done():
-                await worker
-            else:
-                worker.cancel()
-
 
 def get_llm_client() -> LLMClient:
     """获取全局 LLM 客户端实例（单例）。"""

@@ -1,0 +1,7 @@
+* @pcwl22
+
+/.github/workflows/ @pcwl22
+/industrial-rag/app/auth.py @pcwl22
+/industrial-rag/app/security.py @pcwl22
+/industrial-rag/app/vectorstore/migrations/ @pcwl22
+/industrial-rag/eval/ @pcwl22

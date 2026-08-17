@@ -1,131 +1,97 @@
-"""
-重新上传并分块脚本
-直接使用上传目录中的文档重新处理
-"""
+"""Reprocess uploaded documents for one tenant through the canonical ingest path."""
+
+from __future__ import annotations
+
+import argparse
 import asyncio
+import json
+import re
 import sys
-import uuid
 from pathlib import Path
 
-project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(project_root))
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.embedding.embedder import encode_texts  # noqa: E402
-from app.parser.chunk import ParentChildChunker  # noqa: E402
-from app.service.ingest_service import parse_document  # noqa: E402
+from app.auth import normalize_tenant_id  # noqa: E402
+from app.service.ingest_service import process_document  # noqa: E402
+from app.utils.config import get_settings  # noqa: E402
 from app.utils.logger import get_logger  # noqa: E402
-from app.vectorstore.postgres_store import (  # noqa: E402
-    add_documents,
-    close_postgres_store,
-    init_postgres_store,
+from app.vectorstore.storage_adapter import (  # noqa: E402
+    close_vector_store,
+    init_vector_store,
 )
 
 logger = get_logger(__name__)
+_UUID_PREFIX = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}_"
+)
 
 
-async def reprocess_documents():
-    """重新处理上传目录中的所有文档"""
-    logger.info("开始重新处理文档...")
+def _configured_upload_dir() -> Path:
+    configured = get_settings().get("document_processing", {}).get("upload_dir", "./data/uploads")
+    path = Path(str(configured)).expanduser()
+    return path if path.is_absolute() else PROJECT_ROOT / path
 
-    # 初始化存储
-    await init_postgres_store()
 
+def _original_filename(path: Path) -> str:
+    return _UUID_PREFIX.sub("", path.name, count=1) or path.name
+
+
+async def reprocess_documents(
+    tenant_id: str,
+    *,
+    upload_dir: str | Path | None = None,
+    pattern: str = "*.pdf",
+) -> dict[str, int]:
+    """Reprocess matching files for one tenant with idempotent source replacement."""
+    resolved_tenant = normalize_tenant_id(tenant_id)
+    source_dir = Path(upload_dir).expanduser() if upload_dir is not None else _configured_upload_dir()
+    if not source_dir.is_absolute():
+        source_dir = PROJECT_ROOT / source_dir
+    files = sorted(path for path in source_dir.glob(pattern) if path.is_file())
+    logger.info("Found %s files for tenant %s in %s", len(files), resolved_tenant, source_dir)
+
+    await init_vector_store()
+    processed = 0
+    failed = 0
     try:
-        # 查找所有PDF文件
-        upload_dir = Path("E:/RAG/industrial-rag/data/uploads")
-        pdf_files = list(upload_dir.glob("*.pdf"))
-
-        logger.info(f"找到 {len(pdf_files)} 个PDF文件")
-
-        if not pdf_files:
-            logger.info("没有文件需要处理")
-            return
-
-        # 初始化分块器
-        chunker = ParentChildChunker(
-            parent_min_tokens=1500,
-            parent_max_tokens=3000,
-            child_min_tokens=300,
-            child_max_tokens=800,
-        )
-
-        total_processed = 0
-        total_failed = 0
-
-        for pdf_file in pdf_files:
-            filename = pdf_file.name
-            # 提取原始文件名（去掉UUID前缀）
-            if "_" in filename:
-                original_filename = filename.split("_", 1)[1]
-            else:
-                original_filename = filename
-
-            logger.info(f"处理文件: {original_filename}")
-
+        for source in files:
+            filename = _original_filename(source)
             try:
-                # 1. 解析PDF
-                text = parse_document(str(pdf_file))
-
-                if not text or len(text.strip()) < 50:
-                    logger.warning(f"跳过 {original_filename}：内容太短")
-                    total_failed += 1
-                    continue
-
-                # 2. 生成新的document_id
-                document_id = str(uuid.uuid4())
-
-                # 3. 使用新策略分块
-                parent_chunks, child_chunks = chunker.chunk_document(
-                    text=text,
-                    document_id=document_id,
-                    filename=original_filename,
+                result = await process_document(
+                    str(source),
+                    filename,
                     partition="general",
+                    metadata={"source": "reprocess-script"},
+                    tenant_id=resolved_tenant,
                 )
-
-                logger.info(
-                    f"生成分块: {len(parent_chunks)} 个父块, {len(child_chunks)} 个子块"
-                )
-
-                # 4. 准备子块数据（用于检索）
-                chunk_texts = [chunk.content for chunk in child_chunks]
-                chunk_ids = [chunk.id for chunk in child_chunks]
-                chunk_metadatas = [chunk.metadata for chunk in child_chunks]
-
-                # 5. 生成 Embedding
-                logger.info(f"生成 Embedding: {len(chunk_texts)} 个子块")
-                embeddings = []
-                batch_size = 16
-
-                for start in range(0, len(chunk_texts), batch_size):
-                    batch = chunk_texts[start : start + batch_size]
-                    embeddings.extend(encode_texts(batch, batch_size=len(batch)))
-
-                # 6. 存储到数据库
-                await add_documents(
-                    ids=chunk_ids,
-                    embeddings=embeddings,
-                    documents=chunk_texts,
-                    metadatas=chunk_metadatas,
-                    partition="general",
-                )
-
-                logger.info(f"[OK] 文档处理完成: {original_filename}")
-                total_processed += 1
-
-            except Exception as e:
-                logger.error(f"[FAIL] 文档处理失败 {original_filename}: {e}", exc_info=True)
-                total_failed += 1
-
-        logger.info(f"""
-重新处理任务完成！
-- 成功: {total_processed}
-- 失败: {total_failed}
-- 总计: {len(pdf_files)}
-        """)
-
+                if result.get("status") != "completed":
+                    raise RuntimeError(result.get("error") or "document processing failed")
+                processed += 1
+                logger.info("Reprocessed %s (%s chunks)", filename, result.get("total_chunks", 0))
+            except Exception as exc:
+                failed += 1
+                logger.error("Failed to reprocess %s: %s", source, exc, exc_info=True)
     finally:
-        await close_postgres_store()
+        await close_vector_store()
+
+    return {"processed": processed, "failed": failed, "total": len(files)}
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--tenant-id", required=True, help="Tenant UUID that owns the source files")
+    parser.add_argument("--upload-dir", help="Override the configured upload directory")
+    parser.add_argument("--pattern", default="*.pdf", help="Glob pattern, default: *.pdf")
+    args = parser.parse_args()
+    result = asyncio.run(
+        reprocess_documents(args.tenant_id, upload_dir=args.upload_dir, pattern=args.pattern)
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    if result["failed"]:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
-    asyncio.run(reprocess_documents())
+    main()

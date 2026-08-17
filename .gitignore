@@ -33,6 +33,7 @@ coverage/
 # Local services and generated data
 /industrial-rag/data/
 /industrial-rag/.pycache_tmp/
+/industrial-rag/.pytest_tmp*/
 /models/
 
 # Removed/unused frontend

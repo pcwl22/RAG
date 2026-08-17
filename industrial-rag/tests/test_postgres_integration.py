@@ -3,8 +3,10 @@ import asyncio
 import json
 import os
 
+import psycopg2
 import pytest
 
+from app.auth import Principal, reset_current_principal, set_current_principal
 from app.utils.config import get_settings
 from app.vectorstore import postgres_store
 
@@ -26,7 +28,57 @@ def _integration_config() -> dict:
         "max_pool_size": 3,
         "connect_timeout": 5,
         "command_timeout": 30,
+        "auto_migrate": True,
     }
+
+
+def test_real_postgres_runtime_role_has_no_owner_privileges(monkeypatch):
+    runtime_user = os.getenv("POSTGRES_RUNTIME_USER")
+    runtime_password = os.getenv("POSTGRES_RUNTIME_PASSWORD")
+    if not runtime_user or not runtime_password:
+        pytest.skip("runtime-role provisioning is not configured")
+
+    monkeypatch.setattr(postgres_store, "_postgres_config", _integration_config)
+    monkeypatch.setattr(postgres_store, "_embedding_dimension", lambda: 1024)
+
+    async def migrate():
+        await postgres_store.close_postgres_store()
+        await postgres_store.init_postgres_store()
+        await postgres_store.close_postgres_store()
+
+    asyncio.run(migrate())
+
+    cfg = _integration_config()
+    conn = psycopg2.connect(
+        host=cfg["host"],
+        port=cfg["port"],
+        database=cfg["database"],
+        user=runtime_user,
+        password=runtime_password,
+    )
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT rolsuper, rolcreatedb, rolcreaterole, rolbypassrls "
+            "FROM pg_roles WHERE rolname = current_user"
+        )
+        assert cur.fetchone() == (False, False, False, False)
+
+        with pytest.raises(psycopg2.errors.InsufficientPrivilege):
+            cur.execute("SELECT COUNT(*) FROM documents")
+        conn.rollback()
+
+        cur.execute("SET LOCAL ROLE rag_app")
+        cur.execute(
+            "SELECT set_config('app.tenant_id', %s, true)",
+            ("00000000-0000-0000-0000-000000000001",),
+        )
+        cur.execute("SELECT COUNT(*) FROM documents")
+        assert int(cur.fetchone()[0]) >= 0
+    finally:
+        cur.close()
+        conn.rollback()
+        conn.close()
 
 
 def test_real_postgres_schema_health_and_citation_pairing(monkeypatch):
@@ -37,6 +89,39 @@ def test_real_postgres_schema_health_and_citation_pairing(monkeypatch):
         await postgres_store.close_postgres_store()
         await postgres_store.init_postgres_store()
         assert await postgres_store.check_postgres_health() is True
+
+        conn = postgres_store._connection()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE oid = 'documents'::regclass"
+            )
+            assert cur.fetchone() == (True, True)
+            cur.execute(
+                "SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = 'rag_app'"
+            )
+            assert cur.fetchone() == (False, False)
+            cur.execute(
+                """
+                SELECT array_agg(attribute.attname ORDER BY key_column.ordinality)
+                FROM pg_constraint AS constraint_row
+                CROSS JOIN LATERAL unnest(constraint_row.conkey)
+                    WITH ORDINALITY AS key_column(attnum, ordinality)
+                JOIN pg_attribute AS attribute
+                  ON attribute.attrelid = constraint_row.conrelid
+                 AND attribute.attnum = key_column.attnum
+                WHERE constraint_row.conrelid = 'public.documents'::regclass
+                  AND constraint_row.contype = 'p'
+                """
+            )
+            assert cur.fetchone()[0] == ["tenant_id", "id"]
+            cur.execute(
+                "SELECT migration_id, checksum FROM rag_schema_migrations ORDER BY migration_id"
+            )
+            assert cur.fetchall() == sorted(postgres_store.SCHEMA_MIGRATIONS)
+        finally:
+            cur.close()
+            postgres_store._return_connection(conn)
 
         rows = [
             ("pair-civil-1", "民法典第一条", "中华人民共和国民法典", "第一条"),
@@ -148,6 +233,93 @@ def test_real_postgres_schema_health_and_citation_pairing(monkeypatch):
                     "DELETE FROM documents WHERE id = ANY(%s) OR metadata->>'source_key' = %s",
                     ([row[0] for row in rows], "integration-replace-source"),
                 )
+                conn.commit()
+            finally:
+                cur.close()
+                postgres_store._return_connection(conn)
+            await postgres_store.close_postgres_store()
+
+    asyncio.run(run())
+
+
+def test_real_postgres_prevents_cross_tenant_read_and_delete(monkeypatch):
+    monkeypatch.setattr(postgres_store, "_postgres_config", _integration_config)
+    monkeypatch.setattr(postgres_store, "_embedding_dimension", lambda: 1024)
+    tenant_a = "00000000-0000-0000-0000-00000000000a"
+    tenant_b = "00000000-0000-0000-0000-00000000000b"
+    row_a = "tenant-isolation-a"
+    row_b = "tenant-isolation-b"
+
+    async def as_tenant(tenant_id, operation):
+        token = set_current_principal(
+            Principal(f"user-{tenant_id[-1]}", tenant_id, frozenset({"admin"}), "test")
+        )
+        try:
+            return await operation()
+        finally:
+            reset_current_principal(token)
+
+    async def run():
+        await postgres_store.close_postgres_store()
+        await postgres_store.init_postgres_store()
+        conn = postgres_store._connection()
+        cur = conn.cursor()
+        try:
+            cur.executemany(
+                """
+                INSERT INTO rag_tenants (id, name) VALUES (%s::uuid, %s)
+                ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name
+                """,
+                [(tenant_a, "Tenant A"), (tenant_b, "Tenant B")],
+            )
+            cur.execute("DELETE FROM documents WHERE id = ANY(%s)", ([row_a, row_b],))
+            conn.commit()
+        finally:
+            cur.close()
+            postgres_store._return_connection(conn)
+
+        vector = [0.0] * 1024
+        try:
+            await as_tenant(
+                tenant_a,
+                lambda: postgres_store.add_documents(
+                    [row_a],
+                    [vector],
+                    ["Tenant A private content"],
+                    [{"document_id": row_a}],
+                    "tenant-test",
+                ),
+            )
+            await as_tenant(
+                tenant_b,
+                lambda: postgres_store.add_documents(
+                    [row_b],
+                    [vector],
+                    ["Tenant B private content"],
+                    [{"document_id": row_b}],
+                    "tenant-test",
+                ),
+            )
+
+            docs_a = await as_tenant(
+                tenant_a,
+                lambda: postgres_store.get_documents_by_ids([row_a, row_b], "tenant-test"),
+            )
+            assert [doc["id"] for doc in docs_a] == [row_a]
+            assert await as_tenant(
+                tenant_a, lambda: postgres_store.delete_document(row_b)
+            ) is False
+
+            docs_b = await as_tenant(
+                tenant_b,
+                lambda: postgres_store.get_documents_by_ids([row_a, row_b], "tenant-test"),
+            )
+            assert [doc["id"] for doc in docs_b] == [row_b]
+        finally:
+            conn = postgres_store._connection()
+            cur = conn.cursor()
+            try:
+                cur.execute("DELETE FROM documents WHERE id = ANY(%s)", ([row_a, row_b],))
                 conn.commit()
             finally:
                 cur.close()

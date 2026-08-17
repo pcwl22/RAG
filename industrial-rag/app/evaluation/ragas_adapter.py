@@ -194,7 +194,7 @@ def evaluate_samples(
     """Run Ragas collection metrics and return aggregate plus case-level scores."""
     names = validate_metric_names(metric_names)
     metrics = _metric_instances(llm, names)
-    case_results = {
+    case_results: dict[str, dict[str, Any]] = {
         sample.case_id: {
             "id": sample.case_id,
             "question": sample.user_input,

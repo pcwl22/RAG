@@ -1,7 +1,8 @@
 """Shared retrieval parameter defaults for API routes."""
 from dataclasses import dataclass
+from typing import Any
 
-from app.utils.config import get_settings
+from app.utils.config import get_config_section
 
 
 @dataclass(frozen=True)
@@ -11,8 +12,8 @@ class RetrievalParams:
     enable_rerank: bool
 
 
-def _retrieval_config() -> dict:
-    return get_settings().get("rag", {}).get("retrieval", {})
+def _retrieval_config() -> dict[str, Any]:
+    return get_config_section("rag", "retrieval")
 
 
 def resolve_retrieval_params(

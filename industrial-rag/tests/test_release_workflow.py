@@ -73,6 +73,43 @@ def test_release_workflow_policy_rejects_security_regressions(
     assert any(expected in error for error in validate_workflow(path))
 
 
+def test_release_workflow_registry_authentication_uses_ephemeral_job_token(tmp_path: Path):
+    path = _mutated_workflow(
+        tmp_path,
+        "REGISTRY_TOKEN: ${{ github.token }}",
+        "REGISTRY_TOKEN: ${{ secrets.RAG_EVALUATION_ENV_B64 }}",
+    )
+
+    assert any(
+        "prepare-evaluation registry authentication must source REGISTRY_TOKEN from github.token"
+        in error
+        for error in validate_workflow(path)
+    )
+
+
+def test_release_workflow_registry_login_requires_password_stdin(tmp_path: Path):
+    path = _mutated_workflow(tmp_path, "--password-stdin", "--password unsafe-command-argument")
+
+    assert any(
+        "prepare-evaluation registry authentication is missing required invariant: --password-stdin"
+        in error
+        for error in validate_workflow(path)
+    )
+
+
+def test_release_workflow_registry_logout_is_always_run_and_final(tmp_path: Path):
+    path = _mutated_workflow(
+        tmp_path,
+        "- name: Remove repository package credentials\n        if: always()",
+        "- name: Remove repository package credentials\n        if: success()",
+    )
+
+    assert (
+        "prepare-evaluation registry credential cleanup must run with always()"
+        in validate_workflow(path)
+    )
+
+
 def test_release_workflow_rejects_evaluation_dependencies_in_deploy(tmp_path: Path):
     path = _mutated_workflow(
         tmp_path,

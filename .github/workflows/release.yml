@@ -204,6 +204,16 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      - name: Authenticate to repository package namespace
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$REGISTRY_TOKEN"
+          printf '%s' "$REGISTRY_TOKEN" |
+            docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
       - name: Initialize isolated evaluation paths
         shell: bash
         run: |
@@ -600,6 +610,11 @@ jobs:
         run: |
           rm -f "$EVALUATION_ENV_FILE" "$EVALUATION_RUNTIME_FILE"
 
+      - name: Remove repository package credentials
+        if: always()
+        shell: bash
+        run: docker logout ghcr.io > /dev/null 2>&1 || true
+
   ragas-judge:
     needs: prepare-evaluation
     runs-on: ubuntu-latest
@@ -780,6 +795,16 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
+
+      - name: Authenticate to repository package namespace
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$REGISTRY_TOKEN"
+          printf '%s' "$REGISTRY_TOKEN" |
+            docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
 
       - name: Initialize isolated production paths
         shell: bash
@@ -1543,3 +1568,8 @@ jobs:
             "$RUNNER_TEMP/canary-secret-name" \
             "$RUNNER_TEMP/canary-secret-uid" \
             "$RUNNER_TEMP/canary-job-uid"
+
+      - name: Remove repository package credentials
+        if: always()
+        shell: bash
+        run: docker logout ghcr.io > /dev/null 2>&1 || true

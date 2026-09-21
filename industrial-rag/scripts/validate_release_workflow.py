@@ -42,6 +42,10 @@ EXPECTED_RUNNER_LABELS = {
     "ragas-judge": {"ubuntu-latest"},
     "deploy": {"self-hosted", "rag-production"},
 }
+REGISTRY_VERIFICATION_STEPS = {
+    "prepare-evaluation": "Verify candidate signatures and source binding before execution",
+    "deploy": "Verify signed production images",
+}
 SECRET_REFERENCE = re.compile(
     r"\$\{\{\s*secrets\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}"
 )
@@ -258,6 +262,68 @@ def _validate_dependency_separation(jobs: dict[str, Any], errors: list[str]) -> 
     ):
         if forbidden in judge_text:
             errors.append(f"ragas-judge crosses its minimal boundary via {forbidden}")
+
+
+def _validate_registry_authentication(jobs: dict[str, Any], errors: list[str]) -> None:
+    for job_name, verification_step_name in REGISTRY_VERIFICATION_STEPS.items():
+        job = _as_mapping(jobs.get(job_name))
+        steps = _as_steps(job)
+        authentication_steps = [
+            step
+            for step in steps
+            if step.get("name") == "Authenticate to repository package namespace"
+        ]
+        if len(authentication_steps) != 1:
+            errors.append(
+                f"{job_name} must contain exactly one repository package authentication step"
+            )
+            continue
+
+        authentication = authentication_steps[0]
+        environment = _as_mapping(authentication.get("env"))
+        if environment.get("REGISTRY_TOKEN") != "${{ github.token }}":
+            errors.append(
+                f"{job_name} registry authentication must source REGISTRY_TOKEN from github.token"
+            )
+        authentication_run = str(authentication.get("run") or "")
+        _require_tokens(
+            f"{job_name} registry authentication",
+            authentication_run,
+            (
+                'test -n "$REGISTRY_TOKEN"',
+                "printf '%s' \"$REGISTRY_TOKEN\"",
+                "docker login ghcr.io",
+                '--username "$GITHUB_ACTOR"',
+                "--password-stdin",
+            ),
+            errors,
+        )
+
+        verification = _step(job, verification_step_name)
+        if verification is None:
+            errors.append(
+                f"{job_name} is missing the image verification step required after registry login"
+            )
+        elif steps.index(authentication) > steps.index(verification):
+            errors.append(f"{job_name} authenticates to the registry after image verification")
+
+        logout_steps = [
+            step
+            for step in steps
+            if step.get("name") == "Remove repository package credentials"
+        ]
+        if len(logout_steps) != 1:
+            errors.append(
+                f"{job_name} must contain exactly one repository package credential cleanup step"
+            )
+            continue
+        logout = logout_steps[0]
+        if "always()" not in str(logout.get("if") or ""):
+            errors.append(f"{job_name} registry credential cleanup must run with always()")
+        if "docker logout ghcr.io" not in str(logout.get("run") or ""):
+            errors.append(f"{job_name} registry credential cleanup must log out of ghcr.io")
+        if steps[-1] is not logout:
+            errors.append(f"{job_name} registry credential cleanup must be the final step")
 
 
 def _validate_artifact_chain(jobs: dict[str, Any], errors: list[str]) -> None:
@@ -494,6 +560,7 @@ def validate_workflow(path: Path) -> list[str]:
     if "preflight" in jobs:
         _validate_trusted_ref(_as_mapping(jobs["preflight"]), errors)
     _validate_dependency_separation(jobs, errors)
+    _validate_registry_authentication(jobs, errors)
     _validate_artifact_chain(jobs, errors)
     _validate_retrieval_evaluation_contract(jobs, errors)
     _validate_atomic_image_set(jobs, errors)

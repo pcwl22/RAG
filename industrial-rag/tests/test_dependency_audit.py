@@ -64,6 +64,24 @@ def test_trivy_ignore_is_scoped_to_data_only_model_bundle_images() -> None:
     assert str(exception["expired_at"]) == "2027-09-21"
 
 
+def test_security_scan_limits_sarif_gate_to_configured_severities() -> None:
+    workflow_path = PROJECT_ROOT.parent / ".github/workflows/security.yml"
+    source = workflow_path.read_text(encoding="utf-8")
+    workflow = yaml.load(source, Loader=yaml.BaseLoader)
+    supply_chain = workflow["jobs"]["supply-chain"]
+    scan = next(
+        step
+        for step in supply_chain["steps"]
+        if str(step.get("uses") or "").startswith("aquasecurity/trivy-action@")
+    )
+
+    assert scan["with"]["severity"] == "CRITICAL,HIGH"
+    assert scan["with"]["limit-severities-for-sarif"] == "true"
+    assert scan["with"]["trivyignores"] == ".trivyignore.yaml"
+    assert "GITHUB_ADVANCED_SECURITY_ENABLED" not in source
+    assert "vars.ADVANCED_SECURITY_ENABLED" in source
+
+
 def test_policy_rejects_any_vulnerability_exception(policy_root: Path) -> None:
     policy = policy_root / dependency_audit.POLICY_PATH
     policy.write_text(

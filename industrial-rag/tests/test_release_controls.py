@@ -1012,6 +1012,36 @@ def test_application_release_never_mutates_shared_platform_baseline():
     assert "Apply static production resources" not in workflow
 
 
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        ".github/workflows/release.yml",
+        ".github/workflows/publish-production-images.yml",
+    ],
+)
+def test_job_environment_does_not_use_step_only_runner_context(relative_path):
+    source = (REPOSITORY_ROOT / relative_path).read_text(encoding="utf-8")
+    workflow = yaml.load(source, Loader=yaml.BaseLoader)
+
+    for job_name, job in workflow["jobs"].items():
+        for variable, value in (job.get("env") or {}).items():
+            assert "${{ runner." not in str(value), (
+                f"{relative_path} job {job_name} env {variable} uses runner context "
+                "before a runner is allocated"
+            )
+
+
+def test_actionlint_knows_protected_self_hosted_runner_labels():
+    config = yaml.safe_load(
+        (REPOSITORY_ROOT / ".github/actionlint.yaml").read_text(encoding="utf-8")
+    )
+
+    assert set(config["self-hosted-runner"]["labels"]) == {
+        "rag-evaluation-source",
+        "rag-production",
+    }
+
+
 def test_failure_rollback_runs_after_the_last_protected_artifact_gate():
     workflow = (REPOSITORY_ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
 

@@ -46,8 +46,6 @@ jobs:
       COSIGN_CERTIFICATE_OIDC_ISSUER: https://token.actions.githubusercontent.com
       CYCLONEDX_PREDICATE_TYPE: https://cyclonedx.org/bom
       SLSA_PROVENANCE_PREDICATE_TYPE: https://slsa.dev/provenance/v1
-      PUBLISH_ARTIFACT_DIR: ${{ runner.temp }}/industrial-rag-image-publish
-      MODEL_VALIDATION_DIR: ${{ runner.temp }}/industrial-rag-model-validation
 
     steps:
       - name: Check out the exact requested source revision
@@ -55,6 +53,14 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+
+      - name: Initialize isolated publication paths
+        shell: bash
+        run: |
+          {
+            echo "PUBLISH_ARTIFACT_DIR=$RUNNER_TEMP/industrial-rag-image-publish"
+            echo "MODEL_VALIDATION_DIR=$RUNNER_TEMP/industrial-rag-model-validation"
+          } >> "$GITHUB_ENV"
 
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6

@@ -197,15 +197,21 @@ jobs:
     outputs:
       manifest_sha256: ${{ steps.prepared_manifest.outputs.sha256 }}
     env:
-      EVALUATION_ENV_FILE: ${{ runner.temp }}/rag-evaluation-source.env
-      EVALUATION_RUNTIME_FILE: ${{ runner.temp }}/rag-evaluation-runtime.env
-      PREPARED_ROOT: ${{ runner.temp }}/industrial-rag-prepared-evaluation
       PYTHONUNBUFFERED: "1"
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
           fetch-depth: 0
+
+      - name: Initialize isolated evaluation paths
+        shell: bash
+        run: |
+          {
+            echo "EVALUATION_ENV_FILE=$RUNNER_TEMP/rag-evaluation-source.env"
+            echo "EVALUATION_RUNTIME_FILE=$RUNNER_TEMP/rag-evaluation-runtime.env"
+            echo "PREPARED_ROOT=$RUNNER_TEMP/industrial-rag-prepared-evaluation"
+          } >> "$GITHUB_ENV"
 
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
@@ -609,8 +615,6 @@ jobs:
     outputs:
       manifest_sha256: ${{ steps.judged_manifest.outputs.sha256 }}
     env:
-      JUDGED_ROOT: ${{ runner.temp }}/industrial-rag-judged-evaluation
-      PREPARED_ROOT: ${{ runner.temp }}/industrial-rag-prepared-evaluation
       PYTHONUNBUFFERED: "1"
       RAGAS_DO_NOT_TRACK: "true"
     steps:
@@ -618,6 +622,14 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
+
+      - name: Initialize isolated judge paths
+        shell: bash
+        run: |
+          {
+            echo "JUDGED_ROOT=$RUNNER_TEMP/industrial-rag-judged-evaluation"
+            echo "PREPARED_ROOT=$RUNNER_TEMP/industrial-rag-prepared-evaluation"
+          } >> "$GITHUB_ENV"
 
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
@@ -759,8 +771,6 @@ jobs:
       run:
         working-directory: industrial-rag
     env:
-      ENV_FILE: ${{ runner.temp }}/rag-production.env
-      RAG_ENV_FILE: ${{ runner.temp }}/rag-production.env
       RAG_RELEASE_SNAPSHOT: "1"
       RUN_POSTGRES_INTEGRATION: "1"
       PYTHONUNBUFFERED: "1"
@@ -770,6 +780,15 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
+
+      - name: Initialize isolated production paths
+        shell: bash
+        run: |
+          {
+            echo "ENV_FILE=$RUNNER_TEMP/rag-production.env"
+            echo "RAG_ENV_FILE=$RUNNER_TEMP/rag-production.env"
+          } >> "$GITHUB_ENV"
+
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'

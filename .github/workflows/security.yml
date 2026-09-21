@@ -80,6 +80,7 @@ jobs:
           exit-code: 1
           format: sarif
           output: trivy-results.sarif
+          trivyignores: .trivyignore.yaml
 
       - name: Upload Trivy SARIF
         if: >-

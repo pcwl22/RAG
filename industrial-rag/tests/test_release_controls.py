@@ -43,7 +43,10 @@ from scripts.validate_kubernetes_manifests import (
 from scripts.validate_model_bundle_manifest import validate_manifest
 from scripts.validate_release_baseline import (
     CURRENT_SCHEMA_VERSION,
+    HASH_CONTRACT,
     REQUIRED_IMPLEMENTATION_PATHS,
+    canonical_file_sha256,
+    implementation_sha256,
 )
 from scripts.validate_release_baseline import (
     validate as validate_release_baseline,
@@ -205,6 +208,9 @@ def test_release_approval_binds_reports_to_current_protected_datasets(tmp_path):
     )
 
     assert contract["legal_expanded_240.jsonl"]["sample_count"] == 240
+    assert contract["legal_expanded_ragas_40.jsonl"]["sha256"] == canonical_file_sha256(
+        eval_dir / "legal_expanded_ragas_40.jsonl"
+    )
     with pytest.raises(ValueError, match="not bound to the current dataset"):
         _protected_dataset_contract(
             tmp_path,
@@ -351,10 +357,30 @@ def test_release_approval_produces_a_self_validating_refreshed_baseline(tmp_path
     candidate_path.write_text(json.dumps(candidate), encoding="utf-8")
 
     assert candidate["status"] == "approved"
-    assert candidate["datasets"]["legal_expanded_240.jsonl"]["sha256"] == hashes[
-        "legal_expanded_240.jsonl"
-    ]
+    assert candidate["hash_contract"] == HASH_CONTRACT
+    assert candidate["datasets"]["legal_expanded_240.jsonl"][
+        "sha256"
+    ] == canonical_file_sha256(eval_dir / "legal_expanded_240.jsonl")
     assert validate_release_baseline(candidate_path, tmp_path)["passed"] is True
+
+
+def test_release_hash_contract_normalizes_text_line_endings(tmp_path):
+    lf_path = tmp_path / "lf.txt"
+    crlf_path = tmp_path / "crlf.txt"
+    lf_path.write_bytes(b"first\nsecond\n")
+    crlf_path.write_bytes(b"first\r\nsecond\r\n")
+
+    assert canonical_file_sha256(lf_path) == canonical_file_sha256(crlf_path)
+
+    lf_root = tmp_path / "lf-root"
+    crlf_root = tmp_path / "crlf-root"
+    (lf_root / "app").mkdir(parents=True)
+    (crlf_root / "app").mkdir(parents=True)
+    (lf_root / "app/config.txt").write_bytes(b"key=value\n")
+    (crlf_root / "app/config.txt").write_bytes(b"key=value\r\n")
+    assert implementation_sha256(lf_root, ["app"]) == implementation_sha256(
+        crlf_root, ["app"]
+    )
 
 
 def test_kubernetes_secret_renderer_separates_runtime_and_migration_credentials(tmp_path):

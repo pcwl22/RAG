@@ -186,14 +186,20 @@ def test_chat_route_uses_config_threshold_by_default(monkeypatch):
     from types import SimpleNamespace
 
     import app.api.chat as chat_api
+    import app.service.chat_service as chat_service
 
     retrieve_calls = []
+
+    class UnexpectedGenerator:
+        def __init__(self):
+            raise AssertionError("RAG chat must not initialize the direct-chat generator")
 
     class FakeService:
         async def run(self, options):
             retrieve_calls.append(options)
             return SimpleNamespace(results=[DOC], answer="chat answer")
 
+    monkeypatch.setattr(chat_service, "Generator", UnexpectedGenerator)
     monkeypatch.setattr(chat_api, "EnhancedQueryService", FakeService)
 
     async def run():
@@ -214,14 +220,20 @@ def test_chat_rag_uses_history_before_last_user_turn(monkeypatch):
     from types import SimpleNamespace
 
     import app.api.chat as chat_api
+    import app.service.chat_service as chat_service
 
     captured = []
+
+    class UnexpectedGenerator:
+        def __init__(self):
+            raise AssertionError("RAG chat must not initialize the direct-chat generator")
 
     class FakeService:
         async def run(self, options):
             captured.append(options)
             return SimpleNamespace(results=[], answer="chat answer")
 
+    monkeypatch.setattr(chat_service, "Generator", UnexpectedGenerator)
     monkeypatch.setattr(chat_api, "EnhancedQueryService", FakeService)
 
     async def run():

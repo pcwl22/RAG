@@ -30,7 +30,9 @@ from scripts.sample_eval_suite import sample_cases
 from scripts.validate_evaluation_assets import load_and_validate
 from scripts.validate_release_baseline import (
     CURRENT_SCHEMA_VERSION,
+    HASH_CONTRACT,
     REQUIRED_IMPLEMENTATION_PATHS,
+    canonical_file_sha256,
     implementation_sha256,
     validate,
 )
@@ -629,7 +631,7 @@ def test_release_baseline_is_bound_to_rag_implementation(tmp_path):
             encoding="utf-8",
         )
         datasets[name] = {
-            "sha256": hashlib.sha256(dataset.read_bytes()).hexdigest(),
+            "sha256": canonical_file_sha256(dataset),
             "sample_count": sample_count,
         }
     implementation_file = implementation_dir / "engine.py"
@@ -641,6 +643,7 @@ def test_release_baseline_is_bound_to_rag_implementation(tmp_path):
     paths = ["app/retrieval", *sorted(REQUIRED_IMPLEMENTATION_PATHS)]
     baseline = {
         "schema_version": CURRENT_SCHEMA_VERSION,
+        "hash_contract": HASH_CONTRACT,
         "status": "approved",
         "datasets": datasets,
         "checks": {"quality": {"value": 1.0, "minimum": 0.9}},

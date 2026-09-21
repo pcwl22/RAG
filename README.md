@@ -744,6 +744,9 @@ Prometheus 指标默认只在 `/internal/metrics` 暴露。生产环境应设置
 实现的统一 SHA-256。修改这些路径后，`validate_release_baseline.py` 会失败，必须先通过
 无泄漏的 240 条检索集、40 条 Ragas 代表集和 150 条 holdout 集评估，再批准新的实现指纹：
 
+基线 schema v9 使用 `sha256-canonical-text-v1`：UTF-8 文本在计算 SHA-256 前统一换行为
+LF，二进制文件保持原始字节，从而保证 Windows 与 Linux 检出的发布指纹一致。
+
 ```powershell
 python scripts\validate_evaluation_assets.py
 python scripts\evaluate_retrieval_suite.py --input eval\legal_expanded_240.jsonl --output data\ragas_eval\legal_expanded_240_retrieval.json --top-k 5

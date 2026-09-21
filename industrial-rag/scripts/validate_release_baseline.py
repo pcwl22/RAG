@@ -19,7 +19,8 @@ from app.evaluation.retrieval_contract import (  # noqa: E402
 
 EVAL_DIR = PROJECT_ROOT / "eval"
 BASELINE_PATH = EVAL_DIR / "release_baseline.json"
-CURRENT_SCHEMA_VERSION = 8
+CURRENT_SCHEMA_VERSION = 9
+HASH_CONTRACT = "sha256-canonical-text-v1"
 EXPECTED_EVALUATION_ENGINE = "industrial-rag-native-text-judge"
 EXPECTED_EVALUATION_ENGINE_VERSION = "1.1"
 REQUIRED_DATASETS = {
@@ -63,12 +64,19 @@ REQUIRED_IMPLEMENTATION_PATHS = frozenset(
 )
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def canonical_file_bytes(path: Path) -> bytes:
+    """Return portable bytes for a text file and unchanged bytes for binary data."""
+    raw = path.read_bytes()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw
+    return text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
+
+
+def canonical_file_sha256(path: Path) -> str:
+    """Hash a file under the release baseline's cross-platform byte contract."""
+    return hashlib.sha256(canonical_file_bytes(path)).hexdigest()
 
 
 def _sample_count(path: Path) -> int:
@@ -162,9 +170,7 @@ def implementation_sha256(project_root: Path, paths: list[str]) -> str:
         relative = path.relative_to(project_root).as_posix().encode("utf-8")
         digest.update(len(relative).to_bytes(4, "big"))
         digest.update(relative)
-        with path.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
+        digest.update(canonical_file_bytes(path))
     return digest.hexdigest()
 
 
@@ -179,6 +185,8 @@ def validate(
     schema_version = int(baseline.get("schema_version", 0))
     if schema_version != CURRENT_SCHEMA_VERSION:
         errors.append(f"release baseline schema_version must equal {CURRENT_SCHEMA_VERSION}")
+    if baseline.get("hash_contract") != HASH_CONTRACT:
+        errors.append(f"release baseline hash_contract must equal {HASH_CONTRACT}")
 
     datasets = baseline.get("datasets", {})
     if not isinstance(datasets, dict) or set(datasets) != set(REQUIRED_DATASETS):
@@ -189,7 +197,7 @@ def validate(
         if not path.is_file():
             errors.append(f"missing dataset: {name}")
             continue
-        if _sha256(path) != expected.get("sha256"):
+        if canonical_file_sha256(path) != expected.get("sha256"):
             errors.append(f"dataset hash changed: {name}; rerun and approve the release evaluation")
         if _sample_count(path) != int(expected.get("sample_count", -1)):
             errors.append(f"dataset sample count changed: {name}")
@@ -307,6 +315,7 @@ def validate(
         "baseline": str(baseline_path.relative_to(project_root)),
         "dataset_count": len(baseline["datasets"]),
         "check_count": len(baseline["checks"]),
+        "hash_contract": HASH_CONTRACT,
         "implementation_sha256": expected_implementation_hash,
     }
 

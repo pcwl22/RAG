@@ -12,7 +12,13 @@ RUN npm ci
 COPY . .
 RUN npm run build
 
-FROM nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
+FROM nginx:1.30.5-alpine3.24@sha256:a5f2157a0302eb0c5e300415effb63a9e70ed1eb9c107283819bf6d149ab607c
 COPY nginx/default.conf.template /etc/nginx/templates/default.conf.template
 COPY --from=build /app/dist /usr/share/nginx/html
-EXPOSE 80
+RUN sed -i 's/listen 80;/listen 8080;/' /etc/nginx/templates/default.conf.template \
+    && sed -i 's|^pid[[:space:]].*;|pid /tmp/nginx.pid;|' /etc/nginx/nginx.conf \
+    && sed -i '/^user[[:space:]]/d' /etc/nginx/nginx.conf \
+    && mkdir -p /var/cache/nginx /var/run /etc/nginx/conf.d \
+    && chown -R nginx:nginx /var/cache/nginx /var/run /etc/nginx/conf.d /usr/share/nginx/html
+USER 101:101
+EXPOSE 8080

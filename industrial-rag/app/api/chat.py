@@ -81,10 +81,6 @@ async def chat(request: ChatRequest) -> ChatResponse:
         raise HTTPException(status_code=400, detail="No user message found")
 
     try:
-        from app.service.chat_service import Generator
-
-        generator = Generator()
-
         sources = None
 
         # 如果启用RAG，先检索
@@ -105,6 +101,9 @@ async def chat(request: ChatRequest) -> ChatResponse:
             answer = result.answer
         else:
             # 直接对话，不使用RAG
+            from app.service.chat_service import Generator
+
+            generator = Generator()
             answer = await generator.chat(
                 messages=[{"role": msg.role, "content": msg.content} for msg in request.messages],
                 temperature=request.temperature,
@@ -132,10 +131,6 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
 
     async def generate() -> AsyncGenerator[str, None]:
         try:
-            from app.service.chat_service import Generator
-
-            generator = Generator()
-
             # 获取最后一条用户消息
             user_message, chat_history = _last_user_message_and_history(request.messages)
             if not user_message:
@@ -161,6 +156,9 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
             else:
                 # 直接流式对话
+                from app.service.chat_service import Generator
+
+                generator = Generator()
                 async for chunk in generator.chat_stream(
                     messages=[
                         {"role": msg.role, "content": msg.content} for msg in request.messages

@@ -1,5 +1,6 @@
 {
-  "schema_version": 8,
+  "schema_version": 9,
+  "hash_contract": "sha256-canonical-text-v1",
   "status": "approved",
   "blocked_reasons": [],
   "evaluated_at": "2026-09-20T12:01:26.039583+00:00",
@@ -9,7 +10,7 @@
       "sample_count": 240
     },
     "legal_expanded_ragas_40.jsonl": {
-      "sha256": "a839b71dcc431769ab62ec30d33223e2f566131d216f9705a04fd593377de1c1",
+      "sha256": "eee0fff33344cf25852b91f57eac1771e651df862cdf8412a440bf48917c2222",
       "sample_count": 40
     },
     "legal_holdout_150.jsonl": {
@@ -71,7 +72,19 @@
       "scripts/validate_release_baseline.py",
       "security/evaluation_dependency_exceptions.toml"
     ],
-    "sha256": "2ebe54307b634a876520d1ff5730e7967548fd84367154bd19bf0666fa2f9e11"
+    "sha256": "ad3b21e12583ae3b7185c84a574f8e6c3ae7e5076d87a7545e5daf4457c5ad23"
+  },
+  "hash_contract_migration": {
+    "from_schema_version": 8,
+    "from_hash_contract": "sha256-raw-bytes-v1",
+    "reason": "Normalize UTF-8 text line endings for identical Windows and Linux release fingerprints.",
+    "evaluation_results_reused": true,
+    "previous_dataset_sha256": {
+      "legal_expanded_240.jsonl": "46d667189610583256f8e16fc6bdcb413048394fda618ef8d6a55eeef3d898f3",
+      "legal_expanded_ragas_40.jsonl": "a839b71dcc431769ab62ec30d33223e2f566131d216f9705a04fd593377de1c1",
+      "legal_holdout_150.jsonl": "c20c4d82ce9837141d7436265447133b64d47f46a1ebdad7cda2ce7cc811a760"
+    },
+    "previous_implementation_sha256": "2ebe54307b634a876520d1ff5730e7967548fd84367154bd19bf0666fa2f9e11"
   },
   "evaluation_contract": {
     "retrieval_top_k": 5,

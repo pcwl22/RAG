@@ -29,7 +29,7 @@ from app.evaluation.retrieval_contract import (  # noqa: E402
 )
 from app.utils.strict_dotenv import load_release_env_file  # noqa: E402
 
-CURRENT_SCHEMA_VERSION = 8
+CURRENT_SCHEMA_VERSION = 9
 EXPECTED_EVALUATION_ENGINE = "industrial-rag-native-text-judge"
 EXPECTED_EVALUATION_ENGINE_VERSION = "1.1"
 PROTECTED_DATASETS = {
@@ -39,11 +39,18 @@ PROTECTED_DATASETS = {
 }
 
 if TYPE_CHECKING:
-    from scripts.validate_release_baseline import implementation_sha256, validate
+    from scripts.validate_release_baseline import (
+        HASH_CONTRACT,
+        canonical_file_sha256,
+        implementation_sha256,
+        validate,
+    )
 else:
     _validator = importlib.import_module(
         "scripts.validate_release_baseline" if __package__ else "validate_release_baseline"
     )
+    HASH_CONTRACT: str = _validator.HASH_CONTRACT
+    canonical_file_sha256: Callable[[Path], str] = _validator.canonical_file_sha256
     implementation_sha256: Callable[[Path, list[str]], str] = _validator.implementation_sha256
     validate: Callable[..., dict[str, Any]] = _validator.validate
 
@@ -115,7 +122,7 @@ def _require_matching_retrieval_runtime_contract(
     return str(digests[0])
 
 
-def _sha256(path: Path) -> str:
+def _raw_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
@@ -147,8 +154,9 @@ def _protected_dataset_contract(
         path = project_root / "eval" / name
         if not path.is_file():
             raise ValueError(f"protected evaluation dataset is missing: {name}")
-        actual_hash = _sha256(path)
-        if reported_hashes[name] != actual_hash:
+        actual_hash = canonical_file_sha256(path)
+        accepted_report_hashes = {actual_hash, _raw_sha256(path)}
+        if reported_hashes[name] not in accepted_report_hashes:
             raise ValueError(f"quality gate is not bound to the current dataset: {name}")
         actual_count = _sample_count(path)
         if actual_count != expected_count:
@@ -273,6 +281,7 @@ def approve(
         raise ValueError("native judge quality gate must use retrieval top_k=5")
 
     baseline["schema_version"] = CURRENT_SCHEMA_VERSION
+    baseline["hash_contract"] = HASH_CONTRACT
     baseline["datasets"] = dataset_contract
     contract = baseline.setdefault("evaluation_contract", {})
     contract.pop("ragas_version", None)

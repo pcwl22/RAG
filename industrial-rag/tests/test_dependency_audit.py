@@ -46,6 +46,24 @@ def test_checked_in_zero_exception_policy_is_valid(policy_root: Path) -> None:
     assert dependency_audit.EXPECTED_EXCEPTIONS == {}
 
 
+def test_trivy_ignore_is_scoped_to_data_only_model_bundle_images() -> None:
+    ignore_path = PROJECT_ROOT.parent / ".trivyignore.yaml"
+    policy = yaml.safe_load(ignore_path.read_text(encoding="utf-8"))
+
+    assert set(policy) == {"misconfigurations"}
+    exceptions = policy["misconfigurations"]
+    assert len(exceptions) == 1
+    exception = exceptions[0]
+    assert exception["id"] == "DS-0002"
+    assert set(exception["paths"]) == {
+        "industrial-rag/docker/model-bundle/Dockerfile",
+        "industrial-rag/docker/model-bundle/Dockerfile.production",
+    }
+    assert "scratch" in exception["statement"]
+    assert "COPY --from" in exception["statement"]
+    assert str(exception["expired_at"]) == "2027-09-21"
+
+
 def test_policy_rejects_any_vulnerability_exception(policy_root: Path) -> None:
     policy = policy_root / dependency_audit.POLICY_PATH
     policy.write_text(

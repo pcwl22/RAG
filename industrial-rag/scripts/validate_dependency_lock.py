@@ -33,7 +33,7 @@ EXPECTED_API_BASE = (
 )
 EXPECTED_WORKER_BASE = (
     "FROM python:3.12.14-slim@"
-    "sha256:09f7da3bc104798d0afb40bc08d23ab2da20a76130cec1f2ef170848f5d85217"
+    "sha256:2f17fc044b579bab302c2e8054d3a686e2cb9a83de48e70534b94cd8ebbe06a9"
 )
 EXPECTED_RESOLVER_CONSTRAINTS = {
     "constraints-torch-cpu-linux-amd64-py312.txt": (

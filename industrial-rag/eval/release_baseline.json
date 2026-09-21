@@ -72,7 +72,7 @@
       "scripts/validate_release_baseline.py",
       "security/evaluation_dependency_exceptions.toml"
     ],
-    "sha256": "ad3b21e12583ae3b7185c84a574f8e6c3ae7e5076d87a7545e5daf4457c5ad23"
+    "sha256": "916277e231c95d9c1621f4a366ae0de5c377c4c04a8f674562042c0af9056eb8"
   },
   "hash_contract_migration": {
     "from_schema_version": 8,
@@ -86,6 +86,22 @@
     },
     "previous_implementation_sha256": "2ebe54307b634a876520d1ff5730e7967548fd84367154bd19bf0666fa2f9e11"
   },
+  "implementation_security_migrations": [
+    {
+      "from_sha256": "ad3b21e12583ae3b7185c84a574f8e6c3ae7e5076d87a7545e5daf4457c5ad23",
+      "to_sha256": "916277e231c95d9c1621f4a366ae0de5c377c4c04a8f674562042c0af9056eb8",
+      "reason": "Refresh the immutable Python 3.12.14 worker base from Debian 13.6 to its security-patched Debian 13.7 digest.",
+      "evaluation_results_reused": true,
+      "application_dependencies_changed": false,
+      "changed_paths": [
+        "docker/worker/Dockerfile.production",
+        "scripts/validate_dependency_lock.py"
+      ],
+      "previous_base_digest": "sha256:09f7da3bc104798d0afb40bc08d23ab2da20a76130cec1f2ef170848f5d85217",
+      "current_base_digest": "sha256:2f17fc044b579bab302c2e8054d3a686e2cb9a83de48e70534b94cd8ebbe06a9",
+      "current_base_high_critical_findings": 0
+    }
+  ],
   "evaluation_contract": {
     "retrieval_top_k": 5,
     "evaluation_engine": "industrial-rag-native-text-judge",

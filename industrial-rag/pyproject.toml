@@ -9,15 +9,15 @@ license = {text = "Apache-2.0"}
 
 dependencies = [
     # Core Framework
-    "fastapi>=0.139.2,<0.140",
+    "fastapi>=0.139.2,<0.142",
     "uvicorn[standard]>=0.27.0",
-    "gunicorn>=22.0,<24; platform_system != 'Windows'",
+    "gunicorn>=22.0,<27; platform_system != 'Windows'",
     "pydantic>=2.6.0",
     "pydantic-settings>=2.1.0",
 
     # LLM & RAG
     "transformers>=5.16.1,<6",
-    "torch>=2.13.0,<2.14",
+    "torch>=2.13.0,<2.15",
     "sentence-transformers>=6.0.0,<7",
 
     # LLM API Clients
@@ -98,7 +98,7 @@ dev = [
     "types-PyYAML>=6.0.12,<7",
     "types-redis>=4.6,<5",
     "types-psycopg2>=2.9,<3",
-    "pandas-stubs>=2.2,<3",
+    "pandas-stubs>=2.2,<4",
     "ipython>=8.21.0",
     "jupyter>=1.0.0",
 ]
@@ -112,7 +112,7 @@ benchmark = [
 # The protected judge is deliberately dependency-minimal. Do not add Ragas,
 # LangChain, cache deserializers, URL loaders, or multimodal fetchers here.
 evaluation = [
-    "openai==3.6.0",
+    "openai==3.15.0",
 ]
 
 [build-system]

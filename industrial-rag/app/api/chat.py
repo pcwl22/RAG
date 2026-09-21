@@ -2,12 +2,14 @@
 对话API路由
 """
 import json
+from collections.abc import AsyncGenerator
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
+from app.api.input_validation import validate_message_budget
 from app.api.retrieval_params import resolve_retrieval_params
 from app.service.enhanced_query_service import EnhancedQueryOptions, EnhancedQueryService
 from app.utils.logger import get_logger
@@ -20,7 +22,7 @@ SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 class Message(BaseModel):
     """消息"""
 
-    role: Literal["user", "assistant", "system"] = Field(..., description="角色")
+    role: Literal["user", "assistant"] = Field(..., description="角色")
     content: str = Field(..., min_length=1, max_length=8000, description="消息内容")
 
 
@@ -40,12 +42,27 @@ class ChatRequest(BaseModel):
     temperature: float = Field(default=0.7, description="非 RAG 对话生成温度", ge=0.0, le=2.0)
     max_tokens: int = Field(default=2048, description="非 RAG 对话最大生成 token 数", ge=1, le=4096)
 
+    @model_validator(mode="after")
+    def validate_total_input(self) -> "ChatRequest":
+        validate_message_budget(message.content for message in self.messages)
+        return self
+
 
 class ChatResponse(BaseModel):
     """对话响应"""
 
     message: Message
     sources: list[dict] | None = None
+
+
+def _last_user_message_and_history(
+    messages: list[Message],
+) -> tuple[Message | None, list[dict[str, str]]]:
+    """Select the current user turn and exclude any trailing stale messages."""
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].role == "user":
+            return messages[index], [message.model_dump() for message in messages[:index]]
+    return None, []
 
 
 @router.post("/chat", response_model=ChatResponse)
@@ -59,15 +76,11 @@ async def chat(request: ChatRequest) -> ChatResponse:
     Returns:
         对话响应
     """
-    user_message = next((msg for msg in reversed(request.messages) if msg.role == "user"), None)
+    user_message, chat_history = _last_user_message_and_history(request.messages)
     if not user_message:
         raise HTTPException(status_code=400, detail="No user message found")
 
     try:
-        from app.service.chat_service import Generator
-
-        generator = Generator()
-
         sources = None
 
         # 如果启用RAG，先检索
@@ -79,7 +92,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
             )
             result = await EnhancedQueryService().run(EnhancedQueryOptions(
                 query=user_message.content,
-                chat_history=[msg.model_dump() for msg in request.messages[:-1]],
+                chat_history=chat_history,
                 top_k=params.top_k,
                 similarity_threshold=params.similarity_threshold,
                 enable_rerank=params.enable_rerank,
@@ -88,6 +101,9 @@ async def chat(request: ChatRequest) -> ChatResponse:
             answer = result.answer
         else:
             # 直接对话，不使用RAG
+            from app.service.chat_service import Generator
+
+            generator = Generator()
             answer = await generator.chat(
                 messages=[{"role": msg.role, "content": msg.content} for msg in request.messages],
                 temperature=request.temperature,
@@ -102,7 +118,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
 
 
 @router.post("/chat/stream")
-async def chat_stream(request: ChatRequest):
+async def chat_stream(request: ChatRequest) -> StreamingResponse:
     """
     流式对话接口
 
@@ -113,18 +129,13 @@ async def chat_stream(request: ChatRequest):
         SSE流式响应
     """
 
-    async def generate():
+    async def generate() -> AsyncGenerator[str, None]:
         try:
-            from app.service.chat_service import Generator
-
-            generator = Generator()
-
             # 获取最后一条用户消息
-            user_message = next(
-                (msg for msg in reversed(request.messages) if msg.role == "user"), None
-            )
+            user_message, chat_history = _last_user_message_and_history(request.messages)
             if not user_message:
                 yield f"data: {json.dumps({'type': 'error', 'error': 'No user message found'}, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps({'type': 'done', 'error': True}, ensure_ascii=False)}\n\n"
                 return
 
             # 如果启用RAG，先检索并发送来源
@@ -136,7 +147,7 @@ async def chat_stream(request: ChatRequest):
                 )
                 options = EnhancedQueryOptions(
                     query=user_message.content,
-                    chat_history=[msg.model_dump() for msg in request.messages[:-1]],
+                    chat_history=chat_history,
                     top_k=params.top_k,
                     similarity_threshold=params.similarity_threshold,
                     enable_rerank=params.enable_rerank,
@@ -145,6 +156,9 @@ async def chat_stream(request: ChatRequest):
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
             else:
                 # 直接流式对话
+                from app.service.chat_service import Generator
+
+                generator = Generator()
                 async for chunk in generator.chat_stream(
                     messages=[
                         {"role": msg.role, "content": msg.content} for msg in request.messages
@@ -160,5 +174,6 @@ async def chat_stream(request: ChatRequest):
         except Exception as e:
             logger.error(f"Stream chat failed: {e}", exc_info=True)
             yield f"data: {json.dumps({'type': 'error', 'error': 'Chat stream failed'}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': 'done', 'error': True}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream", headers=SSE_HEADERS)

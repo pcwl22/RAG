@@ -24,7 +24,7 @@ echo "✓ Docker 运行正常"
 
 echo
 echo "[2/4] 启动 PostgreSQL 和 Redis..."
-if ! docker-compose up -d; then
+if ! docker compose -f ../docker-compose.yml --env-file .env up -d postgres redis; then
     echo "[错误] Docker Compose 启动失败"
     exit 1
 fi
@@ -48,4 +48,4 @@ echo "按 Ctrl+C 停止服务"
 echo "========================================"
 echo
 
-python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000

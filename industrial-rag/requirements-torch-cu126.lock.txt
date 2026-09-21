@@ -1,0 +1,5 @@
+# Windows amd64 / CPython 3.12 CUDA 12.6 Torch carrier.
+# Install only from https://download.pytorch.org/whl/cu126 with --no-deps and
+# --require-hashes. Its dependency closure is in requirements-gpu.lock.txt.
+torch==2.13.0+cu126 \
+    --hash=sha256:380081ea098bf2b9e727aa85205d94790d884d17c62df3bb00a4f6a1047010a2

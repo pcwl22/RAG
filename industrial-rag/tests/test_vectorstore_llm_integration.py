@@ -105,3 +105,184 @@ def test_openai_compatible_llm_client_with_fake_client():
         assert completions.calls[-1]["max_tokens"] == 0
 
     asyncio.run(run())
+
+
+def test_structured_output_options_are_scoped_to_official_deepseek():
+    from app.llm.model import LLMClient
+
+    class FakeCompletions:
+        def __init__(self):
+            self.calls = []
+
+        async def create(self, **kwargs):
+            self.calls.append(kwargs)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content='{"ok":true}'))]
+            )
+
+    client = LLMClient.__new__(LLMClient)
+    client.provider = "openai_compatible"
+    client.config = {
+        "model_name": "deepseek-flash",
+        "base_url": "https://api.deepseek.com",
+        "temperature": 0,
+        "max_tokens": 64,
+        "max_retries": 0,
+    }
+    completions = FakeCompletions()
+    client._client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    async def run():
+        await client.generate("prompt", structured_output=True)
+        await client.generate("prompt", structured_output=False)
+        client.config["base_url"] = "https://proxy.example/v1"
+        await client.generate("prompt", structured_output=True)
+
+    asyncio.run(run())
+
+    official, ordinary, proxy = completions.calls
+    assert official["reasoning_effort"] == "none"
+    assert official["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert official["response_format"] == {"type": "json_object"}
+    for call in (ordinary, proxy):
+        assert "reasoning_effort" not in call
+        assert "extra_body" not in call
+        assert "response_format" not in call
+
+
+def test_structured_output_policy_rejects_self_hashed_semantic_tampering():
+    import hashlib
+    import json
+
+    from app.llm.request_policy import (
+        build_structured_output_policy,
+        normalize_structured_output_policy,
+    )
+
+    policy = build_structured_output_policy(
+        provider="openai_compatible",
+        model_name="deepseek-flash",
+        base_url="https://api.deepseek.com/v1",
+    )
+    assert normalize_structured_output_policy(policy) == policy
+
+    snapshot = dict(policy["snapshot"])
+    snapshot["thinking"] = "provider_default"
+    encoded = json.dumps(
+        snapshot,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    tampered = {"sha256": hashlib.sha256(encoded).hexdigest(), "snapshot": snapshot}
+
+    assert normalize_structured_output_policy(tampered) is None
+
+
+def test_official_policy_requires_exact_secure_deepseek_endpoint():
+    from app.llm.request_policy import build_structured_output_policy
+
+    for base_url in (
+        "http://api.deepseek.com/v1",
+        "https://api.deepseek.com.evil.example/v1",
+        "https://user@api.deepseek.com/v1",
+        "https://api.deepseek.com:8443/v1",
+    ):
+        policy = build_structured_output_policy(
+            provider="openai_compatible",
+            model_name="deepseek-flash",
+            base_url=base_url,
+        )
+        assert policy["snapshot"]["mode"] == "prompt_only"
+
+
+def test_openai_compatible_sdk_retry_is_disabled(monkeypatch):
+    import openai
+
+    from app.llm.model import LLMClient
+
+    captured = {}
+
+    def fake_async_openai(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", fake_async_openai)
+    client = LLMClient.__new__(LLMClient)
+    client.provider = "openai_compatible"
+    client.config = {
+        "api_key": "test-api-key",
+        "base_url": "https://provider.example/v1",
+        "timeout": 45,
+    }
+
+    assert client._init_openai_compatible() is not None
+    assert captured["max_retries"] == 0
+    assert captured["timeout"] == 45
+
+
+def test_openai_compatible_retries_transient_gateway_function_reference_error():
+    from app.llm.model import LLMClient
+
+    class FlakyCompletions:
+        def __init__(self):
+            self.calls = 0
+
+        async def create(self, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise ValueError("Function id 'gateway-function' is not found")
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="recovered"))]
+            )
+
+    client = LLMClient.__new__(LLMClient)
+    client.provider = "openai_compatible"
+    client.config = {
+        "model_name": "fake-model",
+        "max_retries": 1,
+        "retry_backoff_seconds": 0,
+    }
+    completions = FlakyCompletions()
+    client._client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    async def run():
+        return await client.generate("prompt")
+
+    assert asyncio.run(run()) == "recovered"
+    assert completions.calls == 2
+
+
+def test_openai_compatible_retries_transport_error():
+    from app.llm.model import LLMClient
+
+    class APIConnectionError(Exception):
+        pass
+
+    class FlakyCompletions:
+        def __init__(self):
+            self.calls = 0
+
+        async def create(self, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise APIConnectionError("Connection error.")
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="recovered"))]
+            )
+
+    client = LLMClient.__new__(LLMClient)
+    client.provider = "openai_compatible"
+    client.config = {
+        "model_name": "fake-model",
+        "max_retries": 1,
+        "retry_backoff_seconds": 0,
+    }
+    completions = FlakyCompletions()
+    client._client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    async def run():
+        return await client.generate("prompt")
+
+    assert asyncio.run(run()) == "recovered"
+    assert completions.calls == 2

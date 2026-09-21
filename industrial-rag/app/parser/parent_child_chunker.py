@@ -106,7 +106,7 @@ class ParentChildChunker:
     ) -> list[Chunk]:
         """创建父块：按结构层级聚合"""
         parent_chunks = []
-        current_group = []
+        current_group: list[LegalSection] = []
         current_tokens = 0
         chunk_index = 0
 
@@ -214,7 +214,7 @@ class ParentChildChunker:
 
             # 按段落分割子块
             paragraphs = parent_content.split("\n\n")
-            current_child = []
+            current_child: list[str] = []
             current_tokens = 0
 
             for para in paragraphs:
@@ -307,7 +307,7 @@ class ParentChildChunker:
         child_chunks = []
 
         paragraphs = text.split("\n\n")
-        current_parent = []
+        current_parent: list[str] = []
         current_tokens = 0
         parent_index = 0
 

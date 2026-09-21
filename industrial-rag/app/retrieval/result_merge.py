@@ -72,8 +72,10 @@ def merge_retrieval_results(
                     "doc": doc,
                     "best_score": score,
                     "best_rank": rank,
+                    "best_query": query,
                     "appearances": 1,
                     "matched_queries": [query] if query else [],
+                    "query_retrieval_ranks": {query: rank + 1} if query else {},
                     "priority": _priority_value(doc, priority_ids),
                 }
                 continue
@@ -82,11 +84,15 @@ def merge_retrieval_results(
             item["appearances"] += 1
             if query and query not in item["matched_queries"]:
                 item["matched_queries"].append(query)
+            if query:
+                query_ranks = item["query_retrieval_ranks"]
+                query_ranks[query] = min(query_ranks.get(query, rank + 1), rank + 1)
             item["priority"] = max(item["priority"], _priority_value(doc, priority_ids))
             if (score, -rank) > (item["best_score"], -item["best_rank"]):
                 item["doc"] = doc
                 item["best_score"] = score
                 item["best_rank"] = rank
+                item["best_query"] = query
 
     ranked = sorted(
         chunks.values(),
@@ -104,8 +110,17 @@ def merge_retrieval_results(
         doc = item["doc"].copy()
         doc["score"] = item["best_score"]
         doc["merge_score"] = item["best_score"]
+        # Preserve the evidence that made a document a candidate.  The
+        # enhanced service may score the merged set against a broad common
+        # query afterwards; that score must not erase a strong score obtained
+        # for one of the independent retrieval queries.
+        doc["source_relevance_score"] = item["best_score"]
+        doc["source_retrieval_rank"] = item["best_rank"] + 1
+        if item["best_query"]:
+            doc["source_query"] = item["best_query"]
         doc["multi_query_appearances"] = item["appearances"]
         doc["matched_queries"] = item["matched_queries"]
+        doc["query_retrieval_ranks"] = item["query_retrieval_ranks"]
         if item["priority"]:
             doc["mapped_article_priority"] = item["priority"]
         merged.append(doc)

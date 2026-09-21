@@ -3,6 +3,8 @@
     <div class="header">
       <h1>🤖 RAG智能问答系统</h1>
       <div class="status">
+        <span v-if="oidcEnabled && authUserName" class="auth-user">{{ authUserName }}</span>
+        <button v-if="oidcEnabled" class="btn-tool" @click="handleSignOut">退出登录</button>
         <span :class="{ online: isOnline }">{{ isOnline ? '在线' : '离线' }}</span>
       </div>
     </div>
@@ -127,6 +129,7 @@
       :upload-partition="uploadPartition"
       :upload-progress="uploadProgress"
       :uploading="uploading"
+      :active-task-id="activeUploadTaskId"
       @close="showUpload = false"
       @update:selected-file="selectedFile = $event"
       @update:upload-partition="uploadPartition = $event"
@@ -136,12 +139,21 @@
     <DocumentsModal
       v-if="showDocuments"
       :documents="documents"
+      :document-total="documentTotal"
+      :document-page="documentPage"
+      :document-page-size="DOCUMENT_PAGE_SIZE"
+      :documents-loading="documentsLoading"
+      :documents-error="documentsError"
       :selected-doc="selectedDoc"
       :selected-doc-chunks="selectedDocChunks"
       :selected-doc-chunk-total="selectedDocChunkTotal"
+      :selected-doc-chunk-page="selectedDocChunkPage"
+      :selected-doc-chunk-page-size="CHUNK_PAGE_SIZE"
       :document-chunks-loading="documentChunksLoading"
       :document-chunks-error="documentChunksError"
       @close="showDocuments = false"
+      @change-document-page="loadDocuments"
+      @change-chunk-page="loadDocumentChunks"
       @load-chunks="loadDocumentChunks"
       @toggle-chunk="toggleDocumentChunk"
     />
@@ -177,12 +189,23 @@ import {
   readEventStream
 } from './utils/eventStream'
 import { useChatSessions } from './composables/useChatSessions'
+import { getAuthenticatedUser, oidcEnabled, signOut } from './auth/oidc.js'
+import { buildChatStorageKey } from './utils/chatStorage.js'
+import { pollDocumentTask } from './utils/uploadPolling.js'
 
 const isOnline = ref(false)
+const authUser = getAuthenticatedUser()
+const authUserName = authUser?.profile?.preferred_username || authUser?.profile?.name || ''
+const chatStorageKey = buildChatStorageKey(authUser)
 const documents = ref([])
+const documentTotal = ref(0)
+const documentPage = ref(1)
+const documentsLoading = ref(false)
+const documentsError = ref('')
 const selectedDoc = ref(null)
 const selectedDocChunks = ref([])
 const selectedDocChunkTotal = ref(0)
+const selectedDocChunkPage = ref(1)
 const documentChunksLoading = ref(false)
 const documentChunksError = ref('')
 const showDocuments = ref(false)
@@ -198,7 +221,18 @@ const {
   initChats,
   switchChat,
   updateCurrentSession
-} = useChatSessions({ onAfterSwitch: () => scrollToBottom() })
+} = useChatSessions({
+  onAfterSwitch: () => scrollToBottom(),
+  storageKey: chatStorageKey
+})
+
+const handleSignOut = async () => {
+  try {
+    localStorage.removeItem(chatStorageKey)
+  } finally {
+    await signOut()
+  }
+}
 
 const userInput = ref('')
 const isLoading = ref(false)
@@ -211,6 +245,8 @@ const selectedFile = ref(null)
 const uploadPartition = ref('general')
 const uploading = ref(false)
 const uploadProgress = ref(0)
+const activeUploadTaskId = ref('')
+const pendingUploadStorageKey = `${chatStorageKey}:pending-upload`
 
 const options = ref({
   enableUnderstanding: true,
@@ -219,7 +255,13 @@ const options = ref({
 
 const UPLOAD_POLL_INTERVAL_MS = 1000
 const UPLOAD_MAX_POLLS = 300
+const PENDING_UPLOAD_TTL_MS = 24 * 60 * 60 * 1000
+const DOCUMENT_PAGE_SIZE = 100
+const CHUNK_PAGE_SIZE = 200
 const delay = (milliseconds) => new Promise(resolve => setTimeout(resolve, milliseconds))
+let documentsRequestController = null
+let chunksRequestController = null
+let chunksRequestSequence = 0
 
 const hasActiveStreamingMessage = computed(() =>
   messages.value.some(msg => msg.role === 'assistant' && msg.streaming)
@@ -231,44 +273,90 @@ const checkHealth = async () => {
 }
 
 // 加载文档列表
-const loadDocuments = async () => {
+const loadDocuments = async (page = documentPage.value) => {
+  const requestedPage = Math.max(1, Number(page) || 1)
+  documentsRequestController?.abort()
+  const controller = new AbortController()
+  documentsRequestController = controller
+  documentsLoading.value = true
+  documentsError.value = ''
   try {
-    const data = await fetchDocuments()
+    const data = await fetchDocuments({
+      skip: (requestedPage - 1) * DOCUMENT_PAGE_SIZE,
+      limit: DOCUMENT_PAGE_SIZE,
+      signal: controller.signal
+    })
+    if (documentsRequestController !== controller) return
+    documentPage.value = requestedPage
+    documentTotal.value = Number(data.total || 0)
+    const lastPage = Math.max(1, Math.ceil(documentTotal.value / DOCUMENT_PAGE_SIZE))
+    if (requestedPage > lastPage) {
+      await loadDocuments(lastPage)
+      return
+    }
     documents.value = data.documents || []
     if (selectedDoc.value) {
       const refreshed = documents.value.find(doc => doc.document_id === selectedDoc.value.document_id)
       if (refreshed) {
         selectedDoc.value = refreshed
-      } else {
-        selectedDoc.value = null
-        selectedDocChunks.value = []
-        selectedDocChunkTotal.value = 0
       }
     }
   } catch (error) {
-    console.error('加载文档失败:', error)
+    if (error?.name !== 'AbortError') {
+      documentsError.value = `加载文档失败: ${error.message}`
+      console.error('加载文档失败:', error)
+    }
+  } finally {
+    if (documentsRequestController === controller) {
+      documentsLoading.value = false
+      documentsRequestController = null
+    }
   }
 }
 
-const loadDocumentChunks = async (doc) => {
+const loadDocumentChunks = async (doc, page = 1) => {
   if (!doc?.document_id) return
+  const requestedPage = Math.max(1, Number(page) || 1)
+  chunksRequestController?.abort()
+  const controller = new AbortController()
+  chunksRequestController = controller
+  const requestSequence = ++chunksRequestSequence
   selectedDoc.value = doc
+  selectedDocChunkPage.value = requestedPage
   documentChunksLoading.value = true
   documentChunksError.value = ''
 
   try {
-    const data = await fetchDocumentChunks(doc.document_id, { limit: 5000 })
+    const data = await fetchDocumentChunks(doc.document_id, {
+      skip: (requestedPage - 1) * CHUNK_PAGE_SIZE,
+      limit: CHUNK_PAGE_SIZE,
+      signal: controller.signal
+    })
+    if (
+      requestSequence !== chunksRequestSequence ||
+      selectedDoc.value?.document_id !== doc.document_id
+    ) return
     selectedDocChunkTotal.value = data.total || 0
+    const lastPage = Math.max(1, Math.ceil(selectedDocChunkTotal.value / CHUNK_PAGE_SIZE))
+    if (requestedPage > lastPage) {
+      await loadDocumentChunks(doc, lastPage)
+      return
+    }
     selectedDocChunks.value = (data.chunks || []).map((chunk, index) => ({
       ...chunk,
       show: index === 0
     }))
   } catch (error) {
-    selectedDocChunks.value = []
-    selectedDocChunkTotal.value = 0
-    documentChunksError.value = `加载切片失败: ${error.message}`
+    if (error?.name !== 'AbortError' && requestSequence === chunksRequestSequence) {
+      selectedDocChunks.value = []
+      selectedDocChunkTotal.value = 0
+      documentChunksError.value = `加载切片失败: ${error.message}`
+    }
   } finally {
-    documentChunksLoading.value = false
+    if (requestSequence === chunksRequestSequence) {
+      documentChunksLoading.value = false
+      chunksRequestController = null
+    }
   }
 }
 
@@ -525,40 +613,127 @@ const handleSend = async () => {
 
 // 上传文档
 const handleUpload = async () => {
-  if (!selectedFile.value) return
+  if (!selectedFile.value || uploading.value) return
 
   uploading.value = true
   uploadProgress.value = 0
+  let taskId = ''
 
   try {
     const submitted = await ingestDocument(selectedFile.value, uploadPartition.value)
     if (!submitted?.task_id) throw new Error('上传接口未返回任务 ID')
+    taskId = submitted.task_id
+    activeUploadTaskId.value = taskId
+    try {
+      localStorage.setItem(
+        pendingUploadStorageKey,
+        JSON.stringify({
+          taskId,
+          filename: submitted.filename || selectedFile.value.name,
+          createdAt: Date.now()
+        })
+      )
+    } catch (error) {
+      console.warn('无法持久化上传任务 ID:', error)
+    }
 
     uploadProgress.value = 10
-    let completed = false
-    for (let attempt = 0; attempt < UPLOAD_MAX_POLLS; attempt += 1) {
-      const status = await fetchDocumentStatus(submitted.task_id)
-      if (status.status === 'completed') {
-        uploadProgress.value = 100
-        completed = true
-        break
+    await pollDocumentTask(taskId, {
+      fetchStatus: fetchDocumentStatus,
+      delay,
+      maxPolls: UPLOAD_MAX_POLLS,
+      baseDelayMs: UPLOAD_POLL_INTERVAL_MS,
+      onProgress: (status) => {
+        uploadProgress.value = status.status === 'completed'
+          ? 100
+          : Math.max(10, Math.min(95, status.progress || 50))
       }
-      if (status.status === 'failed') {
-        throw new Error(status.error || '文档处理失败')
-      }
-      uploadProgress.value = Math.max(10, Math.min(95, status.progress || 50))
-      await delay(UPLOAD_POLL_INTERVAL_MS)
+    })
+    try {
+      localStorage.removeItem(pendingUploadStorageKey)
+    } catch (error) {
+      console.warn('无法清理已完成上传任务 ID:', error)
     }
-    if (!completed) throw new Error('文档处理超时，请稍后在文档库中确认任务状态')
+    activeUploadTaskId.value = ''
 
-    await loadDocuments()
+    await loadDocuments(1)
     showUpload.value = false
     selectedFile.value = null
     uploadProgress.value = 0
   } catch (error) {
-    alert('上传失败: ' + error.message)
+    if (error?.terminal === true || error?.status === 404) {
+      activeUploadTaskId.value = ''
+      try {
+        localStorage.removeItem(pendingUploadStorageKey)
+      } catch (storageError) {
+        console.warn('无法清理终止的上传任务 ID:', storageError)
+      }
+    }
+    const taskHint = taskId ? `（任务 ID: ${taskId}）` : ''
+    alert(`上传或状态跟踪失败${taskHint}: ${error.message}`)
   } finally {
     uploading.value = false
+  }
+}
+
+const resumePendingUpload = async () => {
+  let pending = null
+  try {
+    pending = JSON.parse(localStorage.getItem(pendingUploadStorageKey) || 'null')
+  } catch (error) {
+    console.warn('无法恢复上传任务 ID:', error)
+  }
+  const pendingAge = Date.now() - Number(pending?.createdAt || 0)
+  if (
+    !pending?.taskId ||
+    !Number.isFinite(pendingAge) ||
+    pendingAge < 0 ||
+    pendingAge > PENDING_UPLOAD_TTL_MS
+  ) {
+    try {
+      localStorage.removeItem(pendingUploadStorageKey)
+    } catch (error) {
+      console.warn('无法清理过期上传任务 ID:', error)
+    }
+    return
+  }
+  if (uploading.value) return
+
+  activeUploadTaskId.value = pending.taskId
+  uploading.value = true
+  uploadProgress.value = 10
+  try {
+    await pollDocumentTask(pending.taskId, {
+      fetchStatus: fetchDocumentStatus,
+      delay,
+      maxPolls: UPLOAD_MAX_POLLS,
+      baseDelayMs: UPLOAD_POLL_INTERVAL_MS,
+      onProgress: (status) => {
+        uploadProgress.value = status.status === 'completed'
+          ? 100
+          : Math.max(10, Math.min(95, status.progress || 50))
+      }
+    })
+    try {
+      localStorage.removeItem(pendingUploadStorageKey)
+    } catch (error) {
+      console.warn('无法清理已恢复的上传任务 ID:', error)
+    }
+    activeUploadTaskId.value = ''
+    await loadDocuments(1)
+  } catch (error) {
+    if (error?.terminal === true || error?.status === 404) {
+      activeUploadTaskId.value = ''
+      try {
+        localStorage.removeItem(pendingUploadStorageKey)
+      } catch (storageError) {
+        console.warn('无法清理终止的上传任务 ID:', storageError)
+      }
+    }
+    console.warn(`上传任务 ${pending.taskId} 尚未恢复:`, error)
+  } finally {
+    uploading.value = false
+    uploadProgress.value = 0
   }
 }
 
@@ -574,11 +749,14 @@ onMounted(() => {
   initChats()  // 初始化对话历史
   checkHealth()
   loadDocuments()
+  void resumePendingUpload()
   healthIntervalId = setInterval(checkHealth, 30000)
 })
 
 onUnmounted(() => {
   activeRequestController.value?.abort()
+  documentsRequestController?.abort()
+  chunksRequestController?.abort()
   activeRequestController.value = null
   if (healthIntervalId !== null) clearInterval(healthIntervalId)
 })

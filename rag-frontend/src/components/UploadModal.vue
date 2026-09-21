@@ -35,6 +35,9 @@
         <div v-if="uploadProgress > 0" class="progress-bar">
           <div class="progress-fill" :style="{ width: uploadProgress + '%' }"></div>
         </div>
+        <div v-if="activeTaskId" class="task-id">
+          任务 ID：<code>{{ activeTaskId }}</code>
+        </div>
       </div>
       <div class="modal-footer">
         <button @click="emit('close')" class="btn-secondary">取消</button>
@@ -69,6 +72,10 @@ defineProps({
   uploading: {
     type: Boolean,
     default: false
+  },
+  activeTaskId: {
+    type: String,
+    default: ''
   }
 })
 
@@ -185,6 +192,13 @@ const handleDrop = (event) => {
   height: 100%;
   background: #3c5a78;
   transition: width 0.3s;
+}
+
+.task-id {
+  margin-top: 0.75rem;
+  color: #5f6670;
+  font-size: 0.78rem;
+  word-break: break-all;
 }
 
 .modal-footer {

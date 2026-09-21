@@ -1,12 +1,14 @@
 """Enhanced query API integrating query understanding."""
 import json
 import time
+from collections.abc import AsyncGenerator
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
+from app.api.input_validation import validate_message_budget
 from app.api.retrieval_params import resolve_retrieval_params
 from app.service.enhanced_query_service import EnhancedQueryOptions, EnhancedQueryService
 from app.utils.logger import get_logger
@@ -17,7 +19,7 @@ SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
 
 class ChatHistoryMessage(BaseModel):
-    role: Literal["user", "assistant", "system"]
+    role: Literal["user", "assistant"]
     content: str = Field(..., min_length=1, max_length=8000)
 
 
@@ -33,7 +35,13 @@ class EnhancedQueryRequest(BaseModel):
     top_k: int | None = Field(default=None, ge=1, le=50)
     similarity_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     enable_rerank: bool | None = None
-    partition: str | None = None
+    partition: str | None = Field(default=None, min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_total_input(self) -> "EnhancedQueryRequest":
+        history = (message.content for message in (self.chat_history or []))
+        validate_message_budget([self.query, *history])
+        return self
 
 
 class EnhancedQueryResponse(BaseModel):
@@ -78,7 +86,7 @@ async def enhanced_query(request: EnhancedQueryRequest) -> EnhancedQueryResponse
 
     if request.stream:
 
-        async def stream_generator():
+        async def stream_generator() -> AsyncGenerator[str, None]:
             try:
                 service = EnhancedQueryService()
                 async for event in service.stream_events(options):
@@ -87,6 +95,7 @@ async def enhanced_query(request: EnhancedQueryRequest) -> EnhancedQueryResponse
             except Exception as exc:
                 logger.error("Enhanced query stream failed: %s", exc, exc_info=True)
                 yield _sse_payload({"type": "error", "error": "Enhanced query failed"})
+                yield _sse_payload({"type": "done", "error": True})
 
         return StreamingResponse(
             stream_generator(),

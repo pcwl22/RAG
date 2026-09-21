@@ -1,0 +1,1545 @@
+name: Protected production release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  id-token: none
+
+concurrency:
+  group: production-release
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: none
+    defaults:
+      run:
+        working-directory: industrial-rag
+    outputs:
+      manifest_sha256: ${{ steps.preflight_manifest.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Validate trusted release ref and ancestry
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          case "$GITHUB_REF" in
+            "refs/heads/main") ;;
+            refs/tags/v*) ;;
+            *) echo "Release ref must be refs/heads/main or a v* tag." >&2; exit 1 ;;
+          esac
+          git fetch --no-tags origin \
+            +refs/heads/main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: industrial-rag/requirements-ci.lock.txt
+
+      - name: Install reproducible CI dependencies
+        run: |
+          python -m pip install --require-hashes -r requirements-ci.lock.txt
+
+      - name: Validate locked source contracts
+        run: |
+          python scripts/validate_evaluation_assets.py
+          python scripts/validate_dependency_lock.py
+          python scripts/validate_model_bundle_manifest.py \
+            docker/model-bundle/model-manifest.example.json --allow-placeholders
+          python scripts/validate_release_workflow.py \
+            ../.github/workflows/release.yml
+
+      - name: Validate approved dependency exception policy
+        run: >-
+          python scripts/audit_dependency_locks.py
+          --policy-only --check-upstream
+
+      - name: Audit every release dependency lock
+        run: >-
+          python scripts/audit_dependency_locks.py
+          --output-dir "$RUNNER_TEMP/dependency-audits"
+
+      - name: Run static and unit gates without release credentials
+        env:
+          RAG_ENV: laptop
+          RUN_POSTGRES_INTEGRATION: "0"
+          POSTGRES_PASSWORD: test-only
+          DEEPSEEK_API_KEY: test-only
+        run: |
+          python -m ruff check app tests scripts
+          python -m mypy app scripts
+          python -m compileall -q app scripts
+          python -m pytest tests -q
+
+      - name: Build immutable source contract manifest
+        id: preflight_manifest
+        env:
+          MANIFEST_PATH: ${{ runner.temp }}/release-preflight/preflight-manifest.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$MANIFEST_PATH")"
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path.cwd()
+          explicit = {
+              "pyproject.toml",
+              "requirements-ci.lock.txt",
+              "requirements-runtime.lock.txt",
+              "requirements-gpu.lock.txt",
+              "requirements-evaluation.lock.txt",
+              "requirements-torch-cpu.lock.txt",
+              "requirements-torch-cu126.lock.txt",
+              "security/evaluation_dependency_exceptions.toml",
+              "eval/legal_expanded_ragas_40.jsonl",
+              "eval/legal_expanded_240.jsonl",
+              "eval/legal_holdout_150.jsonl",
+              "app/evaluation/retrieval_contract.py",
+              "app/evaluation/ragas_adapter.py",
+              "scripts/approve_release_baseline.py",
+              "scripts/export_lrage.py",
+              "scripts/evaluate_ragas.py",
+              "scripts/evaluate_retrieval_suite.py",
+              "scripts/check_quality_gate.py",
+              "scripts/check_expanded_quality_gate.py",
+              "scripts/check_holdout_quality_gate.py",
+              "scripts/score_retrieval.py",
+              "scripts/validate_evaluation_assets.py",
+              "scripts/audit_dependency_locks.py",
+              "scripts/release_set_attestation.py",
+              "scripts/validate_release_workflow.py",
+              "scripts/validate_release_baseline.py",
+              "../.github/workflows/release.yml",
+              "docker/api/Dockerfile.production",
+              "docker/worker/Dockerfile.production",
+              "docker/model-bundle/Dockerfile.production",
+              "docker/model-bundle/model-manifest.example.json",
+          }
+          explicit.update(
+              path.relative_to(root).as_posix()
+              for path in (root / "deploy/kustomize").rglob("*.yaml")
+          )
+          digests = {}
+          for relative in sorted(explicit):
+              path = root / relative
+              if not path.is_file() or path.is_symlink():
+                  raise SystemExit(f"missing or unsafe source contract file: {relative}")
+              digests[relative] = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+          payload = {
+              "schema": "industrial-rag.release-source.v1",
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "revision": os.environ["GITHUB_SHA"],
+              "ref": os.environ["GITHUB_REF"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "files": digests,
+          }
+          output = Path(os.environ["MANIFEST_PATH"])
+          output.write_text(
+              json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+              + "\n",
+              encoding="utf-8",
+          )
+          PY
+          digest="sha256:$(sha256sum "$MANIFEST_PATH" | awk '{print $1}')"
+          echo "sha256=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Upload source contract
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: industrial-rag-release-preflight
+          path: ${{ runner.temp }}/release-preflight/preflight-manifest.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload dependency audit evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: industrial-rag-release-dependency-audits
+          path: ${{ runner.temp }}/dependency-audits
+          if-no-files-found: warn
+          retention-days: 7
+
+  prepare-evaluation:
+    needs: preflight
+    runs-on: [self-hosted, linux, x64, rag-evaluation-source]
+    environment:
+      name: production-evaluation-source
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      packages: read
+      id-token: none
+    defaults:
+      run:
+        working-directory: industrial-rag
+    outputs:
+      manifest_sha256: ${{ steps.prepared_manifest.outputs.sha256 }}
+    env:
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Initialize isolated evaluation paths
+        shell: bash
+        run: |
+          {
+            echo "EVALUATION_ENV_FILE=$RUNNER_TEMP/rag-evaluation-source.env"
+            echo "EVALUATION_RUNTIME_FILE=$RUNNER_TEMP/rag-evaluation-runtime.env"
+            echo "PREPARED_ROOT=$RUNNER_TEMP/industrial-rag-prepared-evaluation"
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: industrial-rag/requirements-ci.lock.txt
+
+      - name: Install preparation control-plane dependencies
+        run: |
+          python -m pip install --require-hashes -r requirements-ci.lock.txt
+
+      - name: Download immutable source contract
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: industrial-rag-release-preflight
+          path: ${{ runner.temp }}/release-preflight
+
+      - name: Verify source contract before accessing evaluation data
+        env:
+          EXPECTED_MANIFEST_SHA256: ${{ needs.preflight.outputs.manifest_sha256 }}
+          MANIFEST_PATH: ${{ runner.temp }}/release-preflight/preflight-manifest.json
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path.cwd()
+          manifest_path = Path(os.environ["MANIFEST_PATH"])
+          actual = "sha256:" + hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+          if actual != os.environ["EXPECTED_MANIFEST_SHA256"]:
+              raise SystemExit("source contract artifact digest mismatch")
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          if manifest.get("repository") != os.environ["GITHUB_REPOSITORY"]:
+              raise SystemExit("source contract repository mismatch")
+          if manifest.get("revision") != os.environ["GITHUB_SHA"]:
+              raise SystemExit("source contract revision mismatch")
+          for relative, expected in manifest.get("files", {}).items():
+              candidate = root / relative
+              if not candidate.is_file() or candidate.is_symlink():
+                  raise SystemExit(f"source contract file missing: {relative}")
+              digest = "sha256:" + hashlib.sha256(candidate.read_bytes()).hexdigest()
+              if digest != expected:
+                  raise SystemExit(f"source contract file changed: {relative}")
+          PY
+
+      - name: Materialize isolated read-only evaluation snapshot
+        env:
+          RAG_EVALUATION_ENV_B64: ${{ secrets.RAG_EVALUATION_ENV_B64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          rm -f "$EVALUATION_ENV_FILE" "$EVALUATION_RUNTIME_FILE"
+          rm -rf "$PREPARED_ROOT"
+          mkdir -p "$PREPARED_ROOT"
+          test -n "$RAG_EVALUATION_ENV_B64"
+          printf '%s' "$RAG_EVALUATION_ENV_B64" | base64 --decode > "$EVALUATION_ENV_FILE"
+          test -s "$EVALUATION_ENV_FILE"
+          unset RAG_EVALUATION_ENV_B64
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          from app.utils.strict_dotenv import load_release_env_file
+          from scripts.validate_production_env import is_immutable_image_reference
+
+          source = Path(os.environ["EVALUATION_ENV_FILE"])
+          values = load_release_env_file(source)
+          required = {
+              "RAG_EVALUATION_READ_ONLY",
+              "POSTGRES_HOST",
+              "POSTGRES_PORT",
+              "POSTGRES_DB",
+              "POSTGRES_USER",
+              "POSTGRES_PASSWORD",
+              "REDIS_URL",
+              "DEEPSEEK_API_KEY",
+              "DEEPSEEK_API_URL",
+              "DEEPSEEK_MODEL",
+              "API_IMAGE",
+              "WORKER_IMAGE",
+              "FRONTEND_IMAGE",
+              "MODEL_BUNDLE_IMAGE",
+              "MODEL_BUNDLE_DIGEST",
+              "MODEL_MANIFEST_SHA256",
+              "INGRESS_HOST",
+          }
+          missing = sorted(name for name in required if not values.get(name, "").strip())
+          if missing:
+              raise SystemExit("evaluation snapshot is missing: " + ", ".join(missing))
+          if values["RAG_EVALUATION_READ_ONLY"].strip() != "1":
+              raise SystemExit("evaluation snapshot must assert RAG_EVALUATION_READ_ONLY=1")
+          forbidden = sorted(
+              name
+              for name in values
+              if name.startswith(("CANARY_", "POSTGRES_ADMIN", "S3_"))
+              or name in {"RAG_API_KEY", "RAG_METRICS_TOKEN", "POSTGRES_APP_PASSWORD"}
+          )
+          if forbidden:
+              raise SystemExit("evaluation snapshot contains forbidden privileges: " + ", ".join(forbidden))
+          for name in ("API_IMAGE", "WORKER_IMAGE", "FRONTEND_IMAGE", "MODEL_BUNDLE_IMAGE"):
+              if not is_immutable_image_reference(values[name]):
+                  raise SystemExit(f"{name} is not an immutable OCI digest reference")
+
+          allowlist = (
+              "POSTGRES_HOST",
+              "POSTGRES_PORT",
+              "POSTGRES_DB",
+              "POSTGRES_USER",
+              "POSTGRES_PASSWORD",
+              "POSTGRES_SSLMODE",
+              "POSTGRES_SSLROOTCERT",
+              "REDIS_URL",
+              "REDIS_REQUIRE_TLS",
+              "DEEPSEEK_API_KEY",
+              "DEEPSEEK_API_URL",
+              "DEEPSEEK_MODEL",
+          )
+          runtime = {name: values[name] for name in allowlist if values.get(name, "").strip()}
+          runtime.update(
+              {
+                  "RAG_ENV": "base",
+                  "RAG_SECURE_MODE": "1",
+                  "QUEUE_PROVIDER": "memory",
+                  "OBJECT_STORAGE_ENABLED": "false",
+                  "EMBEDDING_DEVICE": "cuda",
+                  "RERANKER_DEVICE": "cuda",
+                  "PGOPTIONS": "-c default_transaction_read_only=on",
+                  "PYTHONUNBUFFERED": "1",
+              }
+          )
+          for name, value in runtime.items():
+              if "\n" in value or "\r" in value:
+                  raise SystemExit(f"evaluation runtime value is not single-line: {name}")
+          target = Path(os.environ["EVALUATION_RUNTIME_FILE"])
+          target.write_text(
+              "".join(f"{name}={value}\n" for name, value in sorted(runtime.items())),
+              encoding="utf-8",
+          )
+          target.chmod(0o600)
+          PY
+
+      - name: Export immutable candidate image references
+        id: evaluation_images
+        run: >-
+          python scripts/export_release_values.py
+          --env-file "$EVALUATION_ENV_FILE" --github-output "$GITHUB_OUTPUT"
+
+      - name: Install cosign for candidate verification
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Verify candidate signatures and source binding before execution
+        env:
+          COSIGN_CERTIFICATE_IDENTITY: ${{ vars.COSIGN_CERTIFICATE_IDENTITY }}
+          COSIGN_CERTIFICATE_OIDC_ISSUER: https://token.actions.githubusercontent.com
+          API_IMAGE: ${{ steps.evaluation_images.outputs.api }}
+          WORKER_IMAGE: ${{ steps.evaluation_images.outputs.worker }}
+          FRONTEND_IMAGE: ${{ steps.evaluation_images.outputs.frontend }}
+          MODEL_BUNDLE_IMAGE: ${{ steps.evaluation_images.outputs.model_bundle }}
+          MODEL_BUNDLE_DIGEST: ${{ steps.evaluation_images.outputs.model_bundle_digest }}
+          MODEL_MANIFEST_SHA256: ${{ steps.evaluation_images.outputs.model_manifest_sha256 }}
+          EXPECTED_SOURCE: https://github.com/${{ github.repository }}
+          EXPECTED_REVISION: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          identity="${COSIGN_CERTIFICATE_IDENTITY:?Set the exact protected build-workflow certificate identity}"
+          for image in "$API_IMAGE" "$WORKER_IMAGE" "$FRONTEND_IMAGE" "$MODEL_BUNDLE_IMAGE"; do
+            cosign verify \
+              --certificate-identity "$identity" \
+              --certificate-oidc-issuer "$COSIGN_CERTIFICATE_OIDC_ISSUER" \
+              "$image" > /dev/null
+            docker pull "$image" > /dev/null
+            revision="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$image")"
+            source="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.source" }}' "$image")"
+            test "$revision" = "$EXPECTED_REVISION"
+            test "$source" = "$EXPECTED_SOURCE"
+          done
+          for image in "$API_IMAGE" "$WORKER_IMAGE"; do
+            bundled_digest="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.model-bundle-digest" }}' "$image")"
+            bundled_manifest="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.model-manifest-sha256" }}' "$image")"
+            test "$bundled_digest" = "$MODEL_BUNDLE_DIGEST"
+            test "$bundled_manifest" = "$MODEL_MANIFEST_SHA256"
+          done
+
+      - name: Verify atomic image-set attestation before candidate execution
+        env:
+          API_IMAGE: ${{ steps.evaluation_images.outputs.api }}
+          WORKER_IMAGE: ${{ steps.evaluation_images.outputs.worker }}
+          FRONTEND_IMAGE: ${{ steps.evaluation_images.outputs.frontend }}
+          MODEL_BUNDLE_IMAGE: ${{ steps.evaluation_images.outputs.model_bundle }}
+          MODEL_MANIFEST_SHA256: ${{ steps.evaluation_images.outputs.model_manifest_sha256 }}
+          PUBLISHER_IDENTITY: ${{ vars.COSIGN_CERTIFICATE_IDENTITY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_set_type="$(python scripts/release_set_attestation.py predicate-type \
+            --github-repository "$GITHUB_REPOSITORY")"
+          publisher_identity="${PUBLISHER_IDENTITY:?Set the exact protected image-publisher identity}"
+          verification_output="$RUNNER_TEMP/cosign-image-set-attestation.json"
+          cosign verify-attestation \
+            --certificate-identity "$publisher_identity" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-github-workflow-sha "$GITHUB_SHA" \
+            --type "$image_set_type" \
+            "$API_IMAGE" > "$verification_output"
+          VERIFIED_DSSE="$verification_output" \
+          EXPECTED_PREDICATE_TYPE="$image_set_type" \
+          EXPECTED_PUBLISHER_IDENTITY="$publisher_identity" \
+          python - <<'PY' > "$RUNNER_TEMP/image-set-workflow-runs"
+          import base64
+          import json
+          import os
+          from pathlib import Path
+
+          documents = json.loads(Path(os.environ["VERIFIED_DSSE"]).read_text(encoding="utf-8"))
+          if not isinstance(documents, list):
+              documents = [documents]
+          values = set()
+          for envelope in documents:
+              if not isinstance(envelope, dict):
+                  continue
+              if envelope.get("payloadType") != "application/vnd.in-toto+json":
+                  continue
+              payload = envelope.get("payload")
+              if not isinstance(payload, str):
+                  continue
+              statement = json.loads(base64.b64decode(payload, validate=True).decode("utf-8"))
+              if statement.get("predicateType") != os.environ["EXPECTED_PREDICATE_TYPE"]:
+                  continue
+              predicate = statement.get("predicate") or {}
+              source = predicate.get("source") or {}
+              if source.get("publisherIdentity") != os.environ["EXPECTED_PUBLISHER_IDENTITY"]:
+                  continue
+              workflow_run = source.get("workflowRun")
+              if isinstance(workflow_run, str):
+                  values.add(workflow_run)
+          if not values:
+              raise SystemExit("verified DSSE contains no approved image-set workflow run")
+          print("\n".join(sorted(values)))
+          PY
+          verified=false
+          while IFS= read -r workflow_run; do
+            if python scripts/release_set_attestation.py verify-attestation \
+              --verification-output "$verification_output" \
+              --project-root . \
+              --github-repository "$GITHUB_REPOSITORY" \
+              --source-revision "$GITHUB_SHA" \
+              --workflow-run "$workflow_run" \
+              --publisher-identity "$publisher_identity" \
+              --model-bundle-image "$MODEL_BUNDLE_IMAGE" \
+              --api-image "$API_IMAGE" \
+              --worker-image "$WORKER_IMAGE" \
+              --frontend-image "$FRONTEND_IMAGE" \
+              --model-manifest-sha256 "$MODEL_MANIFEST_SHA256"; then
+              verified=true
+              break
+            fi
+          done < "$RUNNER_TEMP/image-set-workflow-runs"
+          test "$verified" = true
+
+      - name: Prove evaluation database session is read-only
+        env:
+          API_IMAGE: ${{ steps.evaluation_images.outputs.api }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --network host \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --env-file "$EVALUATION_RUNTIME_FILE" \
+            "$API_IMAGE" \
+            python -c "import os, psycopg2; c=psycopg2.connect(host=os.environ['POSTGRES_HOST'],port=int(os.environ['POSTGRES_PORT']),dbname=os.environ['POSTGRES_DB'],user=os.environ['POSTGRES_USER'],password=os.environ['POSTGRES_PASSWORD']); q=c.cursor(); q.execute('SHOW transaction_read_only'); assert q.fetchone()[0] == 'on'; q.execute('SELECT rolsuper, rolcreaterole, rolcreatedb, rolreplication FROM pg_roles WHERE rolname = current_user'); assert q.fetchone() == (False, False, False, False); c.close()"
+
+      - name: Execute deterministic evaluations in the verified candidate image
+        env:
+          API_IMAGE: ${{ steps.evaluation_images.outputs.api }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$PREPARED_ROOT/lrage"
+          candidate_run=(
+            docker run --rm --network host --gpus all --read-only
+            --user "$(id -u):$(id -g)" --cap-drop ALL
+            --security-opt no-new-privileges --pids-limit 512
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=512m
+            --tmpfs /app/data:rw,noexec,nosuid,nodev,size=64m
+            --tmpfs /app/logs:rw,noexec,nosuid,nodev,size=64m
+            --env-file "$EVALUATION_RUNTIME_FILE"
+            --mount "type=bind,src=${GITHUB_WORKSPACE}/industrial-rag/scripts,dst=/evaluation/scripts,readonly"
+            --mount "type=bind,src=${GITHUB_WORKSPACE}/industrial-rag/eval,dst=/evaluation/eval,readonly"
+            --mount "type=bind,src=${PREPARED_ROOT},dst=/evaluation/output"
+            "$API_IMAGE"
+          )
+          "${candidate_run[@]}" python /evaluation/scripts/export_lrage.py \
+            --input /evaluation/eval/legal_expanded_ragas_40.jsonl \
+            --output-dir /evaluation/output/lrage \
+            --task-name industrial_rag_release_40 --top-k 5
+          "${candidate_run[@]}" python /evaluation/scripts/evaluate_retrieval_suite.py \
+            --input /evaluation/eval/legal_expanded_240.jsonl \
+            --output /evaluation/output/retrieval-240.json \
+            --top-k 5 --use-production-pipeline --production-decomposition \
+            --minimum-citation-recall 0.95
+          "${candidate_run[@]}" python /evaluation/scripts/evaluate_retrieval_suite.py \
+            --input /evaluation/eval/legal_holdout_150.jsonl \
+            --output /evaluation/output/retrieval-holdout-150.json \
+            --top-k 5 --use-production-pipeline --production-decomposition \
+            --minimum-citation-recall 0.95
+
+      - name: Build prepared evaluation manifest
+        id: prepared_manifest
+        env:
+          SOURCE_MANIFEST: ${{ runner.temp }}/release-preflight/preflight-manifest.json
+          SOURCE_MANIFEST_SHA256: ${{ needs.preflight.outputs.manifest_sha256 }}
+          API_IMAGE: ${{ steps.evaluation_images.outputs.api }}
+          WORKER_IMAGE: ${{ steps.evaluation_images.outputs.worker }}
+          FRONTEND_IMAGE: ${{ steps.evaluation_images.outputs.frontend }}
+          MODEL_BUNDLE_IMAGE: ${{ steps.evaluation_images.outputs.model_bundle }}
+          MODEL_BUNDLE_DIGEST: ${{ steps.evaluation_images.outputs.model_bundle_digest }}
+          MODEL_MANIFEST_SHA256: ${{ steps.evaluation_images.outputs.model_manifest_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "$SOURCE_MANIFEST" "$PREPARED_ROOT/preflight-manifest.json"
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["PREPARED_ROOT"])
+          relative_files = (
+              "preflight-manifest.json",
+              "lrage/industrial_rag_release_40.jsonl",
+              "lrage/industrial_rag_release_40.manifest.json",
+              "lrage/industrial_rag_release_40.yaml",
+              "retrieval-240.json",
+              "retrieval-holdout-150.json",
+          )
+          files = {}
+          for relative in relative_files:
+              path = root / relative
+              if not path.is_file() or path.is_symlink():
+                  raise SystemExit(f"prepared evaluation file missing: {relative}")
+              files[relative] = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+          payload = {
+              "schema": "industrial-rag.prepared-evaluation.v1",
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "revision": os.environ["GITHUB_SHA"],
+              "source_manifest_sha256": os.environ["SOURCE_MANIFEST_SHA256"],
+              "candidate_images": {
+                  "api": os.environ["API_IMAGE"],
+                  "worker": os.environ["WORKER_IMAGE"],
+                  "frontend": os.environ["FRONTEND_IMAGE"],
+                  "model_bundle": os.environ["MODEL_BUNDLE_IMAGE"],
+              },
+              "model_bundle_digest": os.environ["MODEL_BUNDLE_DIGEST"],
+              "model_manifest_sha256": os.environ["MODEL_MANIFEST_SHA256"],
+              "files": files,
+          }
+          output = root / "prepared-evaluation-manifest.json"
+          output.write_text(
+              json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+              + "\n",
+              encoding="utf-8",
+          )
+          PY
+          digest="sha256:$(sha256sum "$PREPARED_ROOT/prepared-evaluation-manifest.json" | awk '{print $1}')"
+          echo "sha256=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Upload prepared evaluation evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: industrial-rag-release-prepared-evaluation
+          path: ${{ runner.temp }}/industrial-rag-prepared-evaluation
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Remove isolated evaluation credentials
+        if: always()
+        shell: bash
+        run: |
+          rm -f "$EVALUATION_ENV_FILE" "$EVALUATION_RUNTIME_FILE"
+
+  ragas-judge:
+    needs: prepare-evaluation
+    runs-on: ubuntu-latest
+    environment:
+      name: ragas-judge
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: none
+    defaults:
+      run:
+        working-directory: industrial-rag
+    outputs:
+      manifest_sha256: ${{ steps.judged_manifest.outputs.sha256 }}
+    env:
+      PYTHONUNBUFFERED: "1"
+      RAGAS_DO_NOT_TRACK: "true"
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Initialize isolated judge paths
+        shell: bash
+        run: |
+          {
+            echo "JUDGED_ROOT=$RUNNER_TEMP/industrial-rag-judged-evaluation"
+            echo "PREPARED_ROOT=$RUNNER_TEMP/industrial-rag-prepared-evaluation"
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: industrial-rag/requirements-evaluation.lock.txt
+
+      - name: Install isolated hash-locked judge dependencies
+        run: |
+          python -m pip install --require-hashes -r requirements-evaluation.lock.txt
+
+      - name: Download prepared evaluation evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: industrial-rag-release-prepared-evaluation
+          path: ${{ runner.temp }}/industrial-rag-prepared-evaluation
+
+      - name: Verify prepared evidence before judge access
+        env:
+          EXPECTED_MANIFEST_SHA256: ${{ needs.prepare-evaluation.outputs.manifest_sha256 }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["PREPARED_ROOT"])
+          path = root / "prepared-evaluation-manifest.json"
+          actual = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+          if actual != os.environ["EXPECTED_MANIFEST_SHA256"]:
+              raise SystemExit("prepared evaluation manifest digest mismatch")
+          manifest = json.loads(path.read_text(encoding="utf-8"))
+          if manifest.get("repository") != os.environ["GITHUB_REPOSITORY"]:
+              raise SystemExit("prepared evaluation repository mismatch")
+          if manifest.get("revision") != os.environ["GITHUB_SHA"]:
+              raise SystemExit("prepared evaluation revision mismatch")
+          for relative, expected in manifest.get("files", {}).items():
+              candidate = root / relative
+              if not candidate.is_file() or candidate.is_symlink():
+                  raise SystemExit(f"prepared evaluation file missing: {relative}")
+              digest = "sha256:" + hashlib.sha256(candidate.read_bytes()).hexdigest()
+              if digest != expected:
+                  raise SystemExit(f"prepared evaluation file changed: {relative}")
+          PY
+
+      - name: Run protected dependency-minimal text judge
+        env:
+          RAGAS_JUDGE_API_KEY: ${{ secrets.RAGAS_JUDGE_API_KEY }}
+          RAGAS_BASE_URL: ${{ vars.RAGAS_JUDGE_BASE_URL }}
+          RAGAS_MODEL: ${{ vars.RAGAS_JUDGE_MODEL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$RAGAS_JUDGE_API_KEY"
+          mkdir -p "$JUDGED_ROOT"
+          python scripts/evaluate_ragas.py \
+            --input "$PREPARED_ROOT/lrage/industrial_rag_release_40.jsonl" \
+            --output "$JUDGED_ROOT/ragas-40.json" \
+            --api-key-env RAGAS_JUDGE_API_KEY \
+            --base-url "$RAGAS_BASE_URL" \
+            --model "$RAGAS_MODEL"
+          python scripts/check_quality_gate.py \
+            --ragas-report "$JUDGED_ROOT/ragas-40.json" \
+            --export "$PREPARED_ROOT/lrage/industrial_rag_release_40.jsonl" \
+            --output "$JUDGED_ROOT/quality-gate.json"
+          python scripts/check_expanded_quality_gate.py \
+            --retrieval-report "$PREPARED_ROOT/retrieval-240.json" \
+            --ragas-gate "$JUDGED_ROOT/quality-gate.json" \
+            --output "$JUDGED_ROOT/expanded-gate.json"
+          python scripts/check_holdout_quality_gate.py \
+            --retrieval-report "$PREPARED_ROOT/retrieval-holdout-150.json" \
+            --output "$JUDGED_ROOT/holdout-gate.json"
+
+      - name: Build judged evaluation manifest
+        id: judged_manifest
+        env:
+          PREPARED_MANIFEST_SHA256: ${{ needs.prepare-evaluation.outputs.manifest_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["JUDGED_ROOT"])
+          files = {}
+          for relative in (
+              "ragas-40.json",
+              "quality-gate.json",
+              "expanded-gate.json",
+              "holdout-gate.json",
+          ):
+              path = root / relative
+              if not path.is_file() or path.is_symlink():
+                  raise SystemExit(f"judge output missing: {relative}")
+              files[relative] = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+          payload = {
+              "schema": "industrial-rag.judged-evaluation.v1",
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "revision": os.environ["GITHUB_SHA"],
+              "prepared_manifest_sha256": os.environ["PREPARED_MANIFEST_SHA256"],
+              "files": files,
+          }
+          output = root / "judged-evaluation-manifest.json"
+          output.write_text(
+              json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+              + "\n",
+              encoding="utf-8",
+          )
+          PY
+          digest="sha256:$(sha256sum "$JUDGED_ROOT/judged-evaluation-manifest.json" | awk '{print $1}')"
+          echo "sha256=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Upload judged evaluation evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: industrial-rag-release-judged-evaluation
+          path: ${{ runner.temp }}/industrial-rag-judged-evaluation
+          if-no-files-found: error
+          retention-days: 1
+
+  deploy:
+    needs: [preflight, prepare-evaluation, ragas-judge]
+    # The protected "production" environment must require a human reviewer.
+    # This runner is deployment-only. Evaluation dependencies and judge access
+    # never enter the production credential or Kubernetes trust boundary.
+    runs-on: [self-hosted, linux, x64, rag-production]
+    environment:
+      name: production
+    timeout-minutes: 240
+    permissions:
+      contents: read
+      packages: read
+      id-token: none
+    defaults:
+      run:
+        working-directory: industrial-rag
+    env:
+      RAG_RELEASE_SNAPSHOT: "1"
+      RUN_POSTGRES_INTEGRATION: "1"
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Initialize isolated production paths
+        shell: bash
+        run: |
+          {
+            echo "ENV_FILE=$RUNNER_TEMP/rag-production.env"
+            echo "RAG_ENV_FILE=$RUNNER_TEMP/rag-production.env"
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: industrial-rag/requirements-ci.lock.txt
+
+      - name: Install deployment control-plane dependencies only
+        run: |
+          python -m pip install --require-hashes -r requirements-ci.lock.txt
+
+      - name: Download immutable source contract
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: industrial-rag-release-preflight
+          path: ${{ runner.temp }}/release-evidence/preflight
+
+      - name: Download prepared evaluation evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: industrial-rag-release-prepared-evaluation
+          path: ${{ runner.temp }}/release-evidence/prepared
+
+      - name: Download judged evaluation evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: industrial-rag-release-judged-evaluation
+          path: ${{ runner.temp }}/release-evidence/judged
+
+      - name: Materialize protected Secret Manager snapshot
+        env:
+          RAG_PRODUCTION_ENV_B64: ${{ secrets.RAG_PRODUCTION_ENV_B64 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          rm -f "$ENV_FILE" \
+            "$RUNNER_TEMP/rag-runtime.yaml" \
+            "$RUNNER_TEMP/rag-migration.yaml" \
+            "$RUNNER_TEMP/rag-canary.yaml" \
+            "$RUNNER_TEMP/rag-runtime-current.yaml" \
+            "$RUNNER_TEMP/migration-secret-name" \
+            "$RUNNER_TEMP/migration-secret-uid" \
+            "$RUNNER_TEMP/migration-job-uid" \
+            "$RUNNER_TEMP/canary-secret-name" \
+            "$RUNNER_TEMP/canary-secret-uid" \
+            "$RUNNER_TEMP/canary-job-uid"
+          test -n "$RAG_PRODUCTION_ENV_B64"
+          printf '%s' "$RAG_PRODUCTION_ENV_B64" | base64 --decode > "$ENV_FILE"
+          test -s "$ENV_FILE"
+          echo "RAG_ENV_FILE=$ENV_FILE" >> "$GITHUB_ENV"
+          unset RAG_PRODUCTION_ENV_B64
+
+      - name: Validate production environment contract
+        run: >-
+          python scripts/validate_production_env.py
+          --env-file "$ENV_FILE" --release-snapshot
+
+      - name: Validate locked inputs and model bundle contract
+        run: |
+          python scripts/validate_evaluation_assets.py
+          python scripts/validate_dependency_lock.py
+          python scripts/validate_model_bundle_manifest.py \
+            docker/model-bundle/model-manifest.example.json --allow-placeholders
+
+      - name: Export immutable production image references
+        id: release_images
+        run: >-
+          python scripts/export_release_values.py
+          --env-file "$ENV_FILE" --github-output "$GITHUB_OUTPUT"
+
+      - name: Verify immutable release evidence chain
+        env:
+          EXPECTED_SOURCE_MANIFEST_SHA256: ${{ needs.preflight.outputs.manifest_sha256 }}
+          EXPECTED_PREPARED_MANIFEST_SHA256: ${{ needs.prepare-evaluation.outputs.manifest_sha256 }}
+          EXPECTED_JUDGED_MANIFEST_SHA256: ${{ needs.ragas-judge.outputs.manifest_sha256 }}
+          API_IMAGE: ${{ steps.release_images.outputs.api }}
+          WORKER_IMAGE: ${{ steps.release_images.outputs.worker }}
+          FRONTEND_IMAGE: ${{ steps.release_images.outputs.frontend }}
+          MODEL_BUNDLE_IMAGE: ${{ steps.release_images.outputs.model_bundle }}
+          MODEL_BUNDLE_DIGEST: ${{ steps.release_images.outputs.model_bundle_digest }}
+          MODEL_MANIFEST_SHA256: ${{ steps.release_images.outputs.model_manifest_sha256 }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          evidence = Path(os.environ["RUNNER_TEMP"]) / "release-evidence"
+
+          def load_bound(path: Path, expected: str, label: str) -> dict:
+              actual = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+              if actual != expected:
+                  raise SystemExit(f"{label} manifest digest mismatch")
+              value = json.loads(path.read_text(encoding="utf-8"))
+              if value.get("repository") != os.environ["GITHUB_REPOSITORY"]:
+                  raise SystemExit(f"{label} repository mismatch")
+              if value.get("revision") != os.environ["GITHUB_SHA"]:
+                  raise SystemExit(f"{label} revision mismatch")
+              return value
+
+          source_path = evidence / "preflight/preflight-manifest.json"
+          prepared_path = evidence / "prepared/prepared-evaluation-manifest.json"
+          judged_path = evidence / "judged/judged-evaluation-manifest.json"
+          source = load_bound(
+              source_path,
+              os.environ["EXPECTED_SOURCE_MANIFEST_SHA256"],
+              "source",
+          )
+          prepared = load_bound(
+              prepared_path,
+              os.environ["EXPECTED_PREPARED_MANIFEST_SHA256"],
+              "prepared",
+          )
+          judged = load_bound(
+              judged_path,
+              os.environ["EXPECTED_JUDGED_MANIFEST_SHA256"],
+              "judged",
+          )
+          if prepared.get("source_manifest_sha256") != os.environ["EXPECTED_SOURCE_MANIFEST_SHA256"]:
+              raise SystemExit("prepared evidence is not bound to the source contract")
+          if judged.get("prepared_manifest_sha256") != os.environ["EXPECTED_PREPARED_MANIFEST_SHA256"]:
+              raise SystemExit("judge evidence is not bound to prepared evidence")
+          copied_source = evidence / "prepared/preflight-manifest.json"
+          copied_source_sha = "sha256:" + hashlib.sha256(copied_source.read_bytes()).hexdigest()
+          if copied_source_sha != os.environ["EXPECTED_SOURCE_MANIFEST_SHA256"]:
+              raise SystemExit("prepared evidence contains the wrong source contract")
+
+          for root, manifest, label in (
+              (evidence / "prepared", prepared, "prepared"),
+              (evidence / "judged", judged, "judged"),
+          ):
+              for relative, expected in manifest.get("files", {}).items():
+                  candidate = root / relative
+                  if not candidate.is_file() or candidate.is_symlink():
+                      raise SystemExit(f"{label} evidence file missing: {relative}")
+                  actual = "sha256:" + hashlib.sha256(candidate.read_bytes()).hexdigest()
+                  if actual != expected:
+                      raise SystemExit(f"{label} evidence file changed: {relative}")
+
+          expected_images = {
+              "api": os.environ["API_IMAGE"],
+              "worker": os.environ["WORKER_IMAGE"],
+              "frontend": os.environ["FRONTEND_IMAGE"],
+              "model_bundle": os.environ["MODEL_BUNDLE_IMAGE"],
+          }
+          if prepared.get("candidate_images") != expected_images:
+              raise SystemExit("production image snapshot differs from evaluated candidate_images")
+          if prepared.get("model_bundle_digest") != os.environ["MODEL_BUNDLE_DIGEST"]:
+              raise SystemExit("production model bundle differs from evaluated candidate")
+          if prepared.get("model_manifest_sha256") != os.environ["MODEL_MANIFEST_SHA256"]:
+              raise SystemExit("production model manifest differs from evaluated candidate")
+          if source.get("revision") != prepared.get("revision"):
+              raise SystemExit("source and prepared revisions differ")
+          PY
+
+      - name: Approve baseline from verified passing reports only
+        run: |
+          mkdir -p "$RUNNER_TEMP/industrial-rag-release"
+          python scripts/approve_release_baseline.py \
+            --baseline eval/release_baseline.json \
+            --ragas-gate "$RUNNER_TEMP/release-evidence/judged/quality-gate.json" \
+            --expanded-gate "$RUNNER_TEMP/release-evidence/judged/expanded-gate.json" \
+            --holdout-gate "$RUNNER_TEMP/release-evidence/judged/holdout-gate.json" \
+            --production-env "$ENV_FILE" \
+            --write
+          python scripts/validate_release_baseline.py
+          cp eval/release_baseline.json \
+            "$RUNNER_TEMP/industrial-rag-release/release_baseline.json"
+
+      - name: Install cosign for signature verification
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Verify signed production images
+        env:
+          COSIGN_CERTIFICATE_IDENTITY: ${{ vars.COSIGN_CERTIFICATE_IDENTITY }}
+          COSIGN_CERTIFICATE_OIDC_ISSUER: https://token.actions.githubusercontent.com
+          API_IMAGE: ${{ steps.release_images.outputs.api }}
+          WORKER_IMAGE: ${{ steps.release_images.outputs.worker }}
+          FRONTEND_IMAGE: ${{ steps.release_images.outputs.frontend }}
+          MODEL_BUNDLE_IMAGE: ${{ steps.release_images.outputs.model_bundle }}
+        run: |
+          set -euo pipefail
+          identity="${COSIGN_CERTIFICATE_IDENTITY:?Set the exact protected build-workflow certificate identity}"
+          for image in \
+            "$API_IMAGE" \
+            "$WORKER_IMAGE" \
+            "$FRONTEND_IMAGE" \
+            "$MODEL_BUNDLE_IMAGE"; do
+            name="$(printf '%s' "$image" | tr '/:@' '___')"
+            cosign verify \
+              --certificate-identity "$identity" \
+              --certificate-oidc-issuer "$COSIGN_CERTIFICATE_OIDC_ISSUER" \
+              "$image" > "$RUNNER_TEMP/cosign-$name.json"
+          done
+
+      - name: Verify atomic production image-set attestation
+        env:
+          API_IMAGE: ${{ steps.release_images.outputs.api }}
+          WORKER_IMAGE: ${{ steps.release_images.outputs.worker }}
+          FRONTEND_IMAGE: ${{ steps.release_images.outputs.frontend }}
+          MODEL_BUNDLE_IMAGE: ${{ steps.release_images.outputs.model_bundle }}
+          MODEL_MANIFEST_SHA256: ${{ steps.release_images.outputs.model_manifest_sha256 }}
+          PUBLISHER_IDENTITY: ${{ vars.COSIGN_CERTIFICATE_IDENTITY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_set_type="$(python scripts/release_set_attestation.py predicate-type \
+            --github-repository "$GITHUB_REPOSITORY")"
+          publisher_identity="${PUBLISHER_IDENTITY:?Set the exact protected image-publisher identity}"
+          verification_output="$RUNNER_TEMP/cosign-image-set-attestation.json"
+          cosign verify-attestation \
+            --certificate-identity "$publisher_identity" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-github-workflow-sha "$GITHUB_SHA" \
+            --type "$image_set_type" \
+            "$API_IMAGE" > "$verification_output"
+          VERIFIED_DSSE="$verification_output" \
+          EXPECTED_PREDICATE_TYPE="$image_set_type" \
+          EXPECTED_PUBLISHER_IDENTITY="$publisher_identity" \
+          python - <<'PY' > "$RUNNER_TEMP/image-set-workflow-runs"
+          import base64
+          import json
+          import os
+          from pathlib import Path
+
+          documents = json.loads(Path(os.environ["VERIFIED_DSSE"]).read_text(encoding="utf-8"))
+          if not isinstance(documents, list):
+              documents = [documents]
+          values = set()
+          for envelope in documents:
+              if not isinstance(envelope, dict):
+                  continue
+              if envelope.get("payloadType") != "application/vnd.in-toto+json":
+                  continue
+              payload = envelope.get("payload")
+              if not isinstance(payload, str):
+                  continue
+              statement = json.loads(base64.b64decode(payload, validate=True).decode("utf-8"))
+              if statement.get("predicateType") != os.environ["EXPECTED_PREDICATE_TYPE"]:
+                  continue
+              predicate = statement.get("predicate") or {}
+              source = predicate.get("source") or {}
+              if source.get("publisherIdentity") != os.environ["EXPECTED_PUBLISHER_IDENTITY"]:
+                  continue
+              workflow_run = source.get("workflowRun")
+              if isinstance(workflow_run, str):
+                  values.add(workflow_run)
+          if not values:
+              raise SystemExit("verified DSSE contains no approved image-set workflow run")
+          print("\n".join(sorted(values)))
+          PY
+          verified=false
+          while IFS= read -r workflow_run; do
+            if python scripts/release_set_attestation.py verify-attestation \
+              --verification-output "$verification_output" \
+              --project-root . \
+              --github-repository "$GITHUB_REPOSITORY" \
+              --source-revision "$GITHUB_SHA" \
+              --workflow-run "$workflow_run" \
+              --publisher-identity "$publisher_identity" \
+              --model-bundle-image "$MODEL_BUNDLE_IMAGE" \
+              --api-image "$API_IMAGE" \
+              --worker-image "$WORKER_IMAGE" \
+              --frontend-image "$FRONTEND_IMAGE" \
+              --model-manifest-sha256 "$MODEL_MANIFEST_SHA256"; then
+              verified=true
+              break
+            fi
+          done < "$RUNNER_TEMP/image-set-workflow-runs"
+          test "$verified" = true
+
+      - name: Bind application images to this source revision and model manifest
+        env:
+          API_IMAGE: ${{ steps.release_images.outputs.api }}
+          WORKER_IMAGE: ${{ steps.release_images.outputs.worker }}
+          FRONTEND_IMAGE: ${{ steps.release_images.outputs.frontend }}
+          MODEL_BUNDLE_IMAGE: ${{ steps.release_images.outputs.model_bundle }}
+          MODEL_BUNDLE_DIGEST: ${{ steps.release_images.outputs.model_bundle_digest }}
+          MODEL_MANIFEST_SHA256: ${{ steps.release_images.outputs.model_manifest_sha256 }}
+          EXPECTED_SOURCE: https://github.com/${{ github.repository }}
+          EXPECTED_REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          for image in "$API_IMAGE" "$WORKER_IMAGE" "$FRONTEND_IMAGE"; do
+            docker pull "$image"
+            revision="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$image")"
+            source="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.source" }}' "$image")"
+            test "$revision" = "$EXPECTED_REVISION"
+            test "$source" = "$EXPECTED_SOURCE"
+          done
+          for image in "$API_IMAGE" "$WORKER_IMAGE"; do
+            bundled_digest="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.model-bundle-digest" }}' "$image")"
+            bundled_manifest="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.model-manifest-sha256" }}' "$image")"
+            test "$bundled_digest" = "$MODEL_BUNDLE_DIGEST"
+            test "$bundled_manifest" = "$MODEL_MANIFEST_SHA256"
+          done
+          test "${MODEL_BUNDLE_IMAGE##*@}" = "$MODEL_BUNDLE_DIGEST"
+          docker pull "$MODEL_BUNDLE_IMAGE"
+          model_source="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.source" }}' "$MODEL_BUNDLE_IMAGE")"
+          model_manifest_label="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.model-manifest-sha256" }}' "$MODEL_BUNDLE_IMAGE")"
+          test "$model_source" = "$EXPECTED_SOURCE"
+          test "$model_manifest_label" = "$MODEL_MANIFEST_SHA256"
+          model_container="$(docker create "$MODEL_BUNDLE_IMAGE" /nonexistent)"
+          trap 'docker rm -f "$model_container" >/dev/null 2>&1 || true' EXIT
+          docker cp "$model_container:/models/model-manifest.json" "$RUNNER_TEMP/industrial-rag-release/model-manifest.json"
+          actual_manifest_sha="sha256:$(sha256sum "$RUNNER_TEMP/industrial-rag-release/model-manifest.json" | awk '{print $1}')"
+          test "$actual_manifest_sha" = "$MODEL_MANIFEST_SHA256"
+          docker rm "$model_container" >/dev/null
+          trap - EXIT
+          for entry in "api=$API_IMAGE" "worker=$WORKER_IMAGE"; do
+            name="${entry%%=*}"
+            image="${entry#*=}"
+            application_container="$(docker create "$image")"
+            trap 'docker rm -f "$application_container" >/dev/null 2>&1 || true' EXIT
+            docker cp "$application_container:/app/models/model-manifest.json" \
+              "$RUNNER_TEMP/industrial-rag-release/$name-model-manifest.json"
+            application_manifest_sha="sha256:$(sha256sum "$RUNNER_TEMP/industrial-rag-release/$name-model-manifest.json" | awk '{print $1}')"
+            test "$application_manifest_sha" = "$MODEL_MANIFEST_SHA256"
+            docker rm "$application_container" >/dev/null
+            trap - EXIT
+          done
+
+      - name: Generate source security SBOM
+        if: always()
+        uses: anchore/sbom-action@da167eac915b4e86f08b264dbdbc867b61be6f0c # v0.20.5
+        with:
+          path: ./industrial-rag
+          format: cyclonedx-json
+          artifact-name: industrial-rag-release-source-sbom.cdx.json
+          output-file: ${{ runner.temp }}/industrial-rag-release-source-sbom.cdx.json
+
+      - name: Scan API image
+        if: always()
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.release_images.outputs.api }}
+          scanners: vuln,secret,misconfig
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          format: sarif
+          output: ${{ runner.temp }}/trivy-api.sarif
+          exit-code: 1
+
+      - name: Scan Worker image
+        if: always()
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.release_images.outputs.worker }}
+          scanners: vuln,secret,misconfig
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          format: sarif
+          output: ${{ runner.temp }}/trivy-worker.sarif
+          exit-code: 1
+
+      - name: Scan Frontend image
+        if: always()
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.release_images.outputs.frontend }}
+          scanners: vuln,secret,misconfig
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          format: sarif
+          output: ${{ runner.temp }}/trivy-frontend.sarif
+          exit-code: 1
+
+      - name: Generate image SBOMs
+        if: always()
+        uses: anchore/sbom-action@da167eac915b4e86f08b264dbdbc867b61be6f0c # v0.20.5
+        with:
+          image: ${{ steps.release_images.outputs.api }}
+          format: cyclonedx-json
+          artifact-name: industrial-rag-release-api-sbom.cdx.json
+          output-file: ${{ runner.temp }}/industrial-rag-release-api-sbom.cdx.json
+
+      - name: Generate Worker SBOM
+        if: always()
+        uses: anchore/sbom-action@da167eac915b4e86f08b264dbdbc867b61be6f0c # v0.20.5
+        with:
+          image: ${{ steps.release_images.outputs.worker }}
+          format: cyclonedx-json
+          artifact-name: industrial-rag-release-worker-sbom.cdx.json
+          output-file: ${{ runner.temp }}/industrial-rag-release-worker-sbom.cdx.json
+
+      - name: Generate Frontend SBOM
+        if: always()
+        uses: anchore/sbom-action@da167eac915b4e86f08b264dbdbc867b61be6f0c # v0.20.5
+        with:
+          image: ${{ steps.release_images.outputs.frontend }}
+          format: cyclonedx-json
+          artifact-name: industrial-rag-release-frontend-sbom.cdx.json
+          output-file: ${{ runner.temp }}/industrial-rag-release-frontend-sbom.cdx.json
+
+      - name: Render and validate production manifests
+        env:
+          API_IMAGE: ${{ steps.release_images.outputs.api }}
+          WORKER_IMAGE: ${{ steps.release_images.outputs.worker }}
+          FRONTEND_IMAGE: ${{ steps.release_images.outputs.frontend }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/industrial-rag-release/k8s"
+          kubectl kustomize deploy/kustomize/production \
+            > "$RUNNER_TEMP/industrial-rag-release/k8s/kustomize.yaml"
+          python scripts/render_production_manifests.py \
+            --input "$RUNNER_TEMP/industrial-rag-release/k8s/kustomize.yaml" \
+            --output "$RUNNER_TEMP/industrial-rag-release/k8s/rendered.yaml" \
+            --env-file "$ENV_FILE"
+          python scripts/validate_kubernetes_manifests.py \
+            --manifest "$RUNNER_TEMP/industrial-rag-release/k8s/rendered.yaml" \
+            --expected-api-image "$API_IMAGE" \
+            --expected-worker-image "$WORKER_IMAGE" \
+            --expected-frontend-image "$FRONTEND_IMAGE"
+          python scripts/render_kubernetes_secrets.py \
+            --env-file "$ENV_FILE" --namespace rag-production \
+            --runtime-output "$RUNNER_TEMP/rag-runtime.yaml" \
+            --migration-output "$RUNNER_TEMP/rag-migration.yaml" \
+            --canary-output "$RUNNER_TEMP/rag-canary.yaml"
+          python scripts/select_kubernetes_manifest.py \
+            --input "$RUNNER_TEMP/industrial-rag-release/k8s/rendered.yaml" \
+            --output "$RUNNER_TEMP/industrial-rag-release/k8s/release-configmaps.yaml" \
+            --kind ConfigMap
+          python scripts/select_kubernetes_manifest.py \
+            --input "$RUNNER_TEMP/industrial-rag-release/k8s/rendered.yaml" \
+            --output "$RUNNER_TEMP/industrial-rag-release/k8s/platform-baseline.yaml" \
+            --kind Namespace --kind ServiceAccount --kind Service \
+            --kind Ingress --kind PodDisruptionBudget --kind NetworkPolicy
+          python scripts/select_kubernetes_manifest.py \
+            --input "$RUNNER_TEMP/industrial-rag-release/k8s/rendered.yaml" \
+            --output "$RUNNER_TEMP/industrial-rag-release/k8s/migration.yaml" \
+            --kind Job --name rag-postgres-migration
+          python scripts/select_kubernetes_manifest.py \
+            --input "$RUNNER_TEMP/industrial-rag-release/k8s/rendered.yaml" \
+            --output "$RUNNER_TEMP/industrial-rag-release/k8s/canary.yaml" \
+            --kind Job --name rag-canary
+          python scripts/select_kubernetes_manifest.py \
+            --input "$RUNNER_TEMP/industrial-rag-release/k8s/rendered.yaml" \
+            --output "$RUNNER_TEMP/industrial-rag-release/k8s/deployments.yaml" \
+            --kind Deployment
+
+      - name: Verify pre-provisioned platform baseline has no drift
+        run: |
+          set +e
+          kubectl diff --server-side --field-manager=industrial-rag-platform \
+            -f "$RUNNER_TEMP/industrial-rag-release/k8s/platform-baseline.yaml"
+          diff_status=$?
+          set -e
+          if [ "$diff_status" -eq 1 ]; then
+            echo "Platform baseline drift detected; application releases never mutate shared traffic or policy resources." >&2
+            exit 1
+          fi
+          if [ "$diff_status" -ne 0 ]; then
+            echo "Platform baseline validation failed with kubectl status $diff_status." >&2
+            exit "$diff_status"
+          fi
+
+      - name: Snapshot stable rollback state and validate previous release resources
+        run: |
+          set -euo pipefail
+          rollback_root="$RUNNER_TEMP/industrial-rag-release"
+          mkdir -p "$rollback_root/previous-revisions"
+          mkdir -p "$rollback_root/previous-generations"
+          mkdir -p "$rollback_root/previous-uids"
+          mkdir -p "$rollback_root/previous-deployments"
+          mkdir -p "$rollback_root/previous-resource-refs"
+          mkdir -p "$rollback_root/new-deployments"
+          for deployment in rag-api rag-worker rag-frontend; do
+            snapshot="$(kubectl -n rag-production get deployment "$deployment" --ignore-not-found -o jsonpath='{.metadata.uid}{"|"}{.metadata.generation}{"|"}{.metadata.annotations.deployment\.kubernetes\.io/revision}')"
+            if [ -z "$snapshot" ]; then
+              : > "$rollback_root/new-deployments/$deployment"
+              continue
+            fi
+            IFS='|' read -r uid generation revision <<< "$snapshot"
+            test -n "$uid" && test -n "$generation" && test -n "$revision"
+            printf '%s' "$uid" > "$rollback_root/previous-uids/$deployment"
+            printf '%s' "$revision" > "$rollback_root/previous-revisions/$deployment"
+            printf '%s' "$generation" > "$rollback_root/previous-generations/$deployment"
+            kubectl -n rag-production get deployment "$deployment" -o yaml \
+              > "$rollback_root/previous-deployments/$deployment.yaml"
+            python scripts/list_workload_resource_refs.py \
+              --manifest "$rollback_root/previous-deployments/$deployment.yaml" \
+              > "$rollback_root/previous-resource-refs/$deployment"
+            while IFS= read -r resource_ref; do
+              test -n "$resource_ref" || continue
+              kubectl -n rag-production get "$resource_ref" -o name > /dev/null
+            done < "$rollback_root/previous-resource-refs/$deployment"
+          done
+
+      - name: Validate ingress TLS Secret and certificate
+        env:
+          INGRESS_HOST: ${{ steps.release_images.outputs.ingress_host }}
+        run: |
+          set -euo pipefail
+          secret_type="$(kubectl -n rag-production get secret rag-ingress-tls -o jsonpath='{.type}')"
+          certificate_b64="$(kubectl -n rag-production get secret rag-ingress-tls -o jsonpath='{.data.tls\.crt}')"
+          private_key_b64="$(kubectl -n rag-production get secret rag-ingress-tls -o jsonpath='{.data.tls\.key}')"
+          test "$secret_type" = "kubernetes.io/tls"
+          test -n "$certificate_b64" && test -n "$private_key_b64"
+          certificate_pem="$(printf '%s' "$certificate_b64" | base64 --decode)"
+          private_key_pem="$(printf '%s' "$private_key_b64" | base64 --decode)"
+          printf '%s' "$certificate_pem" | openssl x509 -noout -checkend 604800
+          printf '%s' "$certificate_pem" | openssl x509 -noout -checkhost "$INGRESS_HOST"
+          certificate_key_sha="$(printf '%s' "$certificate_pem" | openssl x509 -pubkey -noout | openssl pkey -pubin -outform DER | sha256sum | awk '{print $1}')"
+          private_key_sha="$(printf '%s' "$private_key_pem" | openssl pkey -pubout -outform DER | sha256sum | awk '{print $1}')"
+          test "$certificate_key_sha" = "$private_key_sha"
+
+      - name: Validate zero-downtime runtime credential rotation
+        run: |
+          set -euo pipefail
+          umask 077
+          current_runtime_secret="$(kubectl -n rag-production get deployment rag-api \
+            --ignore-not-found \
+            -o jsonpath='{range .spec.template.spec.containers[?(@.name=="api")].envFrom[*]}{.secretRef.name}{"\n"}{end}' \
+            | sed '/^$/d')"
+          if [ -n "$current_runtime_secret" ]; then
+            [[ "$current_runtime_secret" =~ ^rag-runtime(-[0-9a-f]{20})?$ ]]
+            kubectl -n rag-production get secret "$current_runtime_secret" -o yaml \
+              > "$RUNNER_TEMP/rag-runtime-current.yaml"
+          else
+            : > "$RUNNER_TEMP/rag-runtime-current.yaml"
+          fi
+          chmod 600 "$RUNNER_TEMP/rag-runtime-current.yaml"
+          python scripts/validate_runtime_credential_rotation.py \
+            --current "$RUNNER_TEMP/rag-runtime-current.yaml" \
+            --desired "$RUNNER_TEMP/rag-runtime.yaml"
+
+      - name: Apply immutable release ConfigMaps
+        run: |
+          kubectl apply --server-side --dry-run=server \
+            -f "$RUNNER_TEMP/industrial-rag-release/k8s/release-configmaps.yaml"
+          kubectl apply --server-side \
+            -f "$RUNNER_TEMP/industrial-rag-release/k8s/release-configmaps.yaml"
+
+      - name: Apply migration Secret Manager mapping
+        shell: bash
+        run: |
+          set -euo pipefail
+          migration_secret_name="$(python -c "import sys,yaml; print(yaml.safe_load(open(sys.argv[1], encoding='utf-8'))['metadata']['name'])" "$RUNNER_TEMP/rag-migration.yaml")"
+          test -n "$migration_secret_name"
+          printf '%s' "$migration_secret_name" > "$RUNNER_TEMP/migration-secret-name"
+          kubectl apply --server-side --dry-run=server \
+            -f "$RUNNER_TEMP/rag-migration.yaml"
+          kubectl apply --server-side \
+            -f "$RUNNER_TEMP/rag-migration.yaml"
+          kubectl -n rag-production get "secret/$migration_secret_name" \
+            -o jsonpath='{.metadata.uid}' > "$RUNNER_TEMP/migration-secret-uid"
+          test -s "$RUNNER_TEMP/migration-secret-uid"
+
+      - name: Run database migration Job
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl -n rag-production delete job rag-postgres-migration --ignore-not-found --wait=true
+          kubectl apply --server-side -f "$RUNNER_TEMP/industrial-rag-release/k8s/migration.yaml"
+          kubectl -n rag-production get job/rag-postgres-migration \
+            -o jsonpath='{.metadata.uid}' > "$RUNNER_TEMP/migration-job-uid"
+          test -s "$RUNNER_TEMP/migration-job-uid"
+          kubectl -n rag-production wait --for=condition=complete \
+            --timeout=15m job/rag-postgres-migration
+
+      - name: Apply runtime and functional-canary Secrets after successful role provisioning
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl apply --server-side --dry-run=server -f "$RUNNER_TEMP/rag-runtime.yaml"
+          kubectl apply --server-side -f "$RUNNER_TEMP/rag-runtime.yaml"
+          canary_secret_name="$(python -c "import sys,yaml; print(yaml.safe_load(open(sys.argv[1], encoding='utf-8'))['metadata']['name'])" "$RUNNER_TEMP/rag-canary.yaml")"
+          test -n "$canary_secret_name"
+          printf '%s' "$canary_secret_name" > "$RUNNER_TEMP/canary-secret-name"
+          kubectl apply --server-side --dry-run=server -f "$RUNNER_TEMP/rag-canary.yaml"
+          kubectl apply --server-side -f "$RUNNER_TEMP/rag-canary.yaml"
+          kubectl -n rag-production get "secret/$canary_secret_name" \
+            -o jsonpath='{.metadata.uid}' > "$RUNNER_TEMP/canary-secret-uid"
+          test -s "$RUNNER_TEMP/canary-secret-uid"
+
+      - name: Run canary Job before stable rollout
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl -n rag-production delete job rag-canary --ignore-not-found --wait=true
+          kubectl apply --server-side -f "$RUNNER_TEMP/industrial-rag-release/k8s/canary.yaml"
+          kubectl -n rag-production get job/rag-canary \
+            -o jsonpath='{.metadata.uid}' > "$RUNNER_TEMP/canary-job-uid"
+          test -s "$RUNNER_TEMP/canary-job-uid"
+          kubectl -n rag-production wait --for=condition=complete \
+            --timeout=15m job/rag-canary
+
+      - name: Roll out stable Deployments
+        id: stable_rollout
+        run: |
+          set -euo pipefail
+          rollback_root="$RUNNER_TEMP/industrial-rag-release"
+          mkdir -p "$rollback_root/release-generations"
+          mkdir -p "$rollback_root/release-uids"
+          mkdir -p "$rollback_root/changed-deployments"
+          for deployment in rag-api rag-worker rag-frontend; do
+            current_snapshot="$(kubectl -n rag-production get deployment "$deployment" --ignore-not-found -o jsonpath='{.metadata.uid}{"|"}{.metadata.generation}')"
+            if [ -f "$rollback_root/new-deployments/$deployment" ]; then
+              test -z "$current_snapshot"
+              continue
+            fi
+            IFS='|' read -r current_uid current_generation <<< "$current_snapshot"
+            test "$current_uid" = "$(<"$rollback_root/previous-uids/$deployment")"
+            test "$current_generation" = "$(<"$rollback_root/previous-generations/$deployment")"
+          done
+          apply_status=0
+          kubectl apply --server-side -f "$RUNNER_TEMP/industrial-rag-release/k8s/deployments.yaml" || apply_status=$?
+          changed=false
+          inspect_status=0
+          for deployment in rag-api rag-worker rag-frontend; do
+            release_snapshot="$(kubectl -n rag-production get deployment "$deployment" --ignore-not-found -o jsonpath='{.metadata.uid}{"|"}{.metadata.generation}')" || inspect_status=1
+            if [ -z "$release_snapshot" ]; then
+              inspect_status=1
+              continue
+            fi
+            IFS='|' read -r release_uid release_generation <<< "$release_snapshot"
+            printf '%s' "$release_uid" > "$RUNNER_TEMP/industrial-rag-release/release-uids/$deployment"
+            printf '%s' "$release_generation" > "$RUNNER_TEMP/industrial-rag-release/release-generations/$deployment"
+            if [ -f "$RUNNER_TEMP/industrial-rag-release/new-deployments/$deployment" ]; then
+              changed=true
+              : > "$RUNNER_TEMP/industrial-rag-release/changed-deployments/$deployment"
+              continue
+            fi
+            previous_generation="$(<"$RUNNER_TEMP/industrial-rag-release/previous-generations/$deployment")"
+            if [ "$release_generation" != "$previous_generation" ]; then
+              changed=true
+              : > "$RUNNER_TEMP/industrial-rag-release/changed-deployments/$deployment"
+            fi
+          done
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          if [ "$apply_status" -ne 0 ] || [ "$inspect_status" -ne 0 ]; then exit 1; fi
+          kubectl -n rag-production rollout status --timeout=15m deployment/rag-api
+          kubectl -n rag-production rollout status --timeout=15m deployment/rag-worker
+          kubectl -n rag-production rollout status --timeout=15m deployment/rag-frontend
+
+      - name: Run read-only production ingress smoke
+        env:
+          INGRESS_HOST: ${{ steps.release_images.outputs.ingress_host }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --request GET --fail --silent --show-error --output /dev/null "https://${INGRESS_HOST}/health/live"
+          curl --request GET --fail --silent --show-error --output /dev/null "https://${INGRESS_HOST}/health/ready"
+
+      - name: Upload protected release artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: industrial-rag-protected-release-artifacts
+          path: |
+            ${{ runner.temp }}/industrial-rag-release
+            ${{ runner.temp }}/release-evidence
+            ${{ runner.temp }}/trivy-*.sarif
+            ${{ runner.temp }}/cosign-*.json
+            ${{ runner.temp }}/industrial-rag-release-*-sbom.cdx.json
+          if-no-files-found: error
+
+      # Keep this after every potentially failing release step.  A missing
+      # artifact is a failed protected release too; it must not leave a
+      # candidate Deployment installed while the workflow reports failure.
+      - name: Restore exact previous Deployment revisions after any release failure
+        if: failure() && steps.stable_rollout.outputs.changed == 'true'
+        run: |
+          set +e
+          rollback_status=0
+          for deployment in rag-api rag-worker rag-frontend; do
+            if [ ! -f "$RUNNER_TEMP/industrial-rag-release/changed-deployments/$deployment" ]; then
+              continue
+            fi
+            release_uid="$(<"$RUNNER_TEMP/industrial-rag-release/release-uids/$deployment")"
+            release_generation="$(<"$RUNNER_TEMP/industrial-rag-release/release-generations/$deployment")"
+            current_snapshot="$(kubectl -n rag-production get deployment "$deployment" --ignore-not-found -o jsonpath='{.metadata.uid}{"|"}{.metadata.generation}')"
+            IFS='|' read -r current_uid current_generation <<< "$current_snapshot"
+            if [ "$current_uid" != "$release_uid" ] || [ "$current_generation" != "$release_generation" ]; then
+              echo "Refusing to overwrite concurrent identity/generation for deployment/$deployment" >&2
+              rollback_status=1
+              continue
+            fi
+            if [ -f "$RUNNER_TEMP/industrial-rag-release/new-deployments/$deployment" ]; then
+              kubectl -n rag-production delete "deployment/$deployment" --wait=true || rollback_status=1
+              continue
+            fi
+            previous_revision="$(<"$RUNNER_TEMP/industrial-rag-release/previous-revisions/$deployment")"
+            while IFS= read -r resource_ref; do
+              test -n "$resource_ref" || continue
+              kubectl -n rag-production get "$resource_ref" -o name > /dev/null || rollback_status=1
+            done < "$RUNNER_TEMP/industrial-rag-release/previous-resource-refs/$deployment"
+            kubectl -n rag-production rollout undo "deployment/$deployment" --to-revision="$previous_revision" || rollback_status=1
+            kubectl -n rag-production rollout status --timeout=15m "deployment/$deployment" || rollback_status=1
+          done
+          exit "$rollback_status"
+
+      - name: Cleanup temporary Kubernetes release resources
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          cleanup_status=0
+          delete_owned() {
+            kind="$1"
+            name="$2"
+            uid_file="$3"
+            if [ -z "$name" ]; then
+              return
+            fi
+            current_uid="$(kubectl -n rag-production get "$kind/$name" \
+              --ignore-not-found -o jsonpath='{.metadata.uid}' 2>/dev/null)"
+            if [ -z "$current_uid" ]; then
+              return
+            fi
+            if [ ! -s "$uid_file" ]; then
+              echo "Refusing to delete untracked temporary $kind/$name" >&2
+              cleanup_status=1
+              return
+            fi
+            expected_uid="$(<"$uid_file")"
+            if [ "$current_uid" != "$expected_uid" ]; then
+              echo "Refusing to delete concurrently replaced $kind/$name" >&2
+              cleanup_status=1
+              return
+            fi
+            kubectl -n rag-production delete "$kind/$name" --wait=true || cleanup_status=1
+          }
+          delete_owned job rag-canary "$RUNNER_TEMP/canary-job-uid"
+          delete_owned job rag-postgres-migration "$RUNNER_TEMP/migration-job-uid"
+          migration_secret_name=""
+          canary_secret_name=""
+          if [ -s "$RUNNER_TEMP/migration-secret-name" ]; then
+            migration_secret_name="$(<"$RUNNER_TEMP/migration-secret-name")"
+          fi
+          if [ -s "$RUNNER_TEMP/canary-secret-name" ]; then
+            canary_secret_name="$(<"$RUNNER_TEMP/canary-secret-name")"
+          fi
+          delete_owned secret "$migration_secret_name" "$RUNNER_TEMP/migration-secret-uid"
+          delete_owned secret "$canary_secret_name" "$RUNNER_TEMP/canary-secret-uid"
+          exit "$cleanup_status"
+
+      - name: Remove protected temporary credentials
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          rm -f "$ENV_FILE" \
+            "$RUNNER_TEMP/rag-runtime.yaml" \
+            "$RUNNER_TEMP/rag-migration.yaml" \
+            "$RUNNER_TEMP/rag-canary.yaml" \
+            "$RUNNER_TEMP/rag-runtime-current.yaml" \
+            "$RUNNER_TEMP/migration-secret-name" \
+            "$RUNNER_TEMP/migration-secret-uid" \
+            "$RUNNER_TEMP/migration-job-uid" \
+            "$RUNNER_TEMP/canary-secret-name" \
+            "$RUNNER_TEMP/canary-secret-uid" \
+            "$RUNNER_TEMP/canary-job-uid"

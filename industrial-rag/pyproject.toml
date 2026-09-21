@@ -9,20 +9,20 @@ license = {text = "Apache-2.0"}
 
 dependencies = [
     # Core Framework
-    "fastapi>=0.110.0",
+    "fastapi>=0.139.2,<0.140",
     "uvicorn[standard]>=0.27.0",
+    "gunicorn>=22.0,<24; platform_system != 'Windows'",
     "pydantic>=2.6.0",
     "pydantic-settings>=2.1.0",
 
     # LLM & RAG
-    "transformers>=4.38.0",
-    "torch>=2.2.0",
-    "sentence-transformers>=2.3.0",
+    "transformers>=5.16.1,<6",
+    "torch>=2.13.0,<2.14",
+    "sentence-transformers>=6.0.0,<7",
 
     # LLM API Clients
     "anthropic>=0.25.0",     # Claude
     "openai>=1.30.0",        # OpenAI-compatible (DeepSeek)
-    "zhipuai>=2.0.0",        # 智谱AI
 
     # Vector Database
     "redis>=5.0.0",
@@ -38,15 +38,19 @@ dependencies = [
     # Message Queue
     "celery[redis]>=5.3.0",
 
+    # S3-compatible object storage for distributed Celery uploads
+    "boto3>=1.35.0,<2",
+
     # Monitoring & Logging
     "prometheus-client>=0.20.0",
-    "prometheus-fastapi-instrumentator>=7.0.0",
+    "prometheus-fastapi-instrumentator>=8.0.0,<9",
     "structlog>=24.1.0",
     "python-json-logger>=2.0.7",
 
     # HTTP & Network
     "httpx>=0.27.0",
     "python-multipart>=0.0.9",
+    "PyJWT[crypto]>=2.9.0,<3",
 
     # Configuration
     "pyyaml>=6.0.1",
@@ -91,6 +95,10 @@ dev = [
     "ruff>=0.2.0",
     "black>=24.1.0",
     "mypy>=1.8.0",
+    "types-PyYAML>=6.0.12,<7",
+    "types-redis>=4.6,<5",
+    "types-psycopg2>=2.9,<3",
+    "pandas-stubs>=2.2,<3",
     "ipython>=8.21.0",
     "jupyter>=1.0.0",
 ]
@@ -101,14 +109,10 @@ benchmark = [
     "seaborn>=0.13.0",
 ]
 
-# Ragas 0.4.3 still imports integrations removed by LangChain Community 0.4.
-# Keep this optional evaluation stack pinned until upstream relaxes that coupling.
+# The protected judge is deliberately dependency-minimal. Do not add Ragas,
+# LangChain, cache deserializers, URL loaders, or multimodal fetchers here.
 evaluation = [
-    "ragas==0.4.3",
-    "langchain==0.3.27",
-    "langchain-community==0.3.31",
-    "langchain-core==0.3.80",
-    "langchain-openai==0.3.35",
+    "openai==3.6.0",
 ]
 
 [build-system]
@@ -160,17 +164,35 @@ ignore = [
 "__init__.py" = ["F401"]
 
 [tool.mypy]
-python_version = "3.11"
+# Targets 3.12 although the package supports >=3.11. NumPy's bundled stubs,
+# reached transitively through openai, use `type` statements that mypy refuses
+# to parse below 3.12, and that aborts the entire run. Real 3.11 compatibility
+# stays guarded by the CI matrix, which runs the test suite on 3.11 and 3.12.
+python_version = "3.12"
+# Use third-party type information without reporting errors inside those
+# packages. Not "skip": that would discard the type information rather than
+# just silencing other people's errors.
+follow_imports = "silent"
+# scripts/ has no __init__.py, so without this mypy resolves the same file as
+# both "postgres_cli" and "scripts.postgres_cli" and refuses to check anything.
+explicit_package_bases = true
+mypy_path = "."
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
+# Ship no type information, or live only in the GPU/evaluation extras that CI
+# does not install. Every one of these is imported behind a try/except.
 module = [
-    "pymilvus.*",
+    "celery.*",
+    "fitz.*",
+    "jinja2.*",
     "magic_pdf.*",
-    "FlagEmbedding.*",
+    "sentence_transformers.*",
+    "tiktoken.*",
+    "torch.*",
 ]
 ignore_missing_imports = true
 

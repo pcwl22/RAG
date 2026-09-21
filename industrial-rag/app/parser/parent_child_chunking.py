@@ -2,7 +2,7 @@
 import re
 from typing import Any
 
-from app.utils.config import get_settings
+from app.utils.config import get_config_section
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -26,12 +26,12 @@ DEFAULT_SEPARATORS = [
 ARTICLE_PATTERN = re.compile(r"(?m)^第[一二三四五六七八九十百千万零〇两0-9]+条[^\n]*")
 
 
-def _chunking_config() -> dict:
-    return get_settings().get("document_processing", {}).get("chunking", {})
+def _chunking_config() -> dict[str, Any]:
+    return get_config_section("document_processing", "chunking")
 
 
-def _parent_child_config() -> dict:
-    return _chunking_config().get("parent_child", {})
+def _parent_child_config() -> dict[str, Any]:
+    return get_config_section("document_processing", "chunking", "parent_child")
 
 
 def _normalize_text(text: str) -> str:
@@ -72,11 +72,21 @@ def _merge_chunks(splits: list[str], target_size: int, overlap: int) -> list[str
     current: list[str] = []
     current_len = 0
 
-    for split in splits:
-        split = split.strip()
-        if not split:
-            continue
+    bounded_splits = [
+        piece
+        for raw_split in splits
+        for piece in (
+            [raw_split.strip()]
+            if len(raw_split.strip()) <= target_size
+            else [
+                raw_split.strip()[index : index + target_size]
+                for index in range(0, len(raw_split.strip()), target_size)
+            ]
+        )
+        if piece
+    ]
 
+    for split in bounded_splits:
         separator_len = 1 if current else 0
         if current and current_len + separator_len + len(split) > target_size:
             chunk = "\n".join(current).strip()
@@ -94,7 +104,11 @@ def _merge_chunks(splits: list[str], target_size: int, overlap: int) -> list[str
 
             current = overlap_parts
             current_len = sum(len(part) for part in current) + max(0, len(current) - 1)
+            while current and current_len + 1 + len(split) > target_size:
+                current.pop(0)
+                current_len = sum(len(part) for part in current) + max(0, len(current) - 1)
 
+        separator_len = 1 if current else 0
         current.append(split)
         current_len += len(split) + separator_len
 
@@ -124,7 +138,7 @@ def _extract_legal_articles(text: str) -> list[str]:
 def _split_long_article(article: str, child_size: int, child_overlap: int, separators: list[str]) -> list[str]:
     if len(article) <= child_size:
         return [article]
-    splits = _split_by_separators(article, separators, child_size * 2)
+    splits = _split_by_separators(article, separators, child_size)
     merged = _merge_chunks(splits, child_size, child_overlap)
     return merged or [article]
 
@@ -141,7 +155,12 @@ def _build_parent_child_from_articles(
     current_parent: list[str] = []
     current_parent_len = 0
 
+    parent_units: list[str] = []
     for article in articles:
+        article_splits = _split_by_separators(article, separators, parent_size)
+        parent_units.extend(_merge_chunks(article_splits, parent_size, overlap=0))
+
+    for article in parent_units:
         article_len = len(article) + (2 if current_parent else 0)
         if current_parent and current_parent_len + article_len > parent_size:
             parent_chunks.append("\n\n".join(current_parent).strip())
@@ -209,7 +228,7 @@ def create_parent_child_chunks(
             separators=separators,
         )
 
-    parent_splits = _split_by_separators(normalized, separators, parent_size * 2)
+    parent_splits = _split_by_separators(normalized, separators, parent_size)
     parent_chunks = _merge_chunks(parent_splits, parent_size, overlap=0)
 
     if not parent_chunks and normalized:
@@ -217,7 +236,7 @@ def create_parent_child_chunks(
 
     results: list[dict[str, Any]] = []
     for parent_index, parent_content in enumerate(parent_chunks):
-        child_splits = _split_by_separators(parent_content, separators, child_size * 2)
+        child_splits = _split_by_separators(parent_content, separators, child_size)
         child_chunks = _merge_chunks(child_splits, child_size, child_overlap)
 
         if not child_chunks and parent_content:

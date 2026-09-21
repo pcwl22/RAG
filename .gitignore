@@ -8,6 +8,9 @@ __pycache__/
 *.py[cod]
 *.pyo
 .pytest_cache/
+.pytest_tmp*/
+.pytest-*/
+.pytest_*/
 .mypy_cache/
 .ruff_cache/
 .coverage
@@ -32,7 +35,13 @@ coverage/
 
 # Local services and generated data
 /industrial-rag/data/
+/industrial-rag/eval/expanded_export.jsonl
+/industrial-rag/eval/holdout_export.jsonl
 /industrial-rag/.pycache_tmp/
+/industrial-rag/.pytest_tmp*/
+/industrial-rag/.pytest-*/
+/industrial-rag/.codex_pytest_tmp*/
+/.tmp-dependency-preflight-pytest*/
 /models/
 
 # Removed/unused frontend

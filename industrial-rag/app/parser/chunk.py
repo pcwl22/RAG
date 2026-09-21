@@ -1,10 +1,11 @@
 """Text chunking helpers."""
 import re
+from typing import Any
 
 from app.parser.legal_parser import LegalDocumentParser, LegalSection
 from app.parser.parent_child_chunker import ParentChildChunker
 from app.parser.parent_child_chunking import chunk_text_parent_child
-from app.utils.config import get_settings
+from app.utils.config import get_config_section
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -26,12 +27,12 @@ DEFAULT_SEPARATORS = [
 ]
 
 
-def _doc_processing_config() -> dict:
-    return get_settings().get("document_processing", {})
+def _doc_processing_config() -> dict[str, Any]:
+    return get_config_section("document_processing")
 
 
-def _chunking_config() -> dict:
-    return _doc_processing_config().get("chunking", {})
+def _chunking_config() -> dict[str, Any]:
+    return get_config_section("document_processing", "chunking")
 
 
 def _normalize_text(text: str) -> str:
@@ -79,10 +80,21 @@ def _merge_splits(splits: list[str], chunk_size: int, chunk_overlap: int) -> lis
     current: list[str] = []
     current_len = 0
 
-    for split in splits:
-        split = split.strip()
-        if not split:
-            continue
+    bounded_splits = [
+        piece
+        for raw_split in splits
+        for piece in (
+            [raw_split.strip()]
+            if len(raw_split.strip()) <= chunk_size
+            else [
+                raw_split.strip()[index : index + chunk_size]
+                for index in range(0, len(raw_split.strip()), chunk_size)
+            ]
+        )
+        if piece
+    ]
+
+    for split in bounded_splits:
         sep_len = 1 if current else 0
         if current and current_len + sep_len + len(split) > chunk_size:
             chunk = "\n".join(current).strip()
@@ -99,7 +111,11 @@ def _merge_splits(splits: list[str], chunk_size: int, chunk_overlap: int) -> lis
                 overlap_len += part_len
             current = overlap_parts
             current_len = sum(len(part) for part in current) + max(0, len(current) - 1)
+            while current and current_len + 1 + len(split) > chunk_size:
+                current.pop(0)
+                current_len = sum(len(part) for part in current) + max(0, len(current) - 1)
 
+        sep_len = 1 if current else 0
         current.append(split)
         current_len += len(split) + sep_len
 
@@ -146,8 +162,14 @@ def chunk_text(text: str) -> list[str]:
     if strategy == "fixed":
         return _sliding_window(text, chunk_size, chunk_overlap)
     if strategy == "semantic":
-        logger.warning("Semantic chunking is not implemented; using recursive chunking")
-        return chunk_text_recursive(text, chunk_size, chunk_overlap)
+        # Silently falling back produced a corpus whose chunk_strategy metadata
+        # and chunking fingerprint claimed "semantic" while the text was split
+        # recursively. Fail instead of misreporting how the corpus was built.
+        raise ValueError(
+            "Semantic chunking is not implemented. Set "
+            "document_processing.chunking.strategy to one of: "
+            "recursive, parent_child, fixed."
+        )
     raise ValueError(f"Unknown chunking strategy: {strategy}")
 
 

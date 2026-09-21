@@ -1,13 +1,16 @@
 """Hybrid retrieval engine: keyword + vector + RRF."""
 
 import re
+import time
+from typing import Any
 
 from app.embedding.embedder import encode_query
 from app.retrieval.domain_signal_map import is_known_out_of_scope
 from app.retrieval.reranker import rerank_documents
-from app.utils.config import get_settings
+from app.utils.config import get_config_section
 from app.utils.inference import run_inference
 from app.utils.logger import get_logger
+from app.utils.metrics import RETRIEVAL_DURATION, RETRIEVAL_REQUESTS
 from app.vectorstore import storage_adapter
 
 logger = get_logger(__name__)
@@ -24,9 +27,27 @@ _LAW_ALIASES = {
     ),
     "中华人民共和国民法典": ("中华人民共和国民法典", "民法典"),
     "中华人民共和国刑法": ("中华人民共和国刑法", "刑法"),
+    "中华人民共和国公司法": ("中华人民共和国公司法", "公司法"),
+    "中华人民共和国行政处罚法": ("中华人民共和国行政处罚法", "行政处罚法"),
+    "中华人民共和国食品安全法": ("中华人民共和国食品安全法", "食品安全法"),
+    "中华人民共和国道路交通安全法": (
+        "中华人民共和国道路交通安全法",
+        "道路交通安全法",
+    ),
+    "中华人民共和国农村土地承包法": (
+        "中华人民共和国农村土地承包法",
+        "农村土地承包法",
+    ),
+    "中华人民共和国治安管理处罚法": (
+        "中华人民共和国治安管理处罚法",
+        "治安管理处罚法",
+    ),
+    "中华人民共和国仲裁法": ("中华人民共和国仲裁法", "仲裁法"),
+    "中华人民共和国民事诉讼法": ("中华人民共和国民事诉讼法", "民事诉讼法"),
+    "中华人民共和国刑事诉讼法": ("中华人民共和国刑事诉讼法", "刑事诉讼法"),
 }
 
-def _explicit_legal_citations(query: str) -> list[tuple[str, str]]:
+def explicit_legal_citations(query: str) -> list[tuple[str, str]]:
     """Preserve the law-to-article relationship expressed in query order."""
     law_spans: list[tuple[int, int, str]] = []
     for canonical_law, aliases in _LAW_ALIASES.items():
@@ -58,8 +79,13 @@ def _explicit_legal_citations(query: str) -> list[tuple[str, str]]:
     return pairs
 
 
-def _retrieval_config() -> dict:
-    return get_settings().get("rag", {}).get("retrieval", {})
+# Backward-compatible private alias for callers/tests created before the
+# coverage guard became part of the service contract.
+_explicit_legal_citations = explicit_legal_citations
+
+
+def _retrieval_config() -> dict[str, Any]:
+    return get_config_section("rag", "retrieval")
 
 
 def _candidate_count(top_k: int, enable_rerank: bool, config: dict) -> int:
@@ -97,7 +123,7 @@ def _deduplicate_results(results: list[dict], max_per_document: int) -> list[dic
 class HybridRetrievalEngine:
     """PostgreSQL hybrid retriever."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.config = _retrieval_config()
 
     async def retrieve_by_ids(
@@ -110,6 +136,43 @@ class HybridRetrievalEngine:
         self,
         query: str,
         top_k: int | None = None,
+        rerank_top_k: int | None = None,
+        rerank_apply_threshold: bool | None = None,
+        similarity_threshold: float | None = None,
+        enable_rerank: bool | None = None,
+        partition: str | None = None,
+        enable_rrf: bool | None = None,
+        enable_dynamic_topk: bool | None = None,
+        enable_exact_citations: bool = True,
+    ) -> list[dict]:
+        started = time.perf_counter()
+        outcome = "success"
+        try:
+            return await self._retrieve_impl(
+                query=query,
+                top_k=top_k,
+                rerank_top_k=rerank_top_k,
+                rerank_apply_threshold=rerank_apply_threshold,
+                similarity_threshold=similarity_threshold,
+                enable_rerank=enable_rerank,
+                partition=partition,
+                enable_rrf=enable_rrf,
+                enable_dynamic_topk=enable_dynamic_topk,
+                enable_exact_citations=enable_exact_citations,
+            )
+        except Exception:
+            outcome = "error"
+            raise
+        finally:
+            RETRIEVAL_REQUESTS.labels(outcome=outcome).inc()
+            RETRIEVAL_DURATION.observe(time.perf_counter() - started)
+
+    async def _retrieve_impl(
+        self,
+        query: str,
+        top_k: int | None = None,
+        rerank_top_k: int | None = None,
+        rerank_apply_threshold: bool | None = None,
         similarity_threshold: float | None = None,
         enable_rerank: bool | None = None,
         partition: str | None = None,
@@ -130,15 +193,26 @@ class HybridRetrievalEngine:
             enable_rrf = bool(self.config.get("enable_rrf", True))
         if enable_dynamic_topk is None:
             enable_dynamic_topk = bool(self.config.get("enable_dynamic_topk", True))
+        if rerank_apply_threshold is None:
+            rerank_apply_threshold = True
+
+        # Enhanced retrieval merges several independent query results.  Keep
+        # a wider reranked candidate set for that merger while preserving the
+        # ordinary ``top_k`` contract for callers that do not opt in.
+        result_top_k = top_k
+        if enable_rerank and rerank_top_k is not None:
+            result_top_k = max(top_k, int(rerank_top_k))
 
         query_embedding = await run_inference(encode_query, query)
-        candidate_k = _candidate_count(top_k, enable_rerank, self.config)
+        candidate_k = _candidate_count(result_top_k, enable_rerank, self.config)
 
         results = await storage_adapter.hybrid_search(
             query=query,
             query_embedding=query_embedding,
             top_k=candidate_k,
             partition=partition,
+            enable_rrf=enable_rrf,
+            enable_dynamic_topk=enable_dynamic_topk,
         )
 
         # RRF scores are intentionally small, so threshold on original retrieval
@@ -155,7 +229,7 @@ class HybridRetrievalEngine:
         max_per_document = int(self.config.get("max_chunks_per_document", 6))
         filtered = _deduplicate_results(filtered, max_per_document)
 
-        citation_pairs = _explicit_legal_citations(query) if enable_exact_citations else []
+        citation_pairs = explicit_legal_citations(query) if enable_exact_citations else []
         exact_docs = (
             await storage_adapter.get_documents_by_citations(citation_pairs, partition)
             if citation_pairs
@@ -167,16 +241,27 @@ class HybridRetrievalEngine:
             return []
 
         if enable_rerank and filtered:
-            filtered = await run_inference(rerank_documents, query, filtered, top_n=top_k)
+            filtered = await run_inference(
+                rerank_documents,
+                query,
+                filtered,
+                top_n=result_top_k,
+                apply_threshold=rerank_apply_threshold,
+            )
         else:
             filtered = filtered[:top_k]
 
         if exact_docs:
             exact_ids = {str(doc.get("id")) for doc in exact_docs}
+            # Explicitly requested provisions are requirements rather than
+            # fuzzy ranking suggestions.  ``top_k`` therefore bounds only the
+            # optional neighbors and must never silently discard a named law
+            # article when a query asks for more provisions than that value.
+            result_limit = max(result_top_k, len(exact_docs))
             filtered = [
                 *exact_docs,
                 *(doc for doc in filtered if str(doc.get("id")) not in exact_ids),
-            ][:top_k]
+            ][:result_limit]
 
         logger.info("Hybrid retrieval returned %s documents", len(filtered))
         return filtered

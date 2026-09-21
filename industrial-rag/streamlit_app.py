@@ -1,4 +1,6 @@
 """Streamlit frontend for the local RAG knowledge QA system."""
+
+import os
 import time
 
 import httpx
@@ -11,7 +13,9 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-API_BASE_URL = "http://localhost:8000"
+API_BASE_URL = os.getenv("RAG_API_BASE_URL", "http://localhost:8000").rstrip("/")
+API_KEY = os.getenv("RAG_API_KEY", "").strip()
+API_HEADERS = {"X-API-Key": API_KEY} if API_KEY else {}
 
 DOCUMENT_CATEGORIES = {
     "contract": "合同",
@@ -33,7 +37,7 @@ def upload_document(file, category: str):
     try:
         files = {"file": (file.name, file.getvalue(), file.type)}
         data = {"partition": category, "metadata": "{}"}
-        with httpx.Client(timeout=300.0) as client:
+        with httpx.Client(timeout=300.0, headers=API_HEADERS) as client:
             response = client.post(f"{API_BASE_URL}/api/v1/documents/ingest", files=files, data=data)
             response.raise_for_status()
             return response.json()
@@ -44,7 +48,7 @@ def upload_document(file, category: str):
 
 def get_documents() -> list[dict]:
     try:
-        with httpx.Client(timeout=30.0) as client:
+        with httpx.Client(timeout=30.0, headers=API_HEADERS) as client:
             response = client.get(f"{API_BASE_URL}/api/v1/documents")
             response.raise_for_status()
             payload = response.json()
@@ -58,7 +62,7 @@ def get_documents() -> list[dict]:
 
 def delete_document(document_id: str) -> bool:
     try:
-        with httpx.Client(timeout=30.0) as client:
+        with httpx.Client(timeout=30.0, headers=API_HEADERS) as client:
             response = client.delete(f"{API_BASE_URL}/api/v1/documents/{document_id}")
             response.raise_for_status()
             return True
@@ -81,7 +85,7 @@ def enhanced_query(query: str, partition: str | None = None) -> dict | None:
         "partition": partition,
     }
     try:
-        with httpx.Client(timeout=180.0) as client:
+        with httpx.Client(timeout=180.0, headers=API_HEADERS) as client:
             response = client.post(f"{API_BASE_URL}/api/v1/query/enhanced", json=payload)
             response.raise_for_status()
             return response.json()

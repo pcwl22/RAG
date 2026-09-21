@@ -225,6 +225,7 @@ def write_lrage_export(
     task_name: str,
     samples: list[dict[str, Any]],
     max_score: int = 10,
+    evaluation_contract: dict[str, Any] | None = None,
 ) -> LrageExportPaths:
     """Write JSONL dataset, LRAGE task YAML, and export manifest."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -248,6 +249,7 @@ def write_lrage_export(
         "dataset_jsonl": str(dataset_jsonl.resolve()),
         "task_yaml": str(task_yaml.resolve()),
         "created_at": datetime.now(UTC).isoformat(),
+        "evaluation_contract": evaluation_contract or {},
         "schema": {
             "lrage_fields": ["Prompt", "Document", "Rubric", "target"],
             "industrial_rag_fields": ["prediction", "contexts", "understanding", "sub_answers"],

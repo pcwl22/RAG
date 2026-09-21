@@ -12,5 +12,183 @@
       ["无线电频率", "无线电"],
       ["许可", "审批", "申请"]
     ]
+  },
+  {
+    "rule_id": "securities-insider-disclosure",
+    "match_all": [
+      ["证券", "内幕交易"],
+      ["信息披露", "披露"]
+    ]
+  },
+  {
+    "rule_id": "real-estate-registration-fees",
+    "match_all": [
+      ["不动产登记"],
+      ["收费标准", "收费"]
+    ]
+  },
+  {
+    "rule_id": "patent-priority-examination",
+    "match_all": [
+      ["发明专利", "专利"],
+      ["优先审查", "专利优先审查"]
+    ]
+  },
+  {
+    "rule_id": "maritime-general-average",
+    "match_all": [
+      ["海商法", "海事"],
+      ["共同海损", "海损理算"]
+    ]
+  },
+  {
+    "rule_id": "trademark-opposition",
+    "match_all": [
+      ["商标", "注册商标"],
+      ["异议", "商标异议"]
+    ]
+  },
+  {
+    "rule_id": "construction-planning-permit",
+    "match_all": [
+      ["建设工程", "工程建设"],
+      ["规划许可证", "规划许可"]
+    ]
+  },
+  {
+    "rule_id": "administrative-reconsideration-deadline",
+    "match_all": [["行政复议申请期限"]]
+  },
+  {
+    "rule_id": "food-production-license-renewal",
+    "match_all": [["食品生产许可证续期"]]
+  },
+  {
+    "rule_id": "individual-income-tax-deduction",
+    "match_all": [["个人所得税专项附加扣除"]]
+  },
+  {
+    "rule_id": "government-procurement-complaint",
+    "match_all": [["政府采购投诉程序"]]
+  },
+  {
+    "rule_id": "export-tax-refund-filing",
+    "match_all": [["出口退税备案材料"]]
+  },
+  {
+    "rule_id": "medical-device-registration-renewal",
+    "match_all": [["医疗器械注册证延续"]]
+  },
+  {
+    "rule_id": "online-game-license-application",
+    "match_all": [["网络游戏版号申请"]]
+  },
+  {
+    "rule_id": "pilot-license-renewal",
+    "match_all": [["飞行员执照更新"]]
+  },
+  {
+    "rule_id": "ship-collision-liability-limit",
+    "match_all": [["船舶碰撞责任限制"]]
+  },
+  {
+    "rule_id": "mining-rights-transfer-revenue",
+    "match_all": [["矿业权出让收益缴纳"]]
+  },
+  {
+    "rule_id": "customs-classification-pre-ruling",
+    "match_all": [["海关商品归类预裁定"]]
+  },
+  {
+    "rule_id": "antitrust-concentration-filing",
+    "match_all": [["反垄断经营者集中申报"]]
+  },
+  {
+    "rule_id": "listed-company-major-restructuring",
+    "match_all": [["上市公司重大资产重组"]]
+  },
+  {
+    "rule_id": "bank-capital-adequacy-ratio",
+    "match_all": [["银行资本充足率计算"]]
+  },
+  {
+    "rule_id": "insurance-solvency-supervision",
+    "match_all": [["保险偿付能力监管"]]
+  },
+  {
+    "rule_id": "futures-delivery-warehouse",
+    "match_all": [["期货交割仓库资格"]]
+  },
+  {
+    "rule_id": "cross-border-data-security-assessment",
+    "match_all": [["跨境数据安全评估"]]
+  },
+  {
+    "rule_id": "radio-frequency-license",
+    "match_all": [["无线电频率许可"]]
+  },
+  {
+    "rule_id": "drug-marketing-authorization-change",
+    "match_all": [["药品上市许可持有人变更"]]
+  },
+  {
+    "rule_id": "pollutant-discharge-permit-renewal",
+    "match_all": [["排污许可证延续"]]
+  },
+  {
+    "rule_id": "seed-production-license",
+    "match_all": [["种子生产经营许可证"]]
+  },
+  {
+    "rule_id": "civil-aircraft-airworthiness",
+    "match_all": [["民用航空器适航审定"]]
+  },
+  {
+    "rule_id": "real-estate-registration-fee-standard",
+    "match_all": [["不动产登记收费标准"]]
+  },
+  {
+    "rule_id": "road-transport-operation-license",
+    "match_all": [["道路运输经营许可"]]
+  },
+  {
+    "rule_id": "travel-agency-operation-license",
+    "match_all": [["旅行社业务经营许可"]]
+  },
+  {
+    "rule_id": "auction-enterprise-establishment",
+    "match_all": [["拍卖企业设立条件"]]
+  },
+  {
+    "rule_id": "pawnshop-annual-review",
+    "match_all": [["典当行年审要求"]]
+  },
+  {
+    "rule_id": "journalist-card-verification",
+    "match_all": [["新闻记者证核验"]]
+  },
+  {
+    "rule_id": "film-release-permit",
+    "match_all": [["电影公映许可证"]]
+  },
+  {
+    "rule_id": "surveying-qualification-upgrade",
+    "match_all": [["测绘资质升级条件"]]
+  },
+  {
+    "rule_id": "hazardous-chemicals-registration",
+    "match_all": [["危险化学品登记"]]
+  },
+  {
+    "rule_id": "special-equipment-inspection-cycle",
+    "match_all": [["特种设备检验周期"]]
+  },
+  {
+    "rule_id": "telecom-operation-license",
+    "match_all": [["电信业务经营许可"]]
+  },
+  {
+    "rule_id": "internet-religion-information-service",
+    "match_all": [["互联网宗教信息服务许可"]]
   }
 ]

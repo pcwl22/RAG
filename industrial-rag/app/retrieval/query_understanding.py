@@ -1,15 +1,16 @@
 """Query understanding: coreference resolution and decomposition."""
 import json
 import re
+from typing import Any
 
 from app.llm.model import get_llm_client
-from app.retrieval.domain_signal_map import build_domain_signal_queries
+from app.retrieval.domain_signal_map import build_domain_signal_queries, is_known_out_of_scope
 from app.retrieval.legal_concept_map import (
     build_concept_article_queries,
     match_legal_concept_articles,
 )
-from app.utils.config import get_settings
-from app.utils.logger import get_logger
+from app.utils.config import get_config_section
+from app.utils.logger import get_logger, text_log_metadata
 
 logger = get_logger(__name__)
 
@@ -35,11 +36,8 @@ COMPOUND_HINTS = [
     "以及",
     "还有",
     "另外",
-    "分别",
     "对比",
     "比较",
-    "和",
-    "或",
     "或者",
     "第一",
     "第二",
@@ -48,6 +46,15 @@ COMPOUND_HINTS = [
     "2.",
     "3.",
 ]
+
+# ``分别`` is common in a single set of facts (for example, multiple
+# guarantors "分别与债权人签订保证合同").  Treating the bare word as a
+# decomposition signal adds a needless model call and can split one legal
+# issue into unrelated searches.  Only an explicit request to answer multiple
+# parts should opt in to model-based decomposition.
+EXPLICIT_COMPOUND_REQUEST = re.compile(
+    r"(?:请)?分别(?:判断|说明|分析|回答|处理|比较|讨论|评估|论述)"
+)
 
 FORMAL_LEGAL_MARKERS = [
     "罪",
@@ -67,22 +74,49 @@ FORMAL_LEGAL_MARKERS = [
 ]
 
 FACT_TRIGGERED_SIGNAL_TERMS = {
-    "共同犯罪": ["共同", "共犯", "同伙", "合谋", "通谋", "事前", "结伙", "多人"],
+    "共同犯罪": [
+        "共同",
+        "共犯",
+        "同伙",
+        "合谋",
+        "通谋",
+        "事前",
+        "结伙",
+        "多人",
+        "教唆",
+    ],
     "连续犯": ["连续犯"],
 }
 
 
-def _query_understanding_config() -> dict:
-    return (
-        get_settings()
-        .get("rag", {})
-        .get("retrieval", {})
-        .get("query_understanding", {})
-    )
+def _query_understanding_config() -> dict[str, Any]:
+    return get_config_section("rag", "retrieval", "query_understanding")
 
 
 def _clean_numbered_line(text: str) -> str:
     return re.sub(r"^\s*(?:[-*]|\d+[.)、]|[一二三四五六七八九十]+[、.])\s*", "", text).strip()
+
+
+def _split_labeled_scenarios(query: str, max_subqueries: int) -> list[str]:
+    """Split an explicitly labeled comparison without depending on an LLM."""
+    labels = list(re.finditer(r"情景\s*[一二三四五六七八九十百0-9]+\s*[:：]", query))
+    if len(labels) < 2:
+        return []
+
+    subqueries: list[str] = []
+    for index, label in enumerate(labels[:max_subqueries]):
+        end = labels[index + 1].start() if index + 1 < len(labels) else len(query)
+        segment = query[label.end():end].strip()
+        if index == len(labels) - 1:
+            segment = re.split(
+                r"\s*(?:请分别|分别判断|分别说明|请比较|请分析|并说明理由|请说明|请问)",
+                segment,
+                maxsplit=1,
+            )[0].strip()
+        segment = segment.rstrip("。；; ")
+        if segment:
+            subqueries.append(segment)
+    return subqueries if len(subqueries) > 1 else []
 
 
 def _clean_rewritten_query(text: str) -> str:
@@ -115,7 +149,7 @@ def _extract_json_object(text: str) -> dict:
         return {}
 
 
-def _normalize_signal_values(value) -> list[str]:
+def _normalize_signal_values(value: Any) -> list[str]:
     if isinstance(value, str):
         raw_values = re.split(r"[，,、;/；\n]+", value)
     elif isinstance(value, list):
@@ -156,7 +190,7 @@ def _drop_untriggered_signal_terms(value: str, query: str) -> str:
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
-def _normalize_signal_values_for_query(value, query: str) -> list[str]:
+def _normalize_signal_values_for_query(value: Any, query: str) -> list[str]:
     allowed_articles = set(_article_terms(query))
     values: list[str] = []
     for item in _normalize_signal_values(value):
@@ -228,7 +262,7 @@ def _is_related_rewrite(original: str, rewritten: str) -> bool:
 class QueryUnderstanding:
     """LLM-backed query understanding module."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.llm = get_llm_client()
         self.config = _query_understanding_config()
 
@@ -260,7 +294,9 @@ class QueryUnderstanding:
 3. 如果没有足够上下文，请保持原问题。
 """
         try:
-            resolved = (await self.llm.generate(prompt=prompt, max_tokens=160)).strip()
+            resolved = (
+                await self.llm.generate(prompt=prompt, temperature=0.0, max_tokens=160)
+            ).strip()
             return resolved or query
         except Exception as exc:
             logger.warning("Coreference resolution failed: %s", exc)
@@ -276,7 +312,12 @@ class QueryUnderstanding:
         prompt = f"""你是法律检索助手。请把用户的口语化或场景化问题改写成贴近法律条文表述的检索查询，便于在法律法规库中检索。
 
 要求：
-1. 提取问题中的法律关系和核心事实，转换为规范的法律概念与术语。
+1. 提取问题中的法律关系和核心事实，转换为规范的法律概念与术语；
+   重点保留规范对象（权利类型、责任类型、行为要件和法律后果），不要只复述生活事实。
+2. 优先识别支配该事实的具体法律制度或法条标题，而不是停留在宽泛的上位概念。
+   例如事实明确涉及在他人土地上长期通行、铺设管线或设置设施时，应优先考虑
+   “地役权/用益物权”等规范概念；事实支持时，刑满释放后短期内再次犯罪应归纳为
+   “累犯”，组织偷渡应归纳为“组织他人偷越国（边）境”。不得凭空添加条号。
 2. 去掉具体人名、地名等与检索无关的细节（如"小明""某小区"），只保留法律要件。
 3. 只输出改写后的检索查询，一行，不要解释。
 4. 如果原问题已经是规范的法律表述，原样输出。
@@ -290,11 +331,16 @@ class QueryUnderstanding:
 原问题：{query}
 改写："""
         try:
-            rewritten = _clean_rewritten_query(await self.llm.generate(prompt=prompt, max_tokens=160))
+            rewritten = _clean_rewritten_query(
+                await self.llm.generate(prompt=prompt, temperature=0.0, max_tokens=160)
+            )
             if not _is_related_rewrite(query, rewritten):
                 logger.warning(
                     "Rejected unrelated query rewrite",
-                    extra={"original_query": query, "rewritten_query": rewritten},
+                    extra={
+                        **text_log_metadata(query, "original_query"),
+                        **text_log_metadata(rewritten, "rewritten_query"),
+                    },
                 )
                 return query
             return rewritten or query
@@ -305,7 +351,13 @@ class QueryUnderstanding:
     async def decompose_query(self, query: str, max_subqueries: int | None = None) -> list[str]:
         """Split a compound question into independent subquestions."""
         max_subqueries = max_subqueries or int(self.config.get("max_subqueries", 3))
+        labeled_scenarios = _split_labeled_scenarios(query, max_subqueries)
+        if labeled_scenarios:
+            return labeled_scenarios
+
         hint_count = sum(1 for hint in COMPOUND_HINTS if hint in query)
+        if EXPLICIT_COMPOUND_REQUEST.search(query):
+            hint_count += 1
         question_count = query.count("?") + query.count("？")
         if hint_count < 1 and question_count < 2:
             return [query]
@@ -322,7 +374,7 @@ class QueryUnderstanding:
 4. 每个子问题都必须保留必要实体，能够单独检索。
 """
         try:
-            response = await self.llm.generate(prompt=prompt, max_tokens=320)
+            response = await self.llm.generate(prompt=prompt, temperature=0.0, max_tokens=320)
             subqueries = [_clean_numbered_line(line) for line in response.splitlines()]
             subqueries = [line for line in subqueries if line]
             if not subqueries:
@@ -356,11 +408,14 @@ class QueryUnderstanding:
 
 要求：
 1. 只抽取问题本身能支持的词语或短语。
-2. 可以做同义的法言法语概括，但不得添加具体条号。
+    2. 可以把事实归纳为有明确依据的规范权利、义务、责任或法律关系，
+       但不得添加具体条号或问题没有支持的结论。
 3. 每个数组最多 5 项。
 4. 不要解释。"""
         try:
-            data = _extract_json_object(await self.llm.generate(prompt=prompt, max_tokens=260))
+            data = _extract_json_object(
+                await self.llm.generate(prompt=prompt, temperature=0.0, max_tokens=260)
+            )
             allowed = ["核心法律概念", "行为", "主体", "结果", "争议点"]
             return {key: _normalize_signal_values_for_query(data.get(key), query) for key in allowed}
         except Exception as exc:
@@ -375,6 +430,22 @@ class QueryUnderstanding:
         enable_decomposition: bool = True,
         enable_rewrite: bool = True,
     ) -> dict:
+        if is_known_out_of_scope(query):
+            # Scope rejection is deterministic and must happen before any
+            # external model call.  Otherwise a rewrite could accidentally
+            # turn an unsupported topic into an in-scope-looking query.
+            return {
+                "original_query": query,
+                "resolved_query": query,
+                "rewritten_query": query,
+                "retrieval_signals": {},
+                "concept_article_mappings": [],
+                "subqueries": [query],
+                "retrieval_queries": [query],
+                "is_decomposed": False,
+                "out_of_scope": True,
+            }
+
         resolved_query = query
         if enable_coreference and chat_history:
             resolved_query = await self.resolve_coreference(query, chat_history)
@@ -384,10 +455,14 @@ class QueryUnderstanding:
         if enable_rewrite:
             rewritten_query = await self.rewrite_query(resolved_query)
 
-        # 问题拆分基于改写后的查询（复合问题改写后仍是复合的）。
+        # 明确标注的对比题优先按原问题切分，避免改写模型把两个情景
+        # 压成一个宽泛问题；其他复合题再基于改写后的查询调用模型拆分。
         subqueries = [rewritten_query]
         if enable_decomposition:
-            subqueries = await self.decompose_query(rewritten_query)
+            subqueries = _split_labeled_scenarios(
+                resolved_query,
+                int(self.config.get("max_subqueries", 3)),
+            ) or await self.decompose_query(resolved_query)
         is_decomposed = len(subqueries) > 1
 
         retrieval_signals = await self.extract_retrieval_signals(resolved_query)
@@ -397,11 +472,28 @@ class QueryUnderstanding:
             rewritten_query,
             signal_query,
         )
-        concept_article_mappings = match_legal_concept_articles(
-            resolved_query,
-            rewritten_query,
-            retrieval_signals,
-        )
+        # For an explicitly decomposed comparison, match each scenario in
+        # isolation.  Matching the entire question lets facts from scenario A
+        # satisfy a controlled rule whose remaining facts come from scenario
+        # B, which can inject an unrelated statute into the priority set.
+        if is_decomposed:
+            mapping_inputs = subqueries
+            concept_article_mappings: list[dict[str, Any]] = []
+            seen_concepts: set[str] = set()
+            for mapping_input in mapping_inputs:
+                for mapping in match_legal_concept_articles(mapping_input):
+                    concept_id = str(mapping.get("concept_id") or "")
+                    if concept_id and concept_id in seen_concepts:
+                        continue
+                    if concept_id:
+                        seen_concepts.add(concept_id)
+                    concept_article_mappings.append(mapping)
+        else:
+            concept_article_mappings = match_legal_concept_articles(
+                resolved_query,
+                rewritten_query,
+                retrieval_signals,
+            )
         concept_article_queries = build_concept_article_queries(concept_article_mappings)
 
         # 检索查询集 = 原查询 + 改写/拆分查询 + 结构化语义信号，合并去重。

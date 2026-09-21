@@ -1,0 +1,81 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rag-postgres-migration
+  labels:
+    app.kubernetes.io/name: rag-postgres-migration
+    app.kubernetes.io/part-of: industrial-rag
+    release-stage: migration
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 86400
+  activeDeadlineSeconds: 900
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rag-postgres-migration
+        app.kubernetes.io/part-of: industrial-rag
+    spec:
+      restartPolicy: Never
+      serviceAccountName: rag-migrate
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migration
+          image: industrial-rag-api
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "app.vectorstore.migrate"]
+          envFrom:
+            - configMapRef:
+                name: rag-runtime-config
+            - secretRef:
+                name: rag-migration
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: rag-migration
+                  key: POSTGRES_ADMIN_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: rag-migration
+                  key: POSTGRES_ADMIN_PASSWORD
+            - name: POSTGRES_COMMAND_TIMEOUT_SECONDS
+              value: "840"
+            - name: POSTGRES_LOCK_TIMEOUT_SECONDS
+              value: "30"
+            - name: POSTGRES_MIGRATION_BATCH_SIZE
+              value: "1000"
+            - name: POSTGRES_PK_CUTOVER_LOCK_TIMEOUT_SECONDS
+              value: "5"
+            # A legacy id-only primary key needs a separately approved traffic
+            # drain. Fresh/final databases do not consult this gate.
+            - name: POSTGRES_ALLOW_LEGACY_PK_CUTOVER
+              value: "false"
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

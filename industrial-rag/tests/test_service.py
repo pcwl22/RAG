@@ -1,9 +1,42 @@
 """Service orchestration tests."""
 import asyncio
 
+import pytest
+
 import app.service.enhanced_query_service as enhanced_service
 import app.service.ingest_service as ingest_service
-from app.service.chat_service import Generator
+from app.service.chat_service import Generator, _doc_debug_summary
+
+
+def test_unstructured_aggregate_prompt_does_not_require_json_contract():
+    prompt = enhanced_service.build_aggregate_prompt(
+        "原始问题",
+        [{"query": "子问题", "answer": "子答案"}],
+        context="可核验上下文",
+        structured=False,
+    )
+
+    assert "直接输出最终答案正文" in prompt
+    assert '"conclusion"' not in prompt
+
+
+def test_document_debug_summary_does_not_log_legal_text_or_source_names():
+    summary = _doc_debug_summary(
+        [
+            {
+                "id": "private-chunk",
+                "score": 0.9,
+                "content": "受保护的法律正文不应进入日志",
+                "metadata": {"filename": "private-case.docx", "chunk_index": 2},
+            }
+        ]
+    )
+
+    serialized = str(summary)
+    assert "受保护的法律正文" not in serialized
+    assert "private-case.docx" not in serialized
+    assert "preview" not in summary[0]
+    assert summary[0]["content_length"] > 0
 
 
 def test_generator_formats_answer_and_streams_basis():
@@ -184,6 +217,36 @@ def test_enhanced_query_refuses_empty_retrieval_without_calling_llm():
     asyncio.run(run())
 
 
+def test_enhanced_retrieval_rejects_known_out_of_scope_before_rewrite_results():
+    async def run():
+        understanding = {
+            "resolved_query": "发明专利优先审查条件具体如何规定？",
+            "retrieval_queries": [
+                "发明专利优先审查条件具体如何规定？",
+                "专利审查程序",
+            ],
+        }
+
+        class FailRetrieval:
+            async def retrieve(self, *args, **kwargs):
+                raise AssertionError("out-of-scope enhanced queries must not retrieve")
+
+        service = enhanced_service.EnhancedQueryService(
+            query_understanding=object(), retrieval_engine=FailRetrieval(), generator=object()
+        )
+
+        results, query_to_docs = await service.retrieve(
+            understanding,
+            enhanced_service.EnhancedQueryOptions(query=understanding["resolved_query"]),
+        )
+
+        assert results == []
+        assert query_to_docs == {query: [] for query in understanding["retrieval_queries"]}
+        assert understanding["out_of_scope"] is True
+
+    asyncio.run(run())
+
+
 def test_generator_keeps_basis_for_partial_supported_conclusion():
     generator = Generator.__new__(Generator)
     docs = [
@@ -308,7 +371,11 @@ def test_enhanced_stream_uses_aggregate_answer_for_basis_filter(monkeypatch):
                 self.basis_query = query
                 return "\n\n依据：ok"
 
-        async def fake_aggregate_stream(query, sub_answers):
+        aggregate_context = None
+
+        async def fake_aggregate_stream(query, sub_answers, context=""):
+            nonlocal aggregate_context
+            aggregate_context = context
             yield "最终"
             yield "答案"
 
@@ -333,6 +400,7 @@ def test_enhanced_stream_uses_aggregate_answer_for_basis_filter(monkeypatch):
 
         assert fake_generator.basis_answer == "最终答案"
         assert fake_generator.basis_query == "compound resolved"
+        assert "source for compound resolved" in aggregate_context
         assert events[-1] == {"type": "chunk", "data": "\n\n依据：ok"}
 
     asyncio.run(run())
@@ -431,6 +499,52 @@ def test_explicit_citation_bypasses_fact_trigger_filter():
     ) == docs
 
 
+def test_mapped_article_exact_match_bypasses_fact_trigger_filter():
+    docs = [
+        {
+            "id": "刑法_总则_犯罪_共同犯罪_28条",
+            "content": "第二十八条 对于被胁迫参加犯罪的，应当减轻处罚或者免除处罚。",
+            "mapped_article_exact_match": True,
+            "metadata": {"article_number": "第二十八条"},
+        }
+    ]
+
+    assert enhanced_service.filter_untriggered_context_docs("一般合同纠纷如何处理？", docs) == docs
+
+
+def test_decomposed_subanswers_receive_controlled_priority_context():
+    async def run():
+        calls = []
+
+        class FakeGenerator:
+            async def generate(self, query, context_docs, use_cache=False):
+                calls.append((query, context_docs))
+                return "sub-answer"
+
+        service = enhanced_service.EnhancedQueryService(
+            query_understanding=object(), retrieval_engine=object(), generator=FakeGenerator()
+        )
+        priority = {
+            "id": "mapped",
+            "content": "controlled article",
+            "mapped_article_priority": 1,
+            "metadata": {"semantic_chunk_id": "mapped-id"},
+        }
+        noise = {"id": "noise", "content": "subquery-specific context", "metadata": {}}
+
+        answers = await service.generate_sub_answers(
+            ["subquery"],
+            {"subquery": [noise]},
+            [priority],
+            priority_docs=[priority],
+        )
+
+        assert answers[0]["result_count"] == 2
+        assert [doc["id"] for doc in calls[0][1]] == ["mapped", "noise"]
+
+    asyncio.run(run())
+
+
 def test_enhanced_retrieval_preserves_explicit_citation_exact_match():
     async def run():
         understanding = {
@@ -507,6 +621,209 @@ def test_dynamic_context_selection_uses_score_elbow_without_mapping():
     selected = enhanced_service.select_dynamic_context_docs(docs, top_k=4)
 
     assert [doc["id"] for doc in selected] == ["a", "b"]
+
+
+def test_dynamic_context_selection_preserves_strong_multi_query_evidence():
+    docs = [
+        {
+            "id": "specific-match",
+            "score": 0.42,
+            "source_relevance_score": 0.91,
+        },
+        {"id": "broad-match", "score": 0.80, "source_relevance_score": 0.80},
+    ]
+
+    selected = enhanced_service.select_dynamic_context_docs(docs, top_k=1)
+
+    assert [doc["id"] for doc in selected] == ["specific-match"]
+    assert selected[0]["context_selection_score"] == pytest.approx(0.812)
+
+
+def test_dynamic_context_selection_uses_common_query_to_correct_saturated_rewrite():
+    docs = [
+        {
+            "id": "unrelated-rewrite-match",
+            "score": 0.62,
+            "source_relevance_score": 0.998,
+        },
+        {
+            "id": "supported-original-match",
+            "score": 0.935,
+            "source_relevance_score": 0.992,
+        },
+    ]
+
+    selected = enhanced_service.select_dynamic_context_docs(docs, top_k=1)
+
+    assert [doc["id"] for doc in selected] == ["supported-original-match"]
+
+
+def test_dynamic_context_selection_preserves_each_queries_top_candidate():
+    docs = [
+        {
+            "id": "rewrite-favorite",
+            "score": 0.99,
+            "source_relevance_score": 0.99,
+            "matched_queries": ["original", "rewrite"],
+            "query_retrieval_ranks": {"original": 8, "rewrite": 1},
+        },
+        {
+            "id": "original-favorite",
+            "score": 0.93,
+            "source_relevance_score": 0.35,
+            "matched_queries": ["original"],
+            "query_retrieval_ranks": {"original": 1},
+        },
+    ]
+
+    selected = enhanced_service.select_dynamic_context_docs(
+        docs,
+        top_k=2,
+        coverage_queries=["original", "rewrite"],
+    )
+
+    assert [doc["id"] for doc in selected] == [
+        "original-favorite",
+        "rewrite-favorite",
+    ]
+    assert all(doc["context_selection"] == "query_coverage" for doc in selected)
+
+
+def test_context_coverage_queries_excludes_internal_signal_queries():
+    understanding = {
+        "resolved_query": "original",
+        "subqueries": ["rewrite one", "rewrite two"],
+        "is_decomposed": True,
+        "retrieval_queries": [
+            "original",
+            "rewrite one",
+            "rewrite two",
+            "synthetic signal query",
+            "controlled article query",
+        ],
+    }
+
+    assert enhanced_service.context_coverage_queries(understanding) == [
+        "original",
+        "rewrite one",
+        "rewrite two",
+    ]
+
+    understanding["is_decomposed"] = False
+    assert enhanced_service.context_coverage_queries(understanding) == ["original"]
+
+
+def test_dynamic_context_selection_retains_one_multi_query_consensus_candidate():
+    drifted_original = {
+        "id": "drifted-original-top",
+        "score": 0.99,
+        "source_relevance_score": 0.56,
+        "matched_queries": ["original"],
+        "query_retrieval_ranks": {"original": 1},
+    }
+    consensus_target = {
+        "id": "consensus-target",
+        "score": 0.99,
+        "source_relevance_score": 0.72,
+        "matched_queries": ["original", "rewrite"],
+        "query_retrieval_ranks": {"original": 6, "rewrite": 5},
+    }
+    rewrite_neighbors = [
+        {
+            "id": f"rewrite-neighbor-{index}",
+            "score": score,
+            "source_relevance_score": score,
+            "matched_queries": ["rewrite"],
+            "query_retrieval_ranks": {"rewrite": index},
+        }
+        for index, score in enumerate((0.95, 0.94, 0.93, 0.92), 1)
+    ]
+
+    selected = enhanced_service.select_dynamic_context_docs(
+        [drifted_original, consensus_target, *rewrite_neighbors],
+        top_k=5,
+        coverage_queries=["original"],
+    )
+
+    assert selected[0]["id"] == "drifted-original-top"
+    assert selected[1]["id"] == "consensus-target"
+    assert selected[1]["context_selection"] == "multi_query_consensus"
+
+
+def test_enhanced_retrieval_requests_wide_rerank_candidate_budget(monkeypatch):
+    async def run():
+        calls = []
+
+        class FakeEngine:
+            async def retrieve(self, **kwargs):
+                calls.append(kwargs)
+                return []
+
+        monkeypatch.setattr(
+            enhanced_service,
+            "get_settings",
+            lambda: {"rag": {"retrieval": {"merge_candidate_multiplier": 8}}},
+        )
+        service = enhanced_service.EnhancedQueryService(
+            query_understanding=object(), retrieval_engine=FakeEngine(), generator=object()
+        )
+        understanding = {
+            "resolved_query": "劳动合同解除条件",
+            "retrieval_queries": ["劳动合同解除条件", "劳动合同解除"],
+            "concept_article_mappings": [],
+        }
+
+        await service.retrieve(
+            understanding,
+            enhanced_service.EnhancedQueryOptions(
+                query=understanding["resolved_query"], top_k=5, enable_rerank=True
+            ),
+        )
+
+        assert len(calls) == 2
+        assert {call["rerank_top_k"] for call in calls} == {40}
+
+    asyncio.run(run())
+
+
+def test_enhanced_retrieval_keeps_all_explicit_citations_above_top_k():
+    async def run():
+        understanding = {
+            "resolved_query": "比较民法典第一条与第二条",
+            "retrieval_queries": ["比较民法典第一条与第二条"],
+            "concept_article_mappings": [],
+        }
+
+        class FakeEngine:
+            async def retrieve(self, **kwargs):
+                return [
+                    {
+                        "id": f"exact-{article}",
+                        "content": article,
+                        "score": 1.0,
+                        "explicit_citation_exact_match": True,
+                        "metadata": {
+                            "semantic_chunk_id": f"exact-{article}",
+                            "law_name": "中华人民共和国民法典",
+                            "article_number": article,
+                        },
+                    }
+                    for article in ("第一条", "第二条")
+                ]
+
+        service = enhanced_service.EnhancedQueryService(
+            query_understanding=object(), retrieval_engine=FakeEngine(), generator=object()
+        )
+        results, _ = await service.retrieve(
+            understanding,
+            enhanced_service.EnhancedQueryOptions(
+                query=understanding["resolved_query"], top_k=1, enable_rerank=False
+            ),
+        )
+
+        assert [doc["id"] for doc in results] == ["exact-第一条", "exact-第二条"]
+
+    asyncio.run(run())
 
 
 def test_mapped_article_coverage_reports_missing_corpus_targets():
@@ -705,6 +1022,42 @@ def test_enhanced_retrieval_keeps_common_crime_context_when_query_triggers_it():
     asyncio.run(run())
 
 
+def test_enhanced_retrieval_keeps_common_crime_context_for_incitement():
+    async def run():
+        understanding = {
+            "resolved_query": "甲教唆十五岁的乙盗窃，但乙没有实施。对甲应如何处理？",
+            "retrieval_queries": ["教唆未成年人犯罪 被教唆人未实施犯罪"],
+        }
+
+        class FakeEngine:
+            async def retrieve(self, **kwargs):
+                return [
+                    {
+                        "id": "刑法_29条",
+                        "score": 0.9,
+                        "content": "第二十九条 教唆他人犯罪的，应当按照他在共同犯罪中所起的作用处罚。",
+                        "metadata": {},
+                    }
+                ]
+
+        service = enhanced_service.EnhancedQueryService(
+            query_understanding=object(), retrieval_engine=FakeEngine(), generator=object()
+        )
+
+        results, query_to_docs = await service.retrieve(
+            understanding,
+            enhanced_service.EnhancedQueryOptions(query=understanding["resolved_query"]),
+        )
+
+        assert [doc["id"] for doc in results] == ["刑法_29条"]
+        assert [
+            doc["id"]
+            for doc in query_to_docs["教唆未成年人犯罪 被教唆人未实施犯罪"]
+        ] == ["刑法_29条"]
+
+    asyncio.run(run())
+
+
 def test_process_document_structures_legal_articles(monkeypatch):
     async def run():
         sample_text = """
@@ -814,5 +1167,61 @@ def test_process_document_orchestrates_parser_embedding_and_storage(monkeypatch)
         assert len(fake_replace_document.calls["ids"]) == 2
         assert fake_replace_document.calls["metadatas"][0]["filename"] == "demo.txt"
         assert fake_replace_document.calls["filename"] == "demo.txt"
+
+    asyncio.run(run())
+
+
+def test_process_document_does_not_trust_parser_owned_upload_metadata(monkeypatch):
+    async def run():
+        sample_text = ("Plain document content for metadata isolation tests.\n\n" * 20).strip()
+
+        async def fake_replace_document(
+            source_key, filename, ids, embeddings, documents, metadatas, partition="general"
+        ):
+            fake_replace_document.calls = metadatas
+            return len(ids)
+
+        monkeypatch.setattr(ingest_service, "parse_document", lambda file_path: sample_text)
+        monkeypatch.setattr(
+            ingest_service,
+            "encode_texts",
+            lambda texts, batch_size=32: [[0.1, 0.2, 0.3] for _ in texts],
+        )
+        monkeypatch.setattr(ingest_service, "_storage_backend", lambda: fake_replace_document)
+
+        result = await ingest_service.process_document(
+            "unused.txt",
+            "actual.txt",
+            metadata={
+                "source_id": "stable-source",
+                "authority": "official",
+                "tenant_id": "00000000-0000-0000-0000-000000000099",
+                "document_id": "forged-document",
+                "upload_task_id": "forged-task",
+                "upload_object_key": "forged-object",
+                "law_name": "伪造法律",
+                "article_number": "第一条",
+                "semantic_chunk_id": "forged-article",
+            },
+            internal_metadata={
+                "upload_task_id": "real-task",
+                "upload_object_key": "tenants/t/uploads/real-task/payload.txt",
+            },
+        )
+
+        assert result["status"] == "completed"
+        metadata = fake_replace_document.calls[0]
+        assert metadata["source_id"] == "stable-source"
+        assert metadata["authority"] == "official"
+        assert metadata["tenant_id"] == "00000000-0000-0000-0000-000000000001"
+        assert metadata["filename"] == "actual.txt"
+        assert metadata["document_id"] != "forged-document"
+        assert metadata["upload_task_id"] == "real-task"
+        assert metadata["upload_object_key"] == (
+            "tenants/t/uploads/real-task/payload.txt"
+        )
+        assert "law_name" not in metadata
+        assert "article_number" not in metadata
+        assert "semantic_chunk_id" not in metadata
 
     asyncio.run(run())

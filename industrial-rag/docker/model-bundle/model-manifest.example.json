@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "models": {
+    "bge-m3": {
+      "model_id": "BAAI/bge-m3",
+      "revision": "bge-m3-local-2026-06",
+      "path": "bge-m3",
+      "sha256": "REPLACE_WITH_SHA256_OF_DETERMINISTIC_MODEL_TREE"
+    },
+    "bge-reranker-v2-m3": {
+      "model_id": "BAAI/bge-reranker-v2-m3",
+      "revision": "bge-reranker-v2-m3-local-2026-06",
+      "path": "bge-reranker-v2-m3",
+      "sha256": "REPLACE_WITH_SHA256_OF_DETERMINISTIC_MODEL_TREE"
+    }
+  }
+}

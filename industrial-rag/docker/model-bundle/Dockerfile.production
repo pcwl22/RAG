@@ -1,0 +1,24 @@
+# syntax=docker/dockerfile:1.7
+# The approved upstream bundle is verified by exact signature, source revision,
+# manifest digest, and deterministic model-tree hashes before this build runs.
+ARG APPROVED_MODEL_BUNDLE_IMAGE
+FROM ${APPROVED_MODEL_BUNDLE_IMAGE} AS approved_model
+
+FROM scratch
+ARG APPROVED_MODEL_BUNDLE_IMAGE
+ARG APPROVED_MODEL_BUNDLE_DIGEST
+ARG APPROVED_MODEL_SOURCE_REPOSITORY
+ARG APPROVED_MODEL_SOURCE_REVISION
+ARG APPROVED_MODEL_CERTIFICATE_IDENTITY
+ARG SOURCE_REVISION
+ARG SOURCE_REPOSITORY
+ARG MODEL_MANIFEST_SHA256
+LABEL org.opencontainers.image.revision=$SOURCE_REVISION \
+      org.opencontainers.image.source=$SOURCE_REPOSITORY \
+      org.opencontainers.image.model-manifest-sha256=$MODEL_MANIFEST_SHA256 \
+      org.opencontainers.image.base.name=$APPROVED_MODEL_BUNDLE_IMAGE \
+      org.opencontainers.image.base.digest=$APPROVED_MODEL_BUNDLE_DIGEST \
+      io.industrial-rag.model.source=$APPROVED_MODEL_SOURCE_REPOSITORY \
+      io.industrial-rag.model.source-revision=$APPROVED_MODEL_SOURCE_REVISION \
+      io.industrial-rag.model.signer-identity=$APPROVED_MODEL_CERTIFICATE_IDENTITY
+COPY --from=approved_model /models/ /models/

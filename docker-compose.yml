@@ -3,12 +3,23 @@ services:
     profiles: ["frontend"]
     build:
       context: ./rag-frontend
+      args:
+        VITE_OIDC_ISSUER: ${VITE_OIDC_ISSUER:-}
+        VITE_OIDC_CLIENT_ID: ${VITE_OIDC_CLIENT_ID:-}
+        VITE_OIDC_AUDIENCE: ${VITE_OIDC_AUDIENCE:-rag-api}
     container_name: rag-frontend
     environment:
       RAG_API_UPSTREAM: ${RAG_API_UPSTREAM:-http://api:8000}
-      RAG_API_KEY: ${RAG_API_KEY:-}
+      OIDC_CONNECT_SRC: ${OIDC_CONNECT_SRC:-http://localhost:18080}
+      TRUSTED_PROXY_CIDR: ${TRUSTED_PROXY_CIDR:-127.0.0.1/32}
     ports:
-      - "${RAG_BIND_ADDRESS:-127.0.0.1}:5173:80"
+      - "${RAG_BIND_ADDRESS:-127.0.0.1}:${RAG_FRONTEND_PORT:-5173}:8080"
+    mem_limit: ${RAG_FRONTEND_MEMORY_LIMIT:-512m}
+    cpus: ${RAG_FRONTEND_CPUS:-1}
+    pids_limit: ${RAG_FRONTEND_PIDS_LIMIT:-128}
+    depends_on:
+      keycloak-config:
+        condition: service_completed_successfully
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
@@ -18,27 +29,50 @@ services:
     build:
       context: ./industrial-rag
       dockerfile: docker/api/Dockerfile
+      args:
+        APT_MIRROR: ${APT_MIRROR:-}
     container_name: rag-api
-    gpus: all
     env_file:
       - ./industrial-rag/.env
     environment:
       RAG_ENV: base
-      QUEUE_PROVIDER: ${QUEUE_PROVIDER:-memory}
+      RAG_SECURE_MODE: ${RAG_SECURE_MODE:-false}
+      POSTGRES_USER: ${POSTGRES_RUNTIME_USER:-rag_runtime}
+      POSTGRES_PASSWORD: ${POSTGRES_APP_PASSWORD:-}
+      POSTGRES_AUTO_MIGRATE: "false"
+      POSTGRES_SSLMODE: verify-full
+      POSTGRES_SSLROOTCERT: /etc/rag/postgres-tls/server.crt
+      QUEUE_PROVIDER: ${QUEUE_PROVIDER:-celery}
       RAG_API_KEY: ${RAG_API_KEY:?Set RAG_API_KEY in industrial-rag/.env}
-      REDIS_URL: redis://redis:6379/0
-      CELERY_BROKER_URL: redis://redis:6379/0
-      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      RAG_SERVICE_TENANT_ID: ${RAG_SERVICE_TENANT_ID:-00000000-0000-0000-0000-000000000001}
+      RAG_SERVICE_ROLES: ${RAG_SERVICE_ROLES:-viewer}
+      OIDC_ENABLED: ${COMPOSE_OIDC_ENABLED:-true}
+      OIDC_ISSUER: ${OIDC_ISSUER:-http://localhost:18080/realms/industrial-rag}
+      OIDC_AUDIENCE: ${OIDC_AUDIENCE:-rag-api}
+      OIDC_JWKS_URL: ${OIDC_INTERNAL_JWKS_URL:-http://keycloak:8080/realms/industrial-rag/protocol/openid-connect/certs}
+      EMBEDDING_DEVICE: ${EMBEDDING_DEVICE:-cpu}
+      RERANKER_DEVICE: ${RERANKER_DEVICE:-cpu}
+      REDIS_URL: ${COMPOSE_REDIS_URL:-redis://:${REDIS_PASSWORD:-}@redis:6379/0}
+      CELERY_BROKER_URL: ${COMPOSE_REDIS_URL:-redis://:${REDIS_PASSWORD:-}@redis:6379/0}
+      CELERY_RESULT_BACKEND: ${COMPOSE_REDIS_URL:-redis://:${REDIS_PASSWORD:-}@redis:6379/0}
     ports:
       - "${RAG_BIND_ADDRESS:-127.0.0.1}:${RAG_API_PORT:-18000}:8000"
+    mem_limit: ${RAG_API_MEMORY_LIMIT:-8g}
+    cpus: ${RAG_API_CPUS:-4}
+    pids_limit: ${RAG_API_PIDS_LIMIT:-512}
     volumes:
       - ./models:/app/models:ro
       - ./industrial-rag/data:/app/data
+      - postgres_tls:/etc/rag/postgres-tls:ro
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      keycloak-config:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready', timeout=3)"]
@@ -50,7 +84,7 @@ services:
       - no-new-privileges:true
 
   worker:
-    profiles: ["worker"]
+    profiles: ["worker", "api"]
     build:
       context: ./industrial-rag
       dockerfile: docker/worker/Dockerfile
@@ -59,26 +93,95 @@ services:
       - ./industrial-rag/.env
     environment:
       RAG_ENV: base
+      RAG_SECURE_MODE: ${RAG_SECURE_MODE:-false}
+      POSTGRES_USER: ${POSTGRES_RUNTIME_USER:-rag_runtime}
+      POSTGRES_PASSWORD: ${POSTGRES_APP_PASSWORD:-}
+      POSTGRES_AUTO_MIGRATE: "false"
+      POSTGRES_SSLMODE: verify-full
+      POSTGRES_SSLROOTCERT: /etc/rag/postgres-tls/server.crt
       QUEUE_PROVIDER: ${QUEUE_PROVIDER:-celery}
-      REDIS_URL: redis://redis:6379/0
-      CELERY_BROKER_URL: redis://redis:6379/0
-      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      REDIS_URL: ${COMPOSE_REDIS_URL:-redis://:${REDIS_PASSWORD:-}@redis:6379/0}
+      CELERY_BROKER_URL: ${COMPOSE_REDIS_URL:-redis://:${REDIS_PASSWORD:-}@redis:6379/0}
+      CELERY_RESULT_BACKEND: ${COMPOSE_REDIS_URL:-redis://:${REDIS_PASSWORD:-}@redis:6379/0}
       EMBEDDING_DEVICE: cpu
       RERANKER_DEVICE: cpu
+      RAG_SERVICE_TENANT_ID: ${RAG_SERVICE_TENANT_ID:-00000000-0000-0000-0000-000000000001}
+    mem_limit: ${RAG_WORKER_MEMORY_LIMIT:-8g}
+    cpus: ${RAG_WORKER_CPUS:-4}
+    pids_limit: ${RAG_WORKER_PIDS_LIMIT:-512}
     volumes:
       - ./models:/app/models:ro
       - ./industrial-rag/data:/app/data
+      - postgres_tls:/etc/rag/postgres-tls:ro
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.workers.healthcheck", "readiness"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
 
+  migrate:
+    profiles: ["api", "worker"]
+    build:
+      context: ./industrial-rag
+      dockerfile: docker/api/Dockerfile
+      args:
+        APT_MIRROR: ${APT_MIRROR:-}
+    env_file:
+      - ./industrial-rag/.env
+    environment:
+      RAG_ENV: base
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in industrial-rag/.env}
+      POSTGRES_AUTO_MIGRATE: "true"
+      POSTGRES_SSLMODE: verify-full
+      POSTGRES_SSLROOTCERT: /etc/rag/postgres-tls/server.crt
+      POSTGRES_RUNTIME_USER: ${POSTGRES_RUNTIME_USER:-rag_runtime}
+      POSTGRES_RUNTIME_PASSWORD: ${POSTGRES_APP_PASSWORD:-}
+    command: ["python", "-m", "app.vectorstore.migrate"]
+    volumes:
+      - postgres_tls:/etc/rag/postgres-tls:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    security_opt:
+      - no-new-privileges:true
+
+  postgres-cert-init:
+    image: pgvector/pgvector:pg16@sha256:131dcf7ff6a900545df8e7e092c270aa8c6db2f2c818e408cb45ec21316b74e6
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        umask 077
+        mkdir -p /tls
+        if [ ! -s /tls/server.key ] || [ ! -s /tls/server.crt ]; then
+          openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 3650 \
+            -keyout /tls/server.key -out /tls/server.crt \
+            -subj "/CN=postgres" -addext "subjectAltName=DNS:postgres"
+        fi
+        chown 999:999 /tls/server.key /tls/server.crt
+        chmod 600 /tls/server.key
+        chmod 644 /tls/server.crt
+    volumes:
+      - postgres_tls:/tls
+    restart: "no"
+    security_opt:
+      - no-new-privileges:true
+
   postgres:
-    image: pgvector/pgvector:pg16
+    image: pgvector/pgvector:pg16@sha256:131dcf7ff6a900545df8e7e092c270aa8c6db2f2c818e408cb45ec21316b74e6
     container_name: rag-postgres
     environment:
       POSTGRES_USER: postgres
@@ -86,8 +189,23 @@ services:
       POSTGRES_DB: rag_db
     ports:
       - "${RAG_BIND_ADDRESS:-127.0.0.1}:${RAG_POSTGRES_PORT:-15432}:5432"
+    mem_limit: ${RAG_POSTGRES_MEMORY_LIMIT:-4g}
+    cpus: ${RAG_POSTGRES_CPUS:-2}
+    pids_limit: ${RAG_POSTGRES_PIDS_LIMIT:-256}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - postgres_tls:/etc/postgresql/tls:ro
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/etc/postgresql/tls/server.crt
+      - -c
+      - ssl_key_file=/etc/postgresql/tls/server.key
+    depends_on:
+      postgres-cert-init:
+        condition: service_completed_successfully
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
@@ -98,22 +216,104 @@ services:
       - no-new-privileges:true
 
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
     container_name: rag-redis
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
     ports:
       - "${RAG_BIND_ADDRESS:-127.0.0.1}:16379:6379"
+    mem_limit: ${RAG_REDIS_MEMORY_LIMIT:-1g}
+    cpus: ${RAG_REDIS_CPUS:-1}
+    pids_limit: ${RAG_REDIS_PIDS_LIMIT:-128}
     volumes:
       - redis_data:/data
     restart: unless-stopped
-    command: redis-server --appendonly yes
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        if [ -n "$${REDIS_PASSWORD:-}" ]; then
+          exec redis-server --appendonly yes --requirepass "$${REDIS_PASSWORD}"
+        fi
+        exec redis-server --appendonly yes
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "if [ -n \"$${REDIS_PASSWORD:-}\" ]; then REDISCLI_AUTH=\"$${REDIS_PASSWORD}\" redis-cli ping; else redis-cli ping; fi"]
       interval: 10s
       timeout: 3s
       retries: 5
     security_opt:
       - no-new-privileges:true
 
+  keycloak:
+    profiles: ["identity", "api", "frontend"]
+    image: quay.io/keycloak/keycloak:26.3.2@sha256:98fab020a3a490aba0978f237e2a06cd0ea42bf149c6cf10f11c0aaf27728ff2
+    container_name: rag-keycloak
+    command: start-dev --import-realm
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?Set KEYCLOAK_ADMIN_PASSWORD in industrial-rag/.env}
+      KC_HEALTH_ENABLED: "true"
+    ports:
+      - "${RAG_BIND_ADDRESS:-127.0.0.1}:${KEYCLOAK_PORT:-18080}:8080"
+    mem_limit: ${KEYCLOAK_MEMORY_LIMIT:-1g}
+    cpus: ${KEYCLOAK_CPUS:-1}
+    pids_limit: ${KEYCLOAK_PIDS_LIMIT:-256}
+    volumes:
+      - keycloak_data:/opt/keycloak/data
+      - ./keycloak/industrial-rag-realm.json:/opt/keycloak/data/import/industrial-rag-realm.json:ro
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+  keycloak-config:
+    profiles: ["identity", "api", "frontend"]
+    image: quay.io/keycloak/keycloak:26.3.2@sha256:98fab020a3a490aba0978f237e2a06cd0ea42bf149c6cf10f11c0aaf27728ff2
+    depends_on:
+      keycloak:
+        condition: service_started
+    environment:
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?Set KEYCLOAK_ADMIN_PASSWORD in industrial-rag/.env}
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - |
+        authenticated=false
+        for attempt in $$(seq 1 60); do
+          if /opt/keycloak/bin/kcadm.sh config credentials \
+            --server http://keycloak:8080 --realm master \
+            --user "$${KEYCLOAK_ADMIN}" --password "$${KEYCLOAK_ADMIN_PASSWORD}"; then
+            authenticated=true
+            break
+          fi
+          sleep 2
+        done
+        if [ "$${authenticated}" != "true" ]; then
+          echo "Keycloak admin authentication timed out after 120 seconds" >&2
+          exit 1
+        fi
+
+        realm_ready=false
+        for attempt in $$(seq 1 60); do
+          if /opt/keycloak/bin/kcadm.sh get realms/industrial-rag >/dev/null 2>&1; then
+            realm_ready=true
+            break
+          fi
+          sleep 2
+        done
+        if [ "$${realm_ready}" != "true" ]; then
+          echo "Keycloak realm industrial-rag was not ready after 120 seconds" >&2
+          exit 1
+        fi
+
+        /opt/keycloak/bin/kcadm.sh update users/profile \
+          -r industrial-rag -f /config/user-profile.json
+    volumes:
+      - ./keycloak/user-profile.json:/config/user-profile.json:ro
+    restart: "no"
+    security_opt:
+      - no-new-privileges:true
+
 volumes:
   postgres_data:
+  postgres_tls:
   redis_data:
+  keycloak_data:

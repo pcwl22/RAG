@@ -1,0 +1,109 @@
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 2 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  codeql:
+    if: github.event.repository.visibility == 'public' || vars.ADVANCED_SECURITY_ENABLED == 'true'
+    name: CodeQL (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [python, javascript-typescript]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: github/codeql-action/init@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4
+        with:
+          languages: ${{ matrix.language }}
+      - uses: github/codeql-action/analyze@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4
+
+  dependency-review:
+    # GitHub rejects this API for private repositories without GHAS. The
+    # portable pip/npm/Trivy gates remain mandatory; set the repository variable
+    # ADVANCED_SECURITY_ENABLED=true after GHAS is licensed to enable this check.
+    if: >-
+      github.event_name == 'pull_request' &&
+      (github.event.repository.visibility == 'public' || vars.ADVANCED_SECURITY_ENABLED == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4
+        with:
+          fail-on-severity: high
+
+  supply-chain:
+    name: Supply-chain scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Lint container build files
+        uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf # v3.1.0
+        with:
+          recursive: true
+          failure-threshold: error
+
+      - name: Scan repository dependencies
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: 1
+          format: sarif
+          output: trivy-results.sarif
+          trivyignores: .trivyignore.yaml
+          limit-severities-for-sarif: true
+
+      - name: Upload Trivy SARIF
+        if: >-
+          always() &&
+          (github.event.repository.visibility == 'public' || vars.ADVANCED_SECURITY_ENABLED == 'true')
+        uses: github/codeql-action/upload-sarif@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Preserve Trivy SARIF evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: trivy-source-scan-sarif
+          path: trivy-results.sarif
+          if-no-files-found: warn
+
+      - name: Generate source SBOM
+        if: always()
+        uses: anchore/sbom-action@da167eac915b4e86f08b264dbdbc867b61be6f0c # v0.20.5
+        with:
+          path: .
+          format: cyclonedx-json
+          artifact-name: industrial-rag-source-sbom.cdx.json
+          output-file: industrial-rag-source-sbom.cdx.json

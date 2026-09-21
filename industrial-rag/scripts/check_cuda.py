@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import json
 import sys
+from typing import Any
 
 import torch
 
 
 def main() -> None:
     available = torch.cuda.is_available()
-    result = {
+    result: dict[str, Any] = {
         "python": sys.version,
         "executable": sys.executable,
         "torch": torch.__version__,

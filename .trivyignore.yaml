@@ -1,0 +1,10 @@
+misconfigurations:
+  - id: DS-0002
+    paths:
+      - industrial-rag/docker/model-bundle/Dockerfile
+      - industrial-rag/docker/model-bundle/Dockerfile.production
+    statement: >-
+      These scratch images contain only immutable model data and no executable,
+      shell, entrypoint, or command. They are consumed exclusively through
+      COPY --from, so USER metadata cannot create a runtime privilege boundary.
+    expired_at: 2027-09-21

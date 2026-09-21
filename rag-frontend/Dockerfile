@@ -1,12 +1,24 @@
-FROM node:22-alpine AS build
+FROM node:22-alpine@sha256:16e22a550f3863206a3f701448c45f7912c6896a62de43add43bb9c86130c3e2 AS build
 
 WORKDIR /app
+ARG VITE_OIDC_ISSUER=""
+ARG VITE_OIDC_CLIENT_ID=""
+ARG VITE_OIDC_AUDIENCE="rag-api"
+ENV VITE_OIDC_ISSUER=${VITE_OIDC_ISSUER}
+ENV VITE_OIDC_CLIENT_ID=${VITE_OIDC_CLIENT_ID}
+ENV VITE_OIDC_AUDIENCE=${VITE_OIDC_AUDIENCE}
 COPY package.json package-lock.json ./
 RUN npm ci
 COPY . .
 RUN npm run build
 
-FROM nginx:1.27-alpine
+FROM nginx:1.30.5-alpine3.24@sha256:a5f2157a0302eb0c5e300415effb63a9e70ed1eb9c107283819bf6d149ab607c
 COPY nginx/default.conf.template /etc/nginx/templates/default.conf.template
 COPY --from=build /app/dist /usr/share/nginx/html
-EXPOSE 80
+RUN sed -i 's/listen 80;/listen 8080;/' /etc/nginx/templates/default.conf.template \
+    && sed -i 's|^pid[[:space:]].*;|pid /tmp/nginx.pid;|' /etc/nginx/nginx.conf \
+    && sed -i '/^user[[:space:]]/d' /etc/nginx/nginx.conf \
+    && mkdir -p /var/cache/nginx /var/run /etc/nginx/conf.d \
+    && chown -R nginx:nginx /var/cache/nginx /var/run /etc/nginx/conf.d /usr/share/nginx/html
+USER 101:101
+EXPOSE 8080

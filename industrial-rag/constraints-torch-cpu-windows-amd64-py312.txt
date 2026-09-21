@@ -1,0 +1,8 @@
+# Resolver-only constraint for the verified Windows/Python 3.12 GPU lock.
+#
+# The common dependency lock deliberately excludes Torch because the runtime
+# installs the separately hashed CUDA carrier.  Using the much smaller CPU
+# wheel here supplies the same Windows dependency metadata without downloading
+# the multi-gigabyte CUDA wheel during lock generation.  This artifact is never
+# installed by scripts/setup_gpu_env.ps1.
+torch @ https://download-r2.pytorch.org/whl/cpu/torch-2.13.0%2Bcpu-cp312-cp312-win_amd64.whl#sha256=a8b450c1e58e5800e5b4691dac412f8d2d65a1dc3298166f91596603a3531e6f

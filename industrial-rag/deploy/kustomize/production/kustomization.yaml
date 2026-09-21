@@ -1,0 +1,20 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: rag-production
+
+resources:
+  - ../base
+
+# These values intentionally fail closed. The protected release workflow must
+# replace them with registry digests obtained from the signed build output.
+images:
+  - name: industrial-rag-api
+    newName: registry.example.invalid/industrial-rag-api
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+  - name: industrial-rag-worker
+    newName: registry.example.invalid/industrial-rag-worker
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+  - name: industrial-rag-frontend
+    newName: registry.example.invalid/industrial-rag-frontend
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000

@@ -3,7 +3,7 @@ import os
 from typing import Any
 
 from app.embedding.embedder import resolve_torch_device
-from app.utils.config import get_settings
+from app.utils.config import get_config_section
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -11,8 +11,26 @@ logger = get_logger(__name__)
 _reranker_model: Any = None
 
 
-def _reranker_config() -> dict:
-    return get_settings().get("reranker", {})
+def _reranker_config() -> dict[str, Any]:
+    return get_config_section("reranker")
+
+
+def _fallback(documents: list[dict], top_n: int | None) -> list[dict]:
+    mode = str(_reranker_config().get("failure_mode", "closed")).strip().lower()
+    if mode == "open":
+        return documents[:top_n] if top_n else documents
+    return []
+
+
+def _reranker_document_text(doc: dict[str, Any]) -> str:
+    """Use the retrieved child passage when parent context is also present."""
+    metadata = doc.get("metadata") or {}
+    return str(
+        doc.get("child_content")
+        or metadata.get("child_content")
+        or doc.get("content")
+        or ""
+    )
 
 
 def load_reranker() -> Any:
@@ -33,10 +51,17 @@ def load_reranker() -> Any:
 
         model_path = cfg.get("model_path", "E:/RAG/models/bge-reranker-v2-m3")
         device = resolve_torch_device(
-            os.getenv("RERANKER_DEVICE") or cfg.get("device", "cuda")
+            os.getenv("RERANKER_DEVICE") or cfg.get("device", "cuda"),
+            allow_cpu_fallback=bool(cfg.get("allow_cpu_fallback", True)),
         )
-        max_length = cfg.get("max_length")
-        _reranker_model = CrossEncoder(model_path, device=device, max_length=max_length)
+        raw_max_length = cfg.get("max_length")
+        max_length: int | None = (
+            int(raw_max_length) if raw_max_length is not None else None
+        )
+        reranker_kwargs: dict[str, Any] = {"device": device}
+        if max_length is not None:
+            reranker_kwargs["max_length"] = max_length
+        _reranker_model = CrossEncoder(model_path, **reranker_kwargs)
         logger.info(f"Reranker loaded successfully from {model_path}")
         return _reranker_model
     except Exception as e:
@@ -48,15 +73,24 @@ def rerank_documents(
     query: str,
     documents: list[dict],
     top_n: int | None = None,
+    *,
+    apply_threshold: bool = True,
 ) -> list[dict]:
-    """Rerank documents and preserve vector/reranker diagnostics in metadata."""
+    """Rerank documents and preserve vector/reranker diagnostics in metadata.
+
+    ``apply_threshold=False`` is intended for a second pass over candidates
+    that were already admitted by one or more independent retrieval queries.
+    The caller remains responsible for applying its final admission policy in
+    that mode; this keeps a broad common query from deleting a document that
+    was highly relevant to one decomposed sub-question.
+    """
     if not documents:
         return []
 
     reranker = load_reranker()
     if not reranker:
-        logger.warning("Reranker not available, returning original order")
-        return documents[:top_n] if top_n else documents
+        logger.error("Reranker unavailable; applying configured failure mode")
+        return _fallback(documents, top_n)
 
     cfg = _reranker_config()
     batch_size = cfg.get("batch_size", 8)
@@ -66,7 +100,7 @@ def rerank_documents(
     if threshold is not None:
         threshold = float(threshold)
 
-    pairs = [[query, doc["content"]] for doc in documents]
+    pairs = [[query, _reranker_document_text(doc)] for doc in documents]
 
     try:
         scores = reranker.predict(pairs, batch_size=batch_size)
@@ -94,8 +128,9 @@ def rerank_documents(
 
         # Absolute threshold filtering. Allowed to return 0 docs — "no relevant
         # law found" is a valid and important answer in the legal domain.
-        if threshold is not None:
-            kept = [doc for doc in reranked if doc["score"] >= threshold]
+        effective_threshold = threshold if apply_threshold else None
+        if effective_threshold is not None:
+            kept = [doc for doc in reranked if doc["score"] >= effective_threshold]
         else:
             kept = reranked
 
@@ -106,9 +141,9 @@ def rerank_documents(
         top_score = kept[0]["score"] if kept else 0.0
         logger.info(
             f"Reranked {len(documents)} docs -> {len(kept)} kept "
-            f"(threshold={threshold}, top prob={top_score:.3f})"
+            f"(threshold={effective_threshold}, top prob={top_score:.3f})"
         )
         return kept
     except Exception as e:
-        logger.error(f"Reranking failed: {e}, falling back to original order")
-        return documents[:top_n] if top_n else documents
+        logger.error("Reranking failed: %s", e, exc_info=True)
+        return _fallback(documents, top_n)

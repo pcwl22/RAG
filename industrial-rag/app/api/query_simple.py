@@ -8,7 +8,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app.api.retrieval_params import resolve_retrieval_params
-from app.retrieval.dense import RetrievalEngine
+from app.retrieval.domain_signal_map import is_known_out_of_scope
+from app.retrieval.factory import build_retrieval_engine
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -23,7 +24,7 @@ class SimpleQueryRequest(BaseModel):
 
 
 @router_simple.post("/query_simple")
-async def query_simple(request: SimpleQueryRequest):
+async def query_simple(request: SimpleQueryRequest) -> JSONResponse:
     """
     保留旧路径的简化查询端点，并复用统一的请求边界校验。
     """
@@ -38,18 +39,21 @@ async def query_simple(request: SimpleQueryRequest):
             enable_rerank=request.enable_rerank,
         )
 
-        logger.info(f"Simple query: {query}, top_k: {params.top_k}")
+        logger.info("Simple query received, top_k=%s", params.top_k)
 
-        # 初始化检索引擎
-        engine = RetrievalEngine()
-
-        # 执行检索
-        results = await engine.retrieve(
-            query=query,
-            top_k=params.top_k,
-            similarity_threshold=params.similarity_threshold,
-            enable_rerank=params.enable_rerank,
-        )
+        # Reject known out-of-scope requests before loading models or touching
+        # the vector store.  This keeps the compatibility endpoint aligned
+        # with the main retrieval engines.
+        if is_known_out_of_scope(query):
+            results = []
+        else:
+            engine = build_retrieval_engine()
+            results = await engine.retrieve(
+                query=query,
+                top_k=params.top_k,
+                similarity_threshold=params.similarity_threshold,
+                enable_rerank=params.enable_rerank,
+            )
 
         # 构造响应
         documents = [
@@ -85,7 +89,7 @@ async def query_simple(request: SimpleQueryRequest):
 
 
 @router_simple.post("/answer_simple")
-async def answer_simple(request: SimpleQueryRequest):
+async def answer_simple(request: SimpleQueryRequest) -> JSONResponse:
     """
     保留旧路径的简化问答端点，并复用统一的请求边界校验。
     """
@@ -100,24 +104,26 @@ async def answer_simple(request: SimpleQueryRequest):
             enable_rerank=request.enable_rerank,
         )
 
-        logger.info(f"Simple answer: {query}, top_k: {params.top_k}")
+        logger.info("Simple answer received, top_k=%s", params.top_k)
 
-        # 初始化检索引擎
-        engine = RetrievalEngine()
-
-        # 检索相关文档
-        results = await engine.retrieve(
-            query=query,
-            top_k=params.top_k,
-            similarity_threshold=params.similarity_threshold,
-            enable_rerank=params.enable_rerank,
-        )
+        if is_known_out_of_scope(query):
+            results = []
+        else:
+            engine = build_retrieval_engine()
+            results = await engine.retrieve(
+                query=query,
+                top_k=params.top_k,
+                similarity_threshold=params.similarity_threshold,
+                enable_rerank=params.enable_rerank,
+            )
 
         if not results:
+            from app.service.chat_service import format_no_context_answer
+
             return JSONResponse(
                 content={
                     "query": query,
-                    "answer": "抱歉，我在知识库中没有找到相关信息来回答这个问题。",
+                    "answer": format_no_context_answer(),
                     "sources": [],
                     "total_time": time.time() - start_time,
                 },

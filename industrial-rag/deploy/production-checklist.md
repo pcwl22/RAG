@@ -87,6 +87,10 @@ infrastructure, not a highly available production topology.
 
 ## Release evidence
 
+- For private repositories, enable GitHub Advanced Security and set the repository variable
+  `GITHUB_ADVANCED_SECURITY_ENABLED=true` before treating CodeQL and Dependency Review as provider-native
+  required checks. Until that license is available, the mandatory portable Ruff, mypy, pip/npm audit,
+  Trivy, lock validation, and SBOM gates remain active and their artifacts must be retained.
 - Require backend tests, frontend tests/build/audit, Ruff, Compose rendering, evaluation asset
   validation, approved RAG quality gates, dependency scanning, and container scanning.
 - Resolve and review `requirements-runtime.lock.txt`, `requirements-gpu.lock.txt`,

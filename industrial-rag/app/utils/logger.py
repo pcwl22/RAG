@@ -1,4 +1,6 @@
 """Logging helpers."""
+import hashlib
+import importlib
 import logging
 import sys
 from logging.handlers import RotatingFileHandler
@@ -6,15 +8,25 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
-structlog: Any
 try:
-    import structlog
+    _structlog: Any = importlib.import_module("structlog")
 except ImportError:
-    structlog = None
+    _structlog = None
+
+structlog: Any | None = _structlog
 
 
 _configured = False
 _configure_lock = Lock()
+
+
+def text_log_metadata(value: str, field: str = "text") -> dict[str, Any]:
+    """Return correlation metadata without copying user text into logs."""
+    text = str(value or "")
+    return {
+        f"{field}_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
+        f"{field}_length": len(text),
+    }
 
 
 def _configure_logging() -> None:
@@ -67,15 +79,17 @@ def _configure_logging() -> None:
                 if log_format == "json"
                 else structlog.dev.ConsoleRenderer(colors=False)
             )
+            processors: list[Any] = [
+                structlog.stdlib.add_log_level,
+                structlog.stdlib.add_logger_name,
+                structlog.processors.TimeStamper(fmt="iso"),
+                structlog.processors.StackInfoRenderer(),
+            ]
+            if log_format == "json":
+                processors.append(structlog.processors.format_exc_info)
+            processors.append(renderer)
             structlog.configure(
-                processors=[
-                    structlog.stdlib.add_log_level,
-                    structlog.stdlib.add_logger_name,
-                    structlog.processors.TimeStamper(fmt="iso"),
-                    structlog.processors.StackInfoRenderer(),
-                    structlog.processors.format_exc_info,
-                    renderer,
-                ],
+                processors=processors,
                 wrapper_class=structlog.stdlib.BoundLogger,
                 context_class=dict,
                 logger_factory=structlog.stdlib.LoggerFactory(),

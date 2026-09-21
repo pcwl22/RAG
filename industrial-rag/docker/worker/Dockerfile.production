@@ -1,0 +1,51 @@
+# syntax=docker/dockerfile:1.7
+ARG MODEL_BUNDLE_IMAGE
+FROM ${MODEL_BUNDLE_IMAGE} AS model_bundle
+
+FROM python:3.12.14-slim@sha256:09f7da3bc104798d0afb40bc08d23ab2da20a76130cec1f2ef170848f5d85217
+
+ARG SOURCE_REVISION
+ARG SOURCE_REPOSITORY
+ARG MODEL_BUNDLE_DIGEST
+ARG MODEL_MANIFEST_SHA256
+LABEL org.opencontainers.image.revision=$SOURCE_REVISION \
+      org.opencontainers.image.source=$SOURCE_REPOSITORY \
+      org.opencontainers.image.model-bundle-digest=$MODEL_BUNDLE_DIGEST \
+      org.opencontainers.image.model-manifest-sha256=$MODEL_MANIFEST_SHA256
+
+WORKDIR /app
+ENV PIP_DEFAULT_TIMEOUT=1000 \
+    PIP_RETRIES=10 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN set -eu; \
+    apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=120 update; \
+    apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=120 install -y --no-install-recommends \
+        build-essential git libpoppler-cpp-dev tesseract-ocr \
+        tesseract-ocr-chi-sim tesseract-ocr-chi-tra libreoffice; \
+    rm -rf /var/lib/apt/lists/*
+
+COPY pyproject.toml README.md requirements-runtime.lock.txt requirements-torch-cpu.lock.txt ./
+RUN pip install --no-cache-dir --no-deps --require-hashes \
+        --index-url https://download.pytorch.org/whl/cpu \
+        -r requirements-torch-cpu.lock.txt \
+    && pip install --no-cache-dir --require-hashes -r requirements-runtime.lock.txt \
+    && python -c "import torch; assert torch.__version__ == '2.13.0+cpu'; assert torch.version.cuda is None"
+ENV PYTHONPATH=/app
+COPY app/ ./app/
+COPY scripts/validate_model_bundle_manifest.py ./scripts/validate_model_bundle_manifest.py
+RUN python -m pip check
+COPY prompts/ ./prompts/
+COPY config/ ./config/
+COPY --from=model_bundle /models/ /app/models/
+
+RUN test -f /app/models/bge-m3/config.json \
+    && test -f /app/models/bge-reranker-v2-m3/config.json \
+    && test -f /app/models/model-manifest.json \
+    && python scripts/validate_model_bundle_manifest.py /app/models/model-manifest.json --models-root /app/models \
+    && mkdir -p /app/data /app/logs \
+    && groupadd --gid 10001 appgroup \
+    && useradd --create-home --uid 10001 --gid 10001 --no-log-init appuser \
+    && chown -R 10001:10001 /app
+USER 10001:10001
+CMD ["celery", "-A", "app.workers.celery_app:celery_app", "worker", "--loglevel=info", "--pool=solo", "--concurrency=1"]

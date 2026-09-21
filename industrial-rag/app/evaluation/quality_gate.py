@@ -1,7 +1,9 @@
-"""Combine Ragas and deterministic retrieval metrics into a CI quality gate."""
+"""Combine native judge and deterministic retrieval metrics into a CI quality gate."""
 from __future__ import annotations
 
 from typing import Any
+
+from app.evaluation.native_judge import EVALUATION_ENGINE, EVALUATION_ENGINE_VERSION
 
 DEFAULT_THRESHOLDS = {
     "answer_accuracy": 0.70,
@@ -50,11 +52,29 @@ def build_quality_gate(
             status = "passed" if float(value) >= minimum else "failed"
         checks[name] = {"value": value, "minimum": minimum, "status": status}
 
+    judge_model = str(ragas_report.get("judge_model") or "").strip()
+    contract_valid = bool(
+        ragas_report.get("evaluation_engine") == EVALUATION_ENGINE
+        and ragas_report.get("evaluation_engine_version") == EVALUATION_ENGINE_VERSION
+        and judge_model
+    )
+    checks["evaluation_contract"] = {
+        "value": contract_valid,
+        "minimum": True,
+        "status": "passed" if contract_valid else "failed",
+    }
+    sample_count = int(ragas_report.get("sample_count") or 0)
+
     return {
         "passed": all(check["status"] != "failed" for check in checks.values()),
         "require_all": require_all,
         "top_k": top_k,
-        "ragas_sample_count": ragas_report.get("sample_count", 0),
+        "evaluation_engine": ragas_report.get("evaluation_engine"),
+        "evaluation_engine_version": ragas_report.get("evaluation_engine_version"),
+        "judge_model": judge_model,
+        "judge_sample_count": sample_count,
+        # Historical alias kept so older artifact consumers fail gradually.
+        "ragas_sample_count": sample_count,
         "retrieval_evaluated_cases": retrieval_report.get("evaluated_cases", 0),
         "checks": checks,
     }

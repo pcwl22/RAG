@@ -13,7 +13,8 @@ import time
 from collections.abc import AsyncIterator
 from typing import Any
 
-from app.utils.config import get_config_section
+from app.llm.request_policy import structured_output_request_options
+from app.utils.config import get_config_section, normalize_openai_base_url
 from app.utils.logger import get_logger
 from app.utils.metrics import LLM_DURATION, LLM_REQUESTS
 
@@ -21,6 +22,27 @@ logger = get_logger(__name__)
 
 # 全局 LLM 客户端实例
 _llm_client: "LLMClient | None" = None
+
+
+def _is_retryable_openai_error(exc: Exception) -> bool:
+    """Identify provider failures that are safe to retry once more.
+
+    Authentication, model and request-validation errors must fail fast.  A
+    few OpenAI-compatible gateways also surface a stale internal function
+    reference as HTTP 400 even though the request itself is valid; that error
+    is transient and has been observed to succeed on the next gateway route.
+    Transport failures are also safe to retry because no provider response was
+    received and the request is idempotent from this client's perspective.
+    """
+    if exc.__class__.__name__ in {"APIConnectionError", "APITimeoutError"}:
+        return True
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int) and status_code in {408, 409, 429}:
+        return True
+    if isinstance(status_code, int) and status_code >= 500:
+        return True
+    message = str(exc).lower()
+    return "function id" in message and "not found" in message
 
 
 def _llm_config() -> dict[str, Any]:
@@ -75,7 +97,15 @@ class LLMClient:
                 if self.provider == "claude":
                     await self._client.models.list(limit=1)
                 else:
-                    await self._client.models.list()
+                    models = self._client.models.list()
+                    # OpenAI's async SDK returns an AsyncPaginator here rather
+                    # than an awaitable page. Keep compatibility with simple
+                    # test doubles and older compatible clients as well.
+                    if hasattr(models, "__aiter__"):
+                        async for _ in models:
+                            break
+                    else:
+                        await models
             except Exception:
                 self._record_health(False)
                 logger.warning("LLM upstream health probe failed", exc_info=True)
@@ -126,10 +156,21 @@ class LLMClient:
                 f"{self.provider.upper()}_API_KEY not set. Please set it in .env or environment."
             )
 
+        raw_base_url = str(self.config.get("base_url", "")).strip()
+        if not raw_base_url or raw_base_url.startswith("${"):
+            raise ValueError(
+                "DEEPSEEK_API_URL not set. Please set it in .env or environment."
+            )
+
         return AsyncOpenAI(
             api_key=api_key,
-            base_url=self.config.get("base_url"),
+            base_url=normalize_openai_base_url(raw_base_url),
             timeout=self.config.get("timeout", 60),
+            # The application owns the bounded retry policy in
+            # ``_generate_openai``. Leaving the SDK default enabled nests two
+            # retry loops (up to nine network attempts for a configured value
+            # of two) and makes latency and telemetry non-deterministic.
+            max_retries=0,
         )
 
     async def generate(
@@ -138,6 +179,7 @@ class LLMClient:
         system_prompt: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        structured_output: bool = False,
     ) -> str:
         """
         生成响应（非流式）。
@@ -157,7 +199,13 @@ class LLMClient:
             if self.provider == "claude":
                 result = await self._generate_claude(prompt, system_prompt, temperature, max_tokens)
             elif self.provider in ("openai_compatible", "deepseek", "zhipu"):
-                result = await self._generate_openai(prompt, system_prompt, temperature, max_tokens)
+                result = await self._generate_openai(
+                    prompt,
+                    system_prompt,
+                    temperature,
+                    max_tokens,
+                    structured_output=structured_output,
+                )
             else:
                 raise ValueError(f"Unsupported provider: {self.provider}")
         except Exception:
@@ -188,6 +236,7 @@ class LLMClient:
         system_prompt: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        structured_output: bool = False,
     ) -> AsyncIterator[str]:
         """
         生成响应（流式）。
@@ -211,7 +260,11 @@ class LLMClient:
                     yield chunk
             elif self.provider in ("openai_compatible", "deepseek", "zhipu"):
                 async for chunk in self._generate_openai_stream(
-                    prompt, system_prompt, temperature, max_tokens
+                    prompt,
+                    system_prompt,
+                    temperature,
+                    max_tokens,
+                    structured_output=structured_output,
                 ):
                     yield chunk
             else:
@@ -273,39 +326,99 @@ class LLMClient:
     # OpenAI-compatible 实现（DeepSeek）
     # --------------------------------------------------------------------------
     async def _generate_openai(
-        self, prompt: str, system_prompt: str | None, temperature: float | None, max_tokens: int | None
+        self,
+        prompt: str,
+        system_prompt: str | None,
+        temperature: float | None,
+        max_tokens: int | None,
+        *,
+        structured_output: bool = False,
     ) -> str:
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
 
-        response = await self._client.chat.completions.create(
-            model=self.config.get("model_name", "deepseek-chat"),
-            messages=messages,
-            temperature=temperature if temperature is not None else self.config.get("temperature", 0.7),
-            max_tokens=max_tokens if max_tokens is not None else self.config.get("max_tokens", 4096),
-        )
+        max_retries = max(0, min(int(self.config.get("max_retries", 2)), 5))
+        retry_backoff = max(0.0, float(self.config.get("retry_backoff_seconds", 0.5)))
+        for attempt in range(max_retries + 1):
+            try:
+                request_options = (
+                    structured_output_request_options(
+                        provider=self.provider,
+                        model_name=str(self.config.get("model_name", "deepseek-chat")),
+                        base_url=str(self.config.get("base_url") or ""),
+                    )
+                    if structured_output
+                    else {}
+                )
+                response = await self._client.chat.completions.create(
+                    model=self.config.get("model_name", "deepseek-chat"),
+                    messages=messages,
+                    temperature=(
+                        temperature
+                        if temperature is not None
+                        else self.config.get("temperature", 0.7)
+                    ),
+                    max_tokens=(
+                        max_tokens
+                        if max_tokens is not None
+                        else self.config.get("max_tokens", 4096)
+                    ),
+                    **request_options,
+                )
+                break
+            except Exception as exc:
+                if attempt >= max_retries or not _is_retryable_openai_error(exc):
+                    raise
+                delay = retry_backoff * (2**attempt)
+                logger.warning(
+                    "Retrying transient OpenAI-compatible request",
+                    extra={"attempt": attempt + 1, "max_retries": max_retries},
+                )
+                if delay:
+                    await asyncio.sleep(delay)
         return response.choices[0].message.content or ""
 
     async def _generate_openai_stream(
-        self, prompt: str, system_prompt: str | None, temperature: float | None, max_tokens: int | None
+        self,
+        prompt: str,
+        system_prompt: str | None,
+        temperature: float | None,
+        max_tokens: int | None,
+        *,
+        structured_output: bool = False,
     ) -> AsyncIterator[str]:
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
 
+        request_options = (
+            structured_output_request_options(
+                provider=self.provider,
+                model_name=str(self.config.get("model_name", "deepseek-chat")),
+                base_url=str(self.config.get("base_url") or ""),
+            )
+            if structured_output
+            else {}
+        )
         stream = await self._client.chat.completions.create(
             model=self.config.get("model_name", "deepseek-chat"),
             messages=messages,
             temperature=temperature if temperature is not None else self.config.get("temperature", 0.7),
             max_tokens=max_tokens if max_tokens is not None else self.config.get("max_tokens", 4096),
             stream=True,
+            **request_options,
         )
         async for chunk in stream:
-            if chunk.choices[0].delta.content:
-                yield chunk.choices[0].delta.content
+            choices = getattr(chunk, "choices", None) or []
+            if not choices:
+                continue
+            delta = getattr(choices[0], "delta", None)
+            content = getattr(delta, "content", None)
+            if content:
+                yield content
 
 def get_llm_client() -> LLMClient:
     """获取全局 LLM 客户端实例（单例）。"""

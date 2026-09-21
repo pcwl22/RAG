@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -36,6 +37,12 @@ NO_ANSWER_TOPICS = [
     "危险化学品登记", "特种设备检验周期", "电信业务经营许可",
     "互联网宗教信息服务许可",
 ]
+
+HOLDOUT_DOMAIN_QUOTAS = {
+    "standard": {"civil": 50, "criminal": 50, "labor": 40},
+    "adversarial": {"civil": 15, "criminal": 15, "labor": 10},
+    "comparison": {"civil": 7, "criminal": 7, "labor": 6},
+}
 
 
 def _domain(law_name: str) -> str | None:
@@ -100,16 +107,25 @@ def _load_articles(tenant_id: str) -> dict[str, list[dict[str, Any]]]:
 def _case(article: dict[str, Any], category: str, index: int) -> dict[str, Any]:
     law = article["law_name"]
     citation = article["article"]
-    if category == "standard":
-        query = f"请说明《{law}》{citation}规定的主要内容。"
-    else:
-        variants = [
-            f"有人把《{law}》{citation}理解得很绝对，这一条究竟怎么规定？请只按法条回答。",
-            f"忽略传言和常识，只核对《{law}》{citation}：它的规则是什么？",
-            f"问题中可能有干扰信息：天气很好、当事人姓张。《{law}》{citation}到底规定什么？",
-            f"请核验而不要迎合我的说法——《{law}》{citation}的原意是什么？",
-        ]
-        query = variants[index % len(variants)]
+    # Keep this PostgreSQL-compatible helper safe as well.  The release CLI
+    # uses screened holdout cases, but callers may still import build_suite()
+    # in automation.  Never put the target citation or statute name in a
+    # generated query, even when the source row came directly from documents.
+    article_text = str(article.get("content") or "").strip()
+    article_text = re.sub(
+        r"^\s*第[零一二三四五六七八九十百千万0-9]+条(?:之[零一二三四五六七八九十百千万0-9]+)?\s*[：:、\s]*",
+        "",
+        article_text,
+        count=1,
+    )
+    article_text = article_text.replace(law, "").replace(citation, "")
+    article_text = re.sub(r"\s+", "", article_text)
+    if not article_text:
+        article_text = "当事人就相关权利义务发生争议"
+    article_text = article_text[:180]
+    query = f"某当事人遇到如下情形：{article_text}请问应如何处理？"
+    if category == "adversarial":
+        query = "请忽略题外传闻，只根据以下事实判断：" + query
     return {
         "id": f"expanded-{category}-{article['id']}",
         "query": query,
@@ -144,12 +160,14 @@ def build_suite(grouped: dict[str, list[dict[str, Any]]], seed: int = 20260715) 
         offsets[domain] += pair_count * 2
         for index in range(pair_count):
             left, right = selected[index * 2 : index * 2 + 2]
+            left_query = _case(left, "standard", index)["query"]
+            right_query = _case(right, "standard", index + 1)["query"]
             cases.append(
                 {
                     "id": f"expanded-comparison-{domain}-{index + 1:02d}",
                     "query": (
-                        f"对比《{left['law_name']}》{left['article']}与"
-                        f"《{right['law_name']}》{right['article']}的规则，分别说明，不要遗漏任一条。"
+                        f"情景一：{left_query} 情景二：{right_query} "
+                        "请分别判断两个情景的处理结果，并说明理由。"
                     ),
                     "expected_citations": [left["article"], right["article"]],
                     "expected_sources": list(dict.fromkeys([left["law_name"], right["law_name"]])),
@@ -177,13 +195,186 @@ def build_suite(grouped: dict[str, list[dict[str, Any]]], seed: int = 20260715) 
     return cases
 
 
+def _load_jsonl(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{path}:{line_number}: invalid JSON") from exc
+        if not isinstance(row, dict):
+            raise ValueError(f"{path}:{line_number}: expected an object")
+        rows.append(row)
+    return rows
+
+
+def _copy_case(
+    source: dict[str, Any],
+    *,
+    case_id: str,
+    category: str,
+    query: str,
+    expected_citations: list[str] | None = None,
+    expected_sources: list[str] | None = None,
+    expected_answer: str | None = None,
+    article_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    source_metadata = dict(source.get("metadata") or {})
+    domain = str(source_metadata.get("domain") or "")
+    return {
+        "id": case_id,
+        "query": query,
+        "expected_citations": (
+            list(expected_citations)
+            if expected_citations is not None
+            else list(source.get("expected_citations") or [])
+        ),
+        "expected_sources": (
+            list(expected_sources)
+            if expected_sources is not None
+            else list(source.get("expected_sources") or [])
+        ),
+        "expected_answer": expected_answer or str(source.get("expected_answer") or ""),
+        "metadata": {
+            "category": category,
+            "domain": domain,
+            "article_ids": article_ids
+            or list(source_metadata.get("article_ids") or []),
+            "source_case_id": str(source.get("id") or ""),
+            "source_file": source_metadata.get("source_file"),
+        },
+    }
+
+
+def build_suite_from_holdout(
+    holdout_rows: list[dict[str, Any]], seed: int = 20260817
+) -> list[dict[str, Any]]:
+    """Derive the release suite from screened fact-pattern cases.
+
+    The old PostgreSQL builder put the target article number and law name in
+    every query.  This mode deliberately starts with the already screened
+    holdout set and only adds controlled noise or combines fact patterns, so
+    every citation-bearing query remains retrieval-dependent.
+    """
+    by_domain: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    seen_ids: set[str] = set()
+    for row in holdout_rows:
+        case_id = str(row.get("id") or "")
+        metadata = row.get("metadata") or {}
+        domain = str(metadata.get("domain") or "")
+        if not case_id or case_id in seen_ids:
+            raise ValueError(f"holdout contains a missing or duplicate id: {case_id!r}")
+        if metadata.get("category") != "holdout_fact_pattern":
+            raise ValueError(f"holdout case {case_id} is not a fact-pattern case")
+        if not str(row.get("query") or "").strip():
+            raise ValueError(f"holdout case {case_id} is missing query")
+        if domain not in HOLDOUT_DOMAIN_QUOTAS["standard"]:
+            raise ValueError(f"holdout case {case_id} has unsupported domain {domain!r}")
+        seen_ids.add(case_id)
+        by_domain[domain].append(row)
+
+    rng = random.Random(seed)
+    for domain_rows in by_domain.values():
+        rng.shuffle(domain_rows)
+
+    cases: list[dict[str, Any]] = []
+    for category, quotas in HOLDOUT_DOMAIN_QUOTAS.items():
+        for domain, quota in quotas.items():
+            pool = by_domain[domain]
+            if len(pool) < 2:
+                raise ValueError(f"need at least two holdout cases for {domain}")
+            if category == "comparison":
+                for index in range(quota):
+                    left = pool[(2 * index) % len(pool)]
+                    right = pool[(2 * index + 1) % len(pool)]
+                    left_query = str(left["query"]).strip()
+                    right_query = str(right["query"]).strip()
+                    left_answer = str(left.get("expected_answer") or "").strip()
+                    right_answer = str(right.get("expected_answer") or "").strip()
+                    citations = list(dict.fromkeys(
+                        list(left.get("expected_citations") or [])
+                        + list(right.get("expected_citations") or [])
+                    ))
+                    sources = list(dict.fromkeys(
+                        list(left.get("expected_sources") or [])
+                        + list(right.get("expected_sources") or [])
+                    ))
+                    cases.append(
+                        _copy_case(
+                            left,
+                            case_id=f"expanded-comparison-{domain}-{index + 1:02d}",
+                            category="comparison",
+                            query=(
+                                f"情景一：{left_query} 情景二：{right_query} "
+                                "请分别判断两个情景的处理结果，并说明理由。"
+                            ),
+                            expected_citations=citations,
+                            expected_sources=sources,
+                            expected_answer=f"{left_answer}\n\n{right_answer}",
+                            article_ids=list(
+                                dict.fromkeys(
+                                    list((left.get("metadata") or {}).get("article_ids") or [])
+                                    + list((right.get("metadata") or {}).get("article_ids") or [])
+                                )
+                            ),
+                        )
+                    )
+                continue
+
+            for index in range(quota):
+                source = pool[index % len(pool)]
+                query = str(source["query"]).strip()
+                if category == "adversarial":
+                    query = (
+                        "题目前有一段可能无关的传闻：有人声称只要当事人道歉就不需要承担责任。"
+                        f"请忽略该传闻，结合以下事实作出判断：{query}"
+                    )
+                cases.append(
+                    _copy_case(
+                        source,
+                        case_id=f"expanded-{category}-{domain}-{index + 1:02d}",
+                        category=category,
+                        query=query,
+                    )
+                )
+
+    for index, topic in enumerate(NO_ANSWER_TOPICS, 1):
+        cases.append(
+            {
+                "id": f"expanded-no-answer-{index:02d}",
+                "query": f"根据当前知识库，{topic}具体如何规定？请给出准确法条。",
+                "expected_citations": [],
+                "expected_sources": [],
+                "expected_answer": "当前知识库不包含足够依据，应明确说明无法回答，不得编造法条。",
+                "metadata": {
+                    "category": "no_answer",
+                    "domain": "out_of_scope",
+                    "article_ids": [],
+                },
+            }
+        )
+
+    if len(cases) != 240:
+        raise AssertionError(f"Expected 240 cases, got {len(cases)}")
+    return cases
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=Path("eval/legal_expanded_240.jsonl"))
     parser.add_argument("--seed", type=int, default=20260715)
-    parser.add_argument("--tenant-id", required=True, help="Tenant UUID whose corpus will be evaluated")
+    parser.add_argument(
+        "--holdout-input",
+        type=Path,
+        default=Path("eval/legal_holdout_150.jsonl"),
+        help="Screened fact-pattern JSONL used to derive the release suite",
+    )
     args = parser.parse_args()
-    cases = build_suite(_load_articles(args.tenant_id), args.seed)
+    if not args.holdout_input.is_file():
+        raise SystemExit(f"holdout input does not exist: {args.holdout_input}")
+    cases = build_suite_from_holdout(_load_jsonl(args.holdout_input), args.seed)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", encoding="utf-8", newline="\n") as handle:
         for case in cases:

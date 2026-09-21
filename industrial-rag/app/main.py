@@ -1,22 +1,31 @@
 """FastAPI application entrypoint for the rag-system layout."""
 import asyncio
+import re
 import time
 from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
+from uuid import uuid4
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import RequestResponseEndpoint
 
 from app.api import chat, search, upload
+from app.auth import OIDCValidator
 from app.embedding.embedder import load_embedding_model
+from app.embedding.model_bundle import validate_runtime_model_manifest
 from app.llm.model import get_llm_client
 from app.retrieval.reranker import load_reranker
 from app.security import authentication_middleware, validate_security_config
-from app.utils.config import get_settings, resolve_queue_provider, validate_runtime_config
+from app.utils.config import (
+    get_settings,
+    resolve_queue_provider,
+    validate_runtime_config,
+)
 from app.utils.inference import close_inference_executor
 from app.utils.logger import get_logger
 from app.vectorstore.storage_adapter import close_vector_store, init_vector_store
@@ -32,6 +41,8 @@ else:
 
 logger = get_logger(__name__)
 BASE_REQUIRED_DEPENDENCIES = ("postgres", "embedding", "llm", "reranker")
+OBJECT_STORAGE_HEALTH_TIMEOUT_SECONDS = 5.0
+_SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 
 
 @dataclass
@@ -92,7 +103,101 @@ def required_dependencies() -> tuple[str, ...]:
     dependencies = list(BASE_REQUIRED_DEPENDENCIES)
     if resolve_queue_provider(config) == "celery":
         dependencies.append("redis")
+        dependencies.append("object_storage")
     return tuple(dependencies)
+
+
+def _request_id(request: Request) -> str:
+    """Accept only bounded trace IDs before echoing or logging them."""
+    candidate = request.headers.get("X-Request-ID", "")
+    return candidate if _SAFE_REQUEST_ID.fullmatch(candidate) else uuid4().hex
+
+
+async def _recover_local_models(app: FastAPI) -> None:
+    """Retry local model initialization without requiring a process restart."""
+    if not app.state.dependencies.get("embedding", False):
+        try:
+            await asyncio.to_thread(load_embedding_model)
+            app.state.dependencies["embedding"] = True
+            logger.info("Embedding model recovered after startup failure")
+        except Exception:
+            logger.warning("Embedding model recovery attempt failed", exc_info=True)
+
+    reranker_enabled = bool(config.get("reranker", {}).get("enabled", False))
+    if not reranker_enabled:
+        app.state.dependencies["reranker"] = True
+    elif not app.state.dependencies.get("reranker", False):
+        try:
+            model = await asyncio.to_thread(load_reranker)
+            if model is None:
+                raise RuntimeError("configured reranker is unavailable")
+            app.state.dependencies["reranker"] = True
+            logger.info("Reranker recovered after startup failure")
+        except Exception:
+            logger.warning("Reranker recovery attempt failed", exc_info=True)
+
+
+async def _local_model_recovery_loop(app: FastAPI) -> None:
+    interval = max(
+        5.0,
+        float(config.get("performance", {}).get("model_recovery_interval_seconds", 30)),
+    )
+    while True:
+        await asyncio.sleep(interval)
+        await _recover_local_models(app)
+
+
+async def _initialize_required_infrastructure(app: FastAPI) -> None:
+    """Initialize infrastructure that cannot recover safely after startup.
+
+    PostgreSQL is always required. Redis and object storage are required only
+    for the distributed Celery ingestion contract; memory mode may continue
+    without Redis-backed caching. Raising here lets the process supervisor
+    retry a transient startup failure instead of leaving a permanently
+    unready-but-live Pod behind.
+    """
+    try:
+        await init_vector_store()
+    except Exception as exc:
+        app.state.dependencies["postgres"] = False
+        raise RuntimeError("required PostgreSQL initialization failed") from exc
+    app.state.dependencies["postgres"] = True
+    logger.info("Vector store initialized")
+
+    from app.utils.cache import init_redis
+
+    try:
+        redis_ready = await init_redis()
+    except Exception as exc:
+        app.state.dependencies["redis"] = False
+        if resolve_queue_provider(config) == "celery":
+            raise RuntimeError("required Redis initialization failed") from exc
+        logger.warning("Optional Redis initialization failed", exc_info=True)
+    else:
+        app.state.dependencies["redis"] = redis_ready
+        if not redis_ready and resolve_queue_provider(config) == "celery":
+            raise RuntimeError("required Redis initialization failed")
+
+    if resolve_queue_provider(config) != "celery":
+        return
+
+    try:
+        from app.storage.object_store import get_object_store
+
+        object_store = get_object_store(config)
+        # The object store owns a dedicated single-attempt health client whose
+        # transport deadline is shorter than this outer coroutine deadline.
+        object_storage_ready = await asyncio.wait_for(
+            asyncio.to_thread(object_store.check_health),
+            timeout=OBJECT_STORAGE_HEALTH_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        app.state.dependencies["object_storage"] = False
+        raise RuntimeError("required object storage initialization failed") from exc
+    if not object_storage_ready:
+        app.state.dependencies["object_storage"] = False
+        raise RuntimeError("required object storage initialization failed")
+    app.state.dependencies["object_storage"] = True
 
 
 @asynccontextmanager
@@ -100,63 +205,85 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Manage application startup and shutdown."""
     logger.info("Starting RAG System...")
 
+    # This is a release integrity boundary, not an optional dependency health
+    # check.  Validate before opening the database or accepting degraded mode.
+    validate_runtime_model_manifest(config)
+
+    recovery_task: asyncio.Task[None] | None = None
+    reconciliation_task: asyncio.Task[None] | None = None
     try:
-        await init_vector_store()
-        app.state.dependencies["postgres"] = True
-        logger.info("Vector store initialized")
-    except Exception as exc:
-        logger.error("Vector store initialization failed: %s", exc, exc_info=True)
+        await _initialize_required_infrastructure(app)
 
-    try:
-        from app.utils.cache import init_redis
-
-        app.state.dependencies["redis"] = await init_redis()
-    except Exception as exc:
-        logger.warning(f"Redis initialization failed: {exc}. Caching will be disabled.")
-
-    try:
-        load_embedding_model()
-        app.state.dependencies["embedding"] = True
-    except Exception as exc:
-        logger.error("Embedding model initialization failed: %s", exc, exc_info=True)
-
-    try:
-        llm_client = get_llm_client()
-        timeout = float(config.get("llm", {}).get("text", {}).get("healthcheck_timeout_seconds", 5))
-        app.state.dependencies["llm"] = await asyncio.wait_for(
-            llm_client.check_health(force=True), timeout=timeout
-        )
-        if not app.state.dependencies["llm"]:
-            raise RuntimeError("configured LLM upstream is unavailable")
-    except Exception as exc:
-        logger.error("LLM client initialization failed: %s", exc, exc_info=True)
-
-    reranker_enabled = bool(config.get("reranker", {}).get("enabled", False))
-    if not reranker_enabled:
-        app.state.dependencies["reranker"] = True
-    else:
         try:
-            if load_reranker() is None:
-                raise RuntimeError("configured reranker is unavailable")
-            app.state.dependencies["reranker"] = True
+            load_embedding_model()
+            app.state.dependencies["embedding"] = True
         except Exception as exc:
-            logger.error("Reranker initialization failed: %s", exc, exc_info=True)
-    logger.info("System ready (dependencies=%s)", app.state.dependencies)
-    app.state.startup_complete = True
+            logger.error("Embedding model initialization failed: %s", exc, exc_info=True)
 
-    yield
+        try:
+            llm_client = get_llm_client()
+            timeout = float(
+                config.get("llm", {}).get("text", {}).get(
+                    "healthcheck_timeout_seconds", 5
+                )
+            )
+            app.state.dependencies["llm"] = await asyncio.wait_for(
+                llm_client.check_health(force=True), timeout=timeout
+            )
+            if not app.state.dependencies["llm"]:
+                raise RuntimeError("configured LLM upstream is unavailable")
+        except Exception as exc:
+            logger.error("LLM client initialization failed: %s", exc, exc_info=True)
 
-    logger.info("Shutting down...")
-    if app.state.dependencies.get("postgres"):
-        await close_vector_store()
+        reranker_enabled = bool(config.get("reranker", {}).get("enabled", False))
+        if not reranker_enabled:
+            app.state.dependencies["reranker"] = True
+        else:
+            try:
+                if load_reranker() is None:
+                    raise RuntimeError("configured reranker is unavailable")
+                app.state.dependencies["reranker"] = True
+            except Exception as exc:
+                logger.error("Reranker initialization failed: %s", exc, exc_info=True)
+        logger.info("Startup completed (dependencies=%s)", app.state.dependencies)
+        app.state.startup_complete = True
+        recovery_task = asyncio.create_task(
+            _local_model_recovery_loop(app),
+            name="local-model-recovery",
+        )
+        if resolve_queue_provider(config) == "celery":
+            from app.service.upload_reconciler import upload_reconciliation_loop
 
-    try:
-        from app.utils.cache import close_redis
+            reconciliation_task = asyncio.create_task(
+                upload_reconciliation_loop(config),
+                name="upload-intent-reconciliation",
+            )
 
-        await close_redis()
-    except Exception as exc:
-        logger.warning(f"Redis shutdown failed: {exc}")
-    close_inference_executor()
+        yield
+    finally:
+        app.state.startup_complete = False
+        if reconciliation_task is not None:
+            reconciliation_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await reconciliation_task
+        if recovery_task is not None:
+            recovery_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await recovery_task
+
+        logger.info("Shutting down...")
+        try:
+            await close_vector_store()
+        except Exception as exc:
+            logger.warning("PostgreSQL shutdown failed: %s", exc)
+
+        try:
+            from app.utils.cache import close_redis
+
+            await close_redis()
+        except Exception as exc:
+            logger.warning("Redis shutdown failed: %s", exc)
+        close_inference_executor()
 
 
 config = get_settings()
@@ -193,6 +320,7 @@ async def limit_api_concurrency(
     timeout = float(
         config.get("performance", {}).get("request_queue_timeout_seconds", 5)
     )
+    queue_deadline = time.monotonic() + max(0.0, timeout)
     performance = config.get("performance", {})
     principal = getattr(request.state, "principal", None)
     tenant_id = getattr(principal, "tenant_id", "local")
@@ -223,21 +351,37 @@ async def limit_api_concurrency(
     )
     if tenant_gate is None:
         return JSONResponse(status_code=503, content={"detail": "Tenant capacity unavailable"})
+    # Queue on the tenant gate first.  Otherwise a noisy tenant can occupy every
+    # global slot with requests that are merely waiting for its own limit,
+    # starving unrelated tenants despite the per-tenant control.
     try:
-        await asyncio.wait_for(app.state.request_semaphore.acquire(), timeout=timeout)
-    except TimeoutError:
+        await asyncio.wait_for(
+            tenant_gate.semaphore.acquire(),
+            timeout=max(0.0, queue_deadline - time.monotonic()),
+        )
+    except asyncio.CancelledError:
         release_tenant_gate(tenant_gate)
-        return JSONResponse(status_code=503, content={"detail": "Server is busy"})
-    try:
-        await asyncio.wait_for(tenant_gate.semaphore.acquire(), timeout=timeout)
+        raise
     except TimeoutError:
-        app.state.request_semaphore.release()
         release_tenant_gate(tenant_gate)
         return JSONResponse(
             status_code=429,
             content={"detail": "Tenant concurrency limit exceeded"},
             headers={"Retry-After": "1", "X-RateLimit-Remaining": str(remaining)},
         )
+    try:
+        await asyncio.wait_for(
+            app.state.request_semaphore.acquire(),
+            timeout=max(0.0, queue_deadline - time.monotonic()),
+        )
+    except asyncio.CancelledError:
+        tenant_gate.semaphore.release()
+        release_tenant_gate(tenant_gate)
+        raise
+    except TimeoutError:
+        tenant_gate.semaphore.release()
+        release_tenant_gate(tenant_gate)
+        return JSONResponse(status_code=503, content={"detail": "Server is busy"})
 
     def release_capacity() -> None:
         release_tenant_gate(tenant_gate)
@@ -290,7 +434,7 @@ if config.get("security", {}).get("cors", {}).get("enabled", True):
 async def log_requests(request: Request, call_next: RequestResponseEndpoint) -> Response:
     """Log each HTTP request after its response body has completed."""
     start_time = time.time()
-    request_id = request.headers.get("X-Request-ID", f"{int(time.time() * 1000)}")
+    request_id = _request_id(request)
 
     response = await call_next(request)
     principal = getattr(request.state, "principal", None)
@@ -389,6 +533,19 @@ async def _probe_dependencies() -> dict[str, bool]:
             logger.warning("Redis readiness probe failed", exc_info=True)
             dependencies["redis"] = False
 
+    if "object_storage" in required_dependencies():
+        try:
+            from app.storage.object_store import get_object_store
+
+            object_store = get_object_store(config)
+            dependencies["object_storage"] = await asyncio.wait_for(
+                asyncio.to_thread(object_store.check_health),
+                timeout=OBJECT_STORAGE_HEALTH_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            logger.warning("Object storage readiness probe failed", exc_info=True)
+            dependencies["object_storage"] = False
+
     app.state.dependencies.update(dependencies)
     return dependencies
 
@@ -436,6 +593,70 @@ async def root() -> dict[str, str]:
 app.include_router(upload.router, prefix="/api/v1", tags=["documents"])
 app.include_router(search.router, prefix="/api/v1")
 app.include_router(chat.router, prefix="/api/v1", tags=["chat"])
+
+
+def _custom_openapi() -> dict[str, Any]:
+    """Document middleware authentication and conditional SSE responses."""
+    if app.openapi_schema:
+        return cast(dict[str, Any], app.openapi_schema)
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    components = schema.setdefault("components", {})
+    schemes = components.setdefault("securitySchemes", {})
+    api_key = config.get("security", {}).get("api_key", {})
+    schemes["ApiKeyAuth"] = {
+        "type": "apiKey",
+        "in": "header",
+        "name": str(api_key.get("header_name", "X-API-Key")),
+    }
+    schemes["BearerAuth"] = {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+    }
+
+    oidc_enabled = OIDCValidator(config).enabled
+    declared_security: list[dict[str, list[str]]] = []
+    if api_key.get("enabled", False):
+        declared_security.append({"ApiKeyAuth": []})
+    if oidc_enabled:
+        declared_security.append({"BearerAuth": []})
+
+    paths = schema.get("paths", {})
+    for path, path_item in paths.items():
+        if path.startswith("/api/"):
+            for operation in path_item.values():
+                if isinstance(operation, dict) and "responses" in operation:
+                    operation["security"] = declared_security
+
+    sse_paths = {
+        "/api/v1/answer",
+        "/api/v1/query/enhanced",
+        "/api/v1/chat/stream",
+    }
+    for path in sse_paths:
+        operation = paths.get(path, {}).get("post")
+        if not isinstance(operation, dict):
+            continue
+        response = operation.setdefault("responses", {}).setdefault(
+            "200", {"description": "Successful response"}
+        )
+        response.setdefault("content", {})["text/event-stream"] = {
+            "schema": {"type": "string"},
+            "examples": {
+                "event": {"value": 'data: {"type":"chunk","data":"..."}\n\n'}
+            },
+        }
+
+    app.openapi_schema = schema
+    return cast(dict[str, Any], schema)
+
+
+app.openapi = _custom_openapi  # type: ignore[method-assign]
 
 
 if __name__ == "__main__":

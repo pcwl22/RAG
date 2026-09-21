@@ -10,6 +10,8 @@ from fastapi.responses import JSONResponse
 from starlette.responses import Response
 
 from app.auth import (
+    OIDCAuthenticationError,
+    OIDCProviderUnavailable,
     OIDCValidator,
     Principal,
     current_principal,
@@ -32,6 +34,7 @@ VIEWER_POST_PATHS = {
     "/api/v1/chat",
     "/api/v1/chat/stream",
 }
+VIEWER_GET_PATHS = {"/api/v1/documents"}
 EDITOR_POST_PATHS = {"/api/v1/documents/ingest"}
 LOOPBACK_HOST_NAMES = frozenset({"localhost", "localhost.localdomain", ""})
 
@@ -54,7 +57,16 @@ def required_api_roles(method: str, path: str) -> frozenset[str]:
     """Return explicitly approved roles for an API operation; unknown routes are denied."""
     normalized_method = method.upper()
     if normalized_method in {"GET", "HEAD"}:
-        return frozenset({"viewer", "editor", "admin"})
+        is_document_read = (
+            path in VIEWER_GET_PATHS
+            or path.startswith("/api/v1/documents/status/")
+            or (path.startswith("/api/v1/documents/") and path.endswith("/chunks"))
+        )
+        return (
+            frozenset({"viewer", "editor", "admin"})
+            if is_document_read
+            else frozenset()
+        )
     if normalized_method == "POST" and path in VIEWER_POST_PATHS:
         return frozenset({"viewer", "editor", "admin"})
     if normalized_method == "POST" and path in EDITOR_POST_PATHS:
@@ -199,12 +211,29 @@ def authentication_middleware(
             if oidc.enabled and authorization.lower().startswith("bearer "):
                 try:
                     principal = await oidc.validate(authorization.split(None, 1)[1])
-                except Exception:
-                    return JSONResponse(status_code=401, content={"detail": "Invalid bearer token"})
+                except OIDCAuthenticationError:
+                    logger.info("Bearer token rejected", extra={"path": request.url.path})
+                    return JSONResponse(
+                        status_code=401,
+                        content={"detail": "Invalid bearer token"},
+                        headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
+                    )
+                except OIDCProviderUnavailable:
+                    logger.error("OIDC validation dependency unavailable", exc_info=True)
+                    return JSONResponse(
+                        status_code=503,
+                        content={"detail": "Authentication service temporarily unavailable"},
+                        headers={"Retry-After": "5"},
+                    )
 
         if principal is None:
             if enabled or oidc.enabled:
-                return JSONResponse(status_code=401, content={"detail": "Authentication required"})
+                headers = {"WWW-Authenticate": "Bearer"} if oidc.enabled else None
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Authentication required"},
+                    headers=headers,
+                )
             # Explicitly disabled authentication is the loopback-only laptop
             # mode. Preserve its local administrator identity so document
             # management remains usable without pretending to authenticate a

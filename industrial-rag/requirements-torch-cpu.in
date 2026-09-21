@@ -1,0 +1,2 @@
+# Linux amd64 / CPython 3.12 worker Torch carrier.
+torch==2.13.0+cpu

@@ -1,8 +1,13 @@
 import { UserManager, WebStorageStateStore } from 'oidc-client-ts'
 
-const issuer = import.meta.env?.VITE_OIDC_ISSUER?.replace(/\/$/, '') || ''
-const clientId = import.meta.env?.VITE_OIDC_CLIENT_ID || ''
-const audience = import.meta.env?.VITE_OIDC_AUDIENCE || 'rag-api'
+const runtimeConfig = globalThis.window?.__RAG_CONFIG__ || {}
+const issuer = String(
+  runtimeConfig.oidcIssuer || import.meta.env?.VITE_OIDC_ISSUER || ''
+).replace(/\/$/, '')
+const clientId = String(runtimeConfig.oidcClientId || import.meta.env?.VITE_OIDC_CLIENT_ID || '')
+const audience = String(
+  runtimeConfig.oidcAudience || import.meta.env?.VITE_OIDC_AUDIENCE || 'rag-api'
+)
 
 export const oidcEnabled = Boolean(issuer && clientId)
 
@@ -23,17 +28,40 @@ const userManager = oidcEnabled
 
 let authenticatedUser = null
 
-const isSigninCallback = () => {
-  const params = new URLSearchParams(window.location.search)
-  return params.has('code') && params.has('state')
+export const parseSigninCallback = (search = '') => {
+  const params = new URLSearchParams(search)
+  if (!params.has('state')) return null
+  if (params.has('error')) {
+    return {
+      kind: 'error',
+      error: params.get('error') || 'unknown_error',
+      description: params.get('error_description') || ''
+    }
+  }
+  return params.has('code') ? { kind: 'success' } : null
+}
+
+const clearSigninCallback = () => {
+  window.history.replaceState(
+    {},
+    document.title,
+    `${window.location.pathname}${window.location.hash}`
+  )
 }
 
 export const initializeAuth = async () => {
   if (!userManager) return null
 
-  if (isSigninCallback()) {
+  const callback = parseSigninCallback(window.location.search)
+  if (callback?.kind === 'error') {
+    clearSigninCallback()
+    const description = callback.description ? `: ${callback.description}` : ''
+    throw new Error(`OIDC sign-in failed (${callback.error})${description}`)
+  }
+
+  if (callback?.kind === 'success') {
     authenticatedUser = await userManager.signinRedirectCallback()
-    window.history.replaceState({}, document.title, `${window.location.pathname}${window.location.hash}`)
+    clearSigninCallback()
   } else {
     authenticatedUser = await userManager.getUser()
   }

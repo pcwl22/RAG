@@ -6,7 +6,16 @@
         <button @click="emit('close')" class="btn-close">✕</button>
       </div>
       <div class="modal-body documents-modal-body">
-        <div v-if="documents.length === 0" class="empty-state">
+        <div v-if="documentsError" class="documents-error">
+          <span>{{ documentsError }}</span>
+          <button
+            class="btn-secondary btn-small"
+            :disabled="documentsLoading"
+            @click="emit('change-document-page', documentPage)"
+          >重试</button>
+        </div>
+        <div v-if="documentsLoading" class="documents-loading">正在加载文档...</div>
+        <div v-if="!documentsLoading && documents.length === 0" class="empty-state">
           暂无文档
         </div>
         <div v-else class="documents-library">
@@ -31,6 +40,19 @@
                 </button>
               </div>
             </div>
+            <div class="pagination-controls">
+              <button
+                class="btn-secondary btn-small"
+                :disabled="documentPage <= 1 || documentsLoading"
+                @click="emit('change-document-page', documentPage - 1)"
+              >上一页</button>
+              <span>第 {{ documentPage }} / {{ documentPageCount }} 页 · 共 {{ documentTotal }} 个</span>
+              <button
+                class="btn-secondary btn-small"
+                :disabled="documentPage >= documentPageCount || documentsLoading"
+                @click="emit('change-document-page', documentPage + 1)"
+              >下一页</button>
+            </div>
           </div>
 
           <section class="document-chunks-panel">
@@ -45,7 +67,10 @@
                     {{ selectedDocChunks.length }} / {{ selectedDocChunkTotal || selectedDoc.chunk_count || 0 }} 块
                   </span>
                 </div>
-                <button @click="emit('load-chunks', selectedDoc)" class="btn-secondary btn-small">
+                <button
+                  @click="emit('load-chunks', selectedDoc, selectedDocChunkPage)"
+                  class="btn-secondary btn-small"
+                >
                   刷新
                 </button>
               </div>
@@ -94,6 +119,21 @@
                     </details>
                   </div>
                 </article>
+                <div class="pagination-controls chunk-pagination">
+                  <button
+                    class="btn-secondary btn-small"
+                    :disabled="selectedDocChunkPage <= 1 || documentChunksLoading"
+                    @click="emit('change-chunk-page', selectedDoc, selectedDocChunkPage - 1)"
+                  >上一页</button>
+                  <span>
+                    第 {{ selectedDocChunkPage }} / {{ selectedDocChunkPageCount }} 页
+                  </span>
+                  <button
+                    class="btn-secondary btn-small"
+                    :disabled="selectedDocChunkPage >= selectedDocChunkPageCount || documentChunksLoading"
+                    @click="emit('change-chunk-page', selectedDoc, selectedDocChunkPage + 1)"
+                  >下一页</button>
+                </div>
               </div>
             </template>
           </section>
@@ -107,13 +147,34 @@
 </template>
 
 <script setup>
+import { computed } from 'vue'
 import { formatJson, formatTime, hasLegalHierarchy } from '../utils/formatters'
 import { getParentContextText } from '../utils/contextText'
 
-defineProps({
+const props = defineProps({
   documents: {
     type: Array,
     default: () => []
+  },
+  documentTotal: {
+    type: Number,
+    default: 0
+  },
+  documentPage: {
+    type: Number,
+    default: 1
+  },
+  documentPageSize: {
+    type: Number,
+    default: 100
+  },
+  documentsLoading: {
+    type: Boolean,
+    default: false
+  },
+  documentsError: {
+    type: String,
+    default: ''
   },
   selectedDoc: {
     type: Object,
@@ -127,6 +188,14 @@ defineProps({
     type: Number,
     default: 0
   },
+  selectedDocChunkPage: {
+    type: Number,
+    default: 1
+  },
+  selectedDocChunkPageSize: {
+    type: Number,
+    default: 200
+  },
   documentChunksLoading: {
     type: Boolean,
     default: false
@@ -137,7 +206,20 @@ defineProps({
   }
 })
 
-const emit = defineEmits(['close', 'load-chunks', 'toggle-chunk'])
+const documentPageCount = computed(() =>
+  Math.max(1, Math.ceil(props.documentTotal / props.documentPageSize))
+)
+const selectedDocChunkPageCount = computed(() =>
+  Math.max(1, Math.ceil(props.selectedDocChunkTotal / props.selectedDocChunkPageSize))
+)
+
+const emit = defineEmits([
+  'close',
+  'load-chunks',
+  'toggle-chunk',
+  'change-document-page',
+  'change-chunk-page'
+])
 </script>
 
 <style scoped>
@@ -230,6 +312,43 @@ const emit = defineEmits(['close', 'load-chunks', 'toggle-chunk'])
   overflow-y: auto;
   padding: 1rem;
   border-right: 1px solid #e7e3da;
+}
+
+.documents-loading,
+.documents-error {
+  padding: 0.65rem 1rem;
+  text-align: center;
+}
+
+.documents-error {
+  color: #991b1b;
+  background: #fef2f2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+}
+
+.pagination-controls {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.6rem;
+  padding: 0.6rem 0;
+  color: #5f6670;
+  font-size: 0.75rem;
+}
+
+.pagination-controls button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.chunk-pagination {
+  position: sticky;
+  bottom: 0;
+  background: white;
+  border-top: 1px solid #e7e3da;
 }
 
 .document-card {

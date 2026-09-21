@@ -2,6 +2,11 @@ limit_req_zone $binary_remote_addr zone=rag_api_per_ip:10m rate=10r/s;
 limit_req_zone $binary_remote_addr zone=rag_stream_per_ip:10m rate=3r/s;
 limit_conn_zone $binary_remote_addr zone=rag_connections_per_ip:10m;
 
+# Only the configured ingress/proxy network may supply the client chain.
+real_ip_header X-Forwarded-For;
+real_ip_recursive on;
+set_real_ip_from ${TRUSTED_PROXY_CIDR};
+
 server {
     listen 80;
     server_name _;
@@ -9,7 +14,7 @@ server {
     index index.html;
 
     # Match the API upload contract; nginx defaults to a 1 MB request limit.
-    client_max_body_size 100m;
+    client_max_body_size 105m;
     client_body_timeout 300s;
     limit_conn rag_connections_per_ip 20;
     limit_req_status 429;

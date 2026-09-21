@@ -1,47 +1,143 @@
 {
-  "schema_version": 2,
-  "evaluated_at": "2026-08-05T12:00:00+08:00",
+  "schema_version": 8,
+  "status": "approved",
+  "blocked_reasons": [],
+  "evaluated_at": "2026-09-20T12:01:26.039583+00:00",
   "datasets": {
     "legal_expanded_240.jsonl": {
-      "sha256": "de0e57badf0f24d320b8847f5b975ef6aa370ff50f51e419530d5f14c2fc8fa2",
+      "sha256": "46d667189610583256f8e16fc6bdcb413048394fda618ef8d6a55eeef3d898f3",
       "sample_count": 240
     },
     "legal_expanded_ragas_40.jsonl": {
-      "sha256": "d281d3f037070b5cc5ad65f8a6506e0ac6c8fa88ada7c8b854ba7230c411c56b",
+      "sha256": "a839b71dcc431769ab62ec30d33223e2f566131d216f9705a04fd593377de1c1",
       "sample_count": 40
+    },
+    "legal_holdout_150.jsonl": {
+      "sha256": "c20c4d82ce9837141d7436265447133b64d47f46a1ebdad7cda2ce7cc811a760",
+      "sample_count": 150
     }
   },
   "implementation": {
     "paths": [
       "app/api/retrieval_params.py",
+      "app/api/upload.py",
       "app/embedding/embedder.py",
+      "app/embedding/model_bundle.py",
       "app/evaluation",
       "app/llm",
       "app/parser",
       "app/retrieval",
       "app/service/chat_service.py",
       "app/service/enhanced_query_service.py",
+      "app/storage",
       "app/vectorstore/postgres_store.py",
       "app/vectorstore/storage_adapter.py",
+      "app/utils/config.py",
+      "app/workers/tasks.py",
       "config/base.yaml",
-      "prompts/system.txt"
+      "config/laptop.yaml",
+      "constraints-docker.txt",
+      "docker/api/Dockerfile.production",
+      "docker/model-bundle/Dockerfile.production",
+      "docker/model-bundle/model-manifest.example.json",
+      "docker/worker/Dockerfile.production",
+      "prompts/business.txt",
+      "prompts/citation.txt",
+      "prompts/output.txt",
+      "prompts/rag_template.jinja2",
+      "prompts/system.txt",
+      "pyproject.toml",
+      "requirements-evaluation.lock.txt",
+      "requirements-evaluation.txt",
+      "requirements-gpu-verified.txt",
+      "requirements-gpu.lock.txt",
+      "requirements-runtime.lock.txt",
+      "requirements-torch-cpu.lock.txt",
+      "requirements-torch-cu126.lock.txt",
+      "scripts/audit_dependency_locks.py",
+      "scripts/approve_release_baseline.py",
+      "scripts/build_model_bundle_manifest.py",
+      "scripts/check_expanded_quality_gate.py",
+      "scripts/check_holdout_quality_gate.py",
+      "scripts/check_quality_gate.py",
+      "scripts/evaluate_ragas.py",
+      "scripts/evaluate_retrieval_suite.py",
+      "scripts/export_lrage.py",
+      "scripts/reembed_postgres_corpus.py",
+      "scripts/score_retrieval.py",
+      "scripts/validate_evaluation_assets.py",
+      "scripts/validate_dependency_lock.py",
+      "scripts/validate_model_bundle_manifest.py",
+      "scripts/validate_release_baseline.py",
+      "security/evaluation_dependency_exceptions.toml"
     ],
-    "sha256": "bde834a409b7cd2d9a733562ec365eed0134b8430a4d65580aa7fdbe2313ceef"
+    "sha256": "2ebe54307b634a876520d1ff5730e7967548fd84367154bd19bf0666fa2f9e11"
   },
   "evaluation_contract": {
     "retrieval_top_k": 5,
-    "ragas_version": "0.4.3",
-    "judge_model": "deepseek-chat"
+    "evaluation_engine": "industrial-rag-native-text-judge",
+    "evaluation_engine_version": "1.1",
+    "judge_model": "deepseek-flash",
+    "retrieval_llm_runtime_identity": {
+      "provider": "openai_compatible",
+      "model_name": "deepseek-flash",
+      "endpoint_sha256": "a34e2a4708ed1c61008a151688838dcf1c44d4e7f08054633e72ba7c0b16cfc1"
+    },
+    "retrieval_runtime_contract_sha256": "bc7fc87e5997383f09bcc7ab1e784b0f2b1aa40480e1b0dc0526d1c0bf0a8925",
+    "answer_generation_policy_sha256": "fadf20a950fb1502a5c6e9c213a8c0af3cce18a5deb4273aca222101a74a7212",
+    "judge_request_policy_sha256": "fadf20a950fb1502a5c6e9c213a8c0af3cce18a5deb4273aca222101a74a7212",
+    "evaluation_lock": "requirements-evaluation.lock.txt",
+    "holdout_dataset": "legal_holdout_150.jsonl",
+    "citation_leakage_policy": "reject"
   },
   "checks": {
-    "in_domain_citation_recall": {"value": 1.0, "minimum": 0.95},
-    "adversarial_citation_recall": {"value": 1.0, "minimum": 0.85},
-    "comparison_citation_recall": {"value": 1.0, "minimum": 0.85},
-    "no_answer_abstention_rate": {"value": 1.0, "minimum": 0.90},
-    "answer_accuracy": {"value": 0.9375, "minimum": 0.70},
-    "faithfulness": {"value": 0.8650138468616729, "minimum": 0.80},
-    "context_precision": {"value": 0.9999999999, "minimum": 0.60},
-    "context_recall": {"value": 1.0, "minimum": 0.70},
-    "citation_mrr": {"value": 0.875, "minimum": 0.70}
+    "answer_accuracy": {
+      "value": 0.75,
+      "minimum": 0.7
+    },
+    "faithfulness": {
+      "value": 0.8416666666666667,
+      "minimum": 0.8
+    },
+    "context_precision": {
+      "value": 0.9944444444444444,
+      "minimum": 0.6
+    },
+    "context_recall": {
+      "value": 0.9239322714322714,
+      "minimum": 0.7
+    },
+    "citation_recall": {
+      "value": 1.0,
+      "minimum": 0.8
+    },
+    "citation_mrr": {
+      "value": 0.8279166666666666,
+      "minimum": 0.7
+    },
+    "in_domain_citation_recall": {
+      "value": 0.990909090909091,
+      "minimum": 0.95
+    },
+    "adversarial_citation_recall": {
+      "value": 1.0,
+      "minimum": 0.85
+    },
+    "comparison_citation_recall": {
+      "value": 1.0,
+      "minimum": 0.85
+    },
+    "no_answer_abstention_rate": {
+      "value": 1.0,
+      "minimum": 0.9
+    },
+    "holdout_citation_recall": {
+      "value": 0.9866666666666667,
+      "minimum": 0.95
+    },
+    "holdout_citation_mrr": {
+      "value": 0.9383333333333334,
+      "minimum": 0.7
+    }
   }
 }

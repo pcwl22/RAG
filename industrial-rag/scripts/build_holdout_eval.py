@@ -1,12 +1,10 @@
 """Build a fact-pattern hold-out evaluation set that actually exercises retrieval.
 
-The shipped ``legal_expanded_240.jsonl`` suite cannot measure retrieval: every one
-of its 200 citation-bearing questions contains, verbatim, the article number it is
-scored on (``请说明《民法典》第七百五十六条规定的主要内容。`` -> ``第七百五十六条``).
-A system that echoes a number back scores 1.0 without retrieving anything.
-
-This builder produces the opposite: a concrete fact pattern with no article number
-and no law name, whose ground-truth citation is the article the facts fall under.
+The committed ``legal_expanded_240.jsonl`` suite is regenerated from screened
+hold-out fact patterns. This builder produces the same contract: a concrete fact
+pattern with no article number and no law name, whose ground-truth citation is the
+article the facts fall under. A system must retrieve the statute instead of
+earning credit by echoing an article number from the question.
 Ground truth comes from the statute text itself -- the generator is shown one
 article and asked to describe a situation governed by it.
 
@@ -49,6 +47,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from app.parser.document_parser import parse_document  # noqa: E402
 from app.parser.legal_parser import build_legal_article_chunks  # noqa: E402
+from app.utils.config import normalize_openai_base_url  # noqa: E402
 
 WORKSPACE_ROOT = PROJECT_ROOT.parent
 DEFAULT_SOURCE_DIR = WORKSPACE_ROOT / "date"
@@ -128,7 +127,18 @@ def is_discriminative(article_text: str) -> bool:
     almost every contract dispute, so a fact pattern written from it is equally
     well answered by whichever specific article actually decides the case.
     """
-    return not ("原则" in article_text and len(article_text) < 200)
+    body = re.sub(
+        r"^第[零一二三四五六七八九十百千万两〇○0-9]+条[\s　]*",
+        "",
+        article_text.strip(),
+        count=1,
+    )
+    is_bare_principle = "原则" in body and len(body) < 200
+    # Legislative-purpose clauses describe why a statute exists; no concrete
+    # fact pattern can be uniquely governed by them. Generating a dispute from
+    # one produces a mislabeled benchmark that rewards legally wrong retrieval.
+    is_purpose_clause = body.startswith("为了")
+    return not (is_bare_principle or is_purpose_clause)
 
 
 def load_articles(source_dir: Path) -> list[Article]:
@@ -247,11 +257,17 @@ def screen_question(question: str, article: Article) -> str | None:
     return None
 
 
-def generate_question(client: Any, article: Article, attempts: int = 3) -> tuple[str | None, list[Rejection]]:
+def generate_question(
+    client: Any,
+    article: Article,
+    attempts: int = 3,
+    *,
+    model_name: str = "deepseek-chat",
+) -> tuple[str | None, list[Rejection]]:
     rejections: list[Rejection] = []
     for attempt in range(attempts):
         response = client.chat.completions.create(
-            model="deepseek-chat",
+            model=model_name,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {
@@ -283,8 +299,17 @@ def build(
 ) -> tuple[list[dict[str, Any]], BuildStats]:
     from openai import OpenAI
 
+    base_url = normalize_openai_base_url(
+        os.environ.get("DEEPSEEK_API_URL", "https://api.deepseek.com/v1")
+    )
+    model_name = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat").strip()
+    if not model_name:
+        raise ValueError("DEEPSEEK_MODEL must be a non-empty model name")
     client = OpenAI(
-        api_key=os.environ["DEEPSEEK_API_KEY"], base_url="https://api.deepseek.com"
+        api_key=os.environ["DEEPSEEK_API_KEY"],
+        base_url=base_url,
+        timeout=60,
+        max_retries=2,
     )
 
     rng = random.Random(seed)
@@ -305,7 +330,9 @@ def build(
     records: list[dict[str, Any]] = []
 
     def work(article: Article) -> tuple[Article, str | None, list[Rejection]]:
-        question, rejections = generate_question(client, article)
+        question, rejections = generate_question(
+            client, article, model_name=model_name
+        )
         return article, question, rejections
 
     with ThreadPoolExecutor(max_workers=workers) as pool_executor:

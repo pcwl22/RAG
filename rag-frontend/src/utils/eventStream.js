@@ -54,6 +54,7 @@ export const readEventStream = async (res, handlers = {}) => {
   const decoder = new TextDecoder('utf-8')
   let buffer = ''
   let finished = false
+  let streamFinished = false
 
   const handleEvent = (event) => {
     const rawData = event
@@ -112,7 +113,15 @@ export const readEventStream = async (res, handlers = {}) => {
     buffer += decoder.decode()
     if (!finished && buffer.trim()) handleEvent(buffer)
     if (!finished) throw new Error('流式响应意外中断')
+    streamFinished = true
   } finally {
+    if (!streamFinished) {
+      try {
+        await reader.cancel()
+      } catch {
+        // The stream may already be closed by the browser or transport.
+      }
+    }
     reader.releaseLock()
   }
 }

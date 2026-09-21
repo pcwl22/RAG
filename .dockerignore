@@ -1,0 +1,13 @@
+# The root context is used only for the protected model-bundle build.
+# Keep source, secrets, VCS metadata and unrelated datasets out of that image.
+*
+!models/
+!models/bge-m3/
+!models/bge-m3/**
+!models/bge-reranker-v2-m3/
+!models/bge-reranker-v2-m3/**
+!model-manifest.json
+**/.git
+**/.git/**
+**/__pycache__
+**/__pycache__/**

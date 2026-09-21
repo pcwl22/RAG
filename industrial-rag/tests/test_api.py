@@ -3,7 +3,7 @@ import asyncio
 
 import httpx
 from starlette.requests import Request
-from starlette.responses import StreamingResponse
+from starlette.responses import Response, StreamingResponse
 
 from app.api.chat import ChatRequest, Message
 from app.api.enhanced_query import ChatHistoryMessage, EnhancedQueryRequest
@@ -351,5 +351,34 @@ def test_stream_request_is_logged_after_body_finishes(monkeypatch):
         await response.body_iterator.aclose()
         assert len(log_calls) == 1
         assert log_calls[0][0] == "Request completed"
+
+    asyncio.run(run())
+
+
+def test_request_id_is_bounded_before_echo_and_logging():
+    async def run():
+        request = Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "GET",
+                "scheme": "http",
+                "path": "/health",
+                "raw_path": b"/health",
+                "query_string": b"",
+                "headers": [(b"x-request-id", b"not a safe trace id")],
+                "client": ("test", 123),
+                "server": ("test", 80),
+            }
+        )
+
+        async def call_next(_request):
+            return Response("ok")
+
+        response = await log_requests(request, call_next)
+        request_id = response.headers["X-Request-ID"]
+        assert request_id != "not a safe trace id"
+        assert len(request_id) == 32
+        assert response.headers["X-Process-Time"]
 
     asyncio.run(run())

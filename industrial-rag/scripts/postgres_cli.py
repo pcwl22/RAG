@@ -14,6 +14,8 @@ class PostgresTarget:
     database: str
     user: str
     password: str | None = None
+    sslmode: str | None = None
+    sslrootcert: str | None = None
 
     @classmethod
     def from_env(
@@ -26,13 +28,52 @@ class PostgresTarget:
         user: str | None = None,
     ) -> PostgresTarget:
         env = environ if environ is not None else os.environ
-        return cls(
-            host=host or env.get("PGHOST") or env.get("POSTGRES_HOST") or "127.0.0.1",
-            port=str(port or env.get("PGPORT") or env.get("POSTGRES_PORT") or "5432"),
-            database=database or env.get("PGDATABASE") or env.get("POSTGRES_DB") or "rag_db",
-            user=user or env.get("PGUSER") or env.get("POSTGRES_USER") or "postgres",
-            password=env.get("PGPASSWORD") or env.get("POSTGRES_PASSWORD"),
+        secure_required = str(env.get("RAG_SECURE_MODE", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        } or str(env.get("RAG_ENV", "")).strip().lower() == "base"
+
+        def selected(
+            explicit: str | None,
+            standard_name: str,
+            canonical_name: str,
+            default: str,
+        ) -> str:
+            if explicit:
+                return explicit
+            if secure_required:
+                return env.get(canonical_name) or env.get(standard_name) or default
+            return env.get(standard_name) or env.get(canonical_name) or default
+
+        target = cls(
+            host=selected(host, "PGHOST", "POSTGRES_HOST", "127.0.0.1"),
+            port=selected(port, "PGPORT", "POSTGRES_PORT", "5432"),
+            database=selected(database, "PGDATABASE", "POSTGRES_DB", "rag_db"),
+            user=selected(user, "PGUSER", "POSTGRES_USER", "postgres"),
+            password=(
+                env.get("POSTGRES_PASSWORD") or env.get("PGPASSWORD")
+                if secure_required
+                else env.get("PGPASSWORD") or env.get("POSTGRES_PASSWORD")
+            ),
+            # Release validation owns the canonical POSTGRES_* values. Do not
+            # allow stale ambient libpq variables to downgrade maintenance TLS.
+            sslmode=env.get("POSTGRES_SSLMODE") or env.get("PGSSLMODE"),
+            sslrootcert=env.get("POSTGRES_SSLROOTCERT") or env.get("PGSSLROOTCERT"),
         )
+        if secure_required:
+            if target.sslmode != "verify-full":
+                raise ValueError(
+                    "PostgreSQL maintenance requires sslmode=verify-full in "
+                    "secure/production mode"
+                )
+            if not str(target.sslrootcert or "").strip():
+                raise ValueError(
+                    "PostgreSQL maintenance requires a root certificate in "
+                    "secure/production mode"
+                )
+        return target
 
     def connection_args(self) -> list[str]:
         return [
@@ -50,4 +91,8 @@ class PostgresTarget:
         result = dict(environ if environ is not None else os.environ)
         if self.password:
             result["PGPASSWORD"] = self.password
+        if self.sslmode:
+            result["PGSSLMODE"] = self.sslmode
+        if self.sslrootcert:
+            result["PGSSLROOTCERT"] = self.sslrootcert
         return result

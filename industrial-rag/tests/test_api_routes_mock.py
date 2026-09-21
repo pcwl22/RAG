@@ -210,6 +210,43 @@ def test_chat_route_uses_config_threshold_by_default(monkeypatch):
     asyncio.run(run())
 
 
+def test_chat_rag_uses_history_before_last_user_turn(monkeypatch):
+    from types import SimpleNamespace
+
+    import app.api.chat as chat_api
+
+    captured = []
+
+    class FakeService:
+        async def run(self, options):
+            captured.append(options)
+            return SimpleNamespace(results=[], answer="chat answer")
+
+    monkeypatch.setattr(chat_api, "EnhancedQueryService", FakeService)
+
+    async def run():
+        response = await _post_json(
+            "/api/v1/chat",
+            {
+                "messages": [
+                    {"role": "user", "content": "previous question"},
+                    {"role": "assistant", "content": "previous answer"},
+                    {"role": "user", "content": "current question"},
+                    {"role": "assistant", "content": "stale trailing answer"},
+                ]
+            },
+        )
+
+        assert response.status_code == 200
+        assert captured[0].query == "current question"
+        assert captured[0].chat_history == [
+            {"role": "user", "content": "previous question"},
+            {"role": "assistant", "content": "previous answer"},
+        ]
+
+    asyncio.run(run())
+
+
 def test_chat_without_user_message_preserves_client_error():
     async def run():
         response = await _post_json(
@@ -244,6 +281,8 @@ def test_enhanced_query_route_with_mocked_understanding_retrieval_and_generation
             self,
             query,
             top_k=5,
+            rerank_top_k=None,
+            rerank_apply_threshold=None,
             similarity_threshold=None,
             enable_rerank=True,
             partition=None,
@@ -253,6 +292,8 @@ def test_enhanced_query_route_with_mocked_understanding_retrieval_and_generation
                 {
                     "query": query,
                     "top_k": top_k,
+                    "rerank_top_k": rerank_top_k,
+                    "rerank_apply_threshold": rerank_apply_threshold,
                     "similarity_threshold": similarity_threshold,
                     "enable_rerank": enable_rerank,
                     "partition": partition,
@@ -304,6 +345,8 @@ def test_enhanced_query_refuses_missing_requested_law_before_decomposed_generati
             self,
             query,
             top_k=5,
+            rerank_top_k=None,
+            rerank_apply_threshold=None,
             similarity_threshold=None,
             enable_rerank=True,
             partition=None,
@@ -455,15 +498,84 @@ def test_upload_status_list_and_delete_routes_with_mocks(monkeypatch, tmp_path):
     asyncio.run(run())
 
 
+def test_celery_upload_passes_only_tenant_and_object_key(monkeypatch, tmp_path):
+    import app.api.upload as upload_api
+    import app.workers.tasks as worker_tasks
+
+    calls = []
+
+    class FakeStore:
+        def upload_file(self, local_path, object_key):
+            calls.append(("upload", object_key))
+
+        def put_json(self, object_key, payload):
+            calls.append(("manifest", object_key, payload))
+
+        def delete_object(self, object_key):
+            calls.append(("delete", object_key))
+
+    class FakeTask:
+        def apply_async(self, *, kwargs, task_id, queue):
+            calls.append(("apply_async", kwargs, task_id, queue))
+            return self
+
+    monkeypatch.setattr(
+        upload_api,
+        "config",
+        {
+            "document_processing": {
+                "upload_dir": str(tmp_path),
+                "supported_formats": ["txt"],
+                "max_file_size": 1024,
+            },
+            "queue": {"provider": "celery"},
+        },
+    )
+    monkeypatch.setattr(upload_api, "_object_storage_for_queue", lambda _provider: FakeStore())
+    monkeypatch.setattr(
+        upload_api,
+        "_persist_task_state",
+        lambda *args, **kwargs: _completed_async(True),
+    )
+    monkeypatch.setattr(worker_tasks, "process_document_task", FakeTask())
+    monkeypatch.setenv("CELERY_TASK_DEFAULT_QUEUE", "release-canary-test-pod")
+
+    async def run():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            response = await client.post(
+                "/api/v1/documents/ingest",
+                files={"file": ("folder\\sample.txt", b"sample content", "text/plain")},
+                data={"partition": "text", "metadata": '{"source":"test"}'},
+            )
+        return response
+
+    async def _run_and_assert():
+        response = await run()
+        assert response.status_code == 200
+        delay_calls = [call for call in calls if call[0] == "apply_async"]
+        assert len(delay_calls) == 1
+        assert set(delay_calls[0][1]) == {"tenant_id", "object_key"}
+        assert delay_calls[0][1]["object_key"].endswith("/payload.txt")
+        assert delay_calls[0][2]
+        assert delay_calls[0][3] == "release-canary-test-pod"
+        manifest = next(call for call in calls if call[0] == "manifest")
+        assert manifest[2]["partition"] == "text"
+        assert manifest[2]["metadata"]["source"] == "test"
+        assert manifest[2]["metadata"]["source_id"].startswith("upload-name-sha256:")
+
+    async def _completed_async(value=None):
+        return value
+
+    asyncio.run(_run_and_assert())
+
+
 def test_simple_query_and_answer_refuse_known_out_of_scope(monkeypatch):
     import app.api.query_simple as query_simple_api
 
     class ScopeAwareEngine:
         async def retrieve(self, *, query, **kwargs):
-            from app.retrieval.domain_signal_map import is_known_out_of_scope
-
-            assert is_known_out_of_scope(query)
-            return []
+            raise AssertionError("out-of-scope queries must not initialize retrieval")
 
     monkeypatch.setattr(query_simple_api, "build_retrieval_engine", ScopeAwareEngine)
 

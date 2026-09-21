@@ -1,7 +1,7 @@
 """Streamlit frontend for the local RAG knowledge QA system."""
-import time
 
 import os
+import time
 
 import httpx
 import streamlit as st

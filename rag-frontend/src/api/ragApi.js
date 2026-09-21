@@ -9,7 +9,20 @@ export const ENDPOINTS = {
   enhancedQuery: `${API_BASE}/query/enhanced`
 }
 
-const ensureOk = async (response) => {
+export class ApiError extends Error {
+  constructor(message, { status = 0, retryAfterSeconds = null } = {}) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+    this.retryAfterSeconds = retryAfterSeconds
+  }
+
+  get retryable() {
+    return this.status === 0 || [408, 425, 429, 500, 502, 503, 504].includes(this.status)
+  }
+}
+
+export const ensureOk = async (response) => {
   if (response.ok) return response
 
   let detail = ''
@@ -20,7 +33,17 @@ const ensureOk = async (response) => {
     detail = ''
   }
 
-  throw new Error(detail ? `HTTP ${response.status}: ${detail}` : `HTTP ${response.status}`)
+  const retryAfterHeader = response.headers?.get?.('Retry-After')
+  const retryAfter = retryAfterHeader === null || retryAfterHeader === undefined
+    ? Number.NaN
+    : Number(retryAfterHeader)
+  throw new ApiError(
+    detail ? `HTTP ${response.status}: ${detail}` : `HTTP ${response.status}`,
+    {
+      status: response.status,
+      retryAfterSeconds: Number.isFinite(retryAfter) && retryAfter >= 0 ? retryAfter : null
+    }
+  )
 }
 
 export const fetchHealth = async () => {
@@ -34,15 +57,22 @@ export const fetchHealth = async () => {
   }
 }
 
-export const fetchDocuments = async () => {
-  const response = await ensureOk(await authorizedFetch(`${API_BASE}/documents`))
+export const fetchDocuments = async ({ skip = 0, limit = 100, signal } = {}) => {
+  const query = new URLSearchParams({ skip: String(skip), limit: String(limit) })
+  const response = await ensureOk(
+    await authorizedFetch(`${API_BASE}/documents?${query}`, { signal })
+  )
   return response.json()
 }
 
-export const fetchDocumentChunks = async (documentId, { limit = 5000 } = {}) => {
+export const fetchDocumentChunks = async (
+  documentId,
+  { skip = 0, limit = 200, signal } = {}
+) => {
   const encodedId = encodeURIComponent(documentId)
+  const query = new URLSearchParams({ skip: String(skip), limit: String(limit) })
   const response = await ensureOk(
-    await authorizedFetch(`${API_BASE}/documents/${encodedId}/chunks?limit=${limit}`)
+    await authorizedFetch(`${API_BASE}/documents/${encodedId}/chunks?${query}`, { signal })
   )
   return response.json()
 }

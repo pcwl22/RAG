@@ -12,7 +12,7 @@ from app.api.retrieval_params import resolve_retrieval_params
 from app.retrieval.domain_signal_map import is_known_out_of_scope
 from app.retrieval.factory import build_retrieval_engine
 from app.retrieval.result_merge import result_score
-from app.service.chat_service import Generator
+from app.service.chat_service import Generator, format_no_context_answer
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -135,7 +135,7 @@ async def answer_question(request: AnswerRequest) -> AnswerResponse | StreamingR
                     sources = [_to_retrieved_document(doc).model_dump() for doc in results]
                     yield f"data: {json.dumps({'type': 'sources', 'data': sources}, ensure_ascii=False)}\n\n"
                     if not results:
-                        message = "抱歉，我在知识库中没有找到足够相关的信息来回答这个问题。"
+                        message = format_no_context_answer()
                         yield f"data: {json.dumps({'type': 'chunk', 'data': message}, ensure_ascii=False)}\n\n"
                     else:
                         yield f"data: {json.dumps({'type': 'status', 'data': '正在生成答案...'}, ensure_ascii=False)}\n\n"
@@ -167,7 +167,7 @@ async def answer_question(request: AnswerRequest) -> AnswerResponse | StreamingR
             )
 
         if not results:
-            answer = "抱歉，我在知识库中没有找到足够相关的信息来回答这个问题。"
+            answer = format_no_context_answer()
         else:
             generator = Generator()
             answer = await generator.generate(query=request.query, context_docs=results)

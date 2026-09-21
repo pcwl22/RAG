@@ -1,0 +1,164 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rag-canary
+  labels:
+    app.kubernetes.io/name: rag-canary
+    app.kubernetes.io/part-of: industrial-rag
+    release-stage: canary
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  activeDeadlineSeconds: 900
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rag-canary
+        app.kubernetes.io/part-of: industrial-rag
+    spec:
+      restartPolicy: Never
+      serviceAccountName: rag-canary
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: smoke
+          image: industrial-rag-api
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |-
+              set -eu
+              export CELERY_TASK_DEFAULT_QUEUE="release-canary-${HOSTNAME}"
+              python -m uvicorn app.main:app --host 127.0.0.1 --port 18000 > /tmp/canary-api.log 2>&1 &
+              api_pid=$!
+              set +e
+              python /opt/industrial-rag-canary/run_release_canary.py \
+                --api-base-url http://127.0.0.1:18000 \
+                --readiness-timeout 240 \
+                --ingest-timeout 480 \
+                --request-timeout 60
+              canary_status=$?
+              touch /canary-state/done
+              kill "$api_pid" 2>/dev/null || true
+              wait "$api_pid" 2>/dev/null || true
+              exit "$canary_status"
+          envFrom:
+            - configMapRef:
+                name: rag-runtime-config
+            - secretRef:
+                name: rag-runtime
+            - secretRef:
+                name: rag-canary-credentials
+          env:
+            - name: EMBEDDING_DEVICE
+              value: "cuda"
+            - name: RERANKER_DEVICE
+              value: "cuda"
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "2Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "2"
+              memory: "8Gi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: canary-script
+              mountPath: /opt/industrial-rag-canary
+              readOnly: true
+            - name: canary-state
+              mountPath: /canary-state
+            - name: data
+              mountPath: /app/data
+            - name: api-logs
+              mountPath: /app/logs
+        - name: candidate-worker
+          image: industrial-rag-worker
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |-
+              set -eu
+              export CELERY_TASK_DEFAULT_QUEUE="release-canary-${HOSTNAME}"
+              celery -A app.workers.celery_app:celery_app worker \
+                --loglevel=info --pool=solo --concurrency=1 \
+                --without-gossip --without-mingle --without-heartbeat \
+                -Q "$CELERY_TASK_DEFAULT_QUEUE" &
+              worker_pid=$!
+              trap 'kill "$worker_pid" 2>/dev/null || true' EXIT
+              while [ ! -f /canary-state/done ]; do
+                if ! kill -0 "$worker_pid" 2>/dev/null; then
+                  wait "$worker_pid"
+                  exit $?
+                fi
+                sleep 2
+              done
+              kill -TERM "$worker_pid" 2>/dev/null || true
+              wait "$worker_pid" 2>/dev/null || true
+          envFrom:
+            - configMapRef:
+                name: rag-runtime-config
+            - secretRef:
+                name: rag-runtime
+          env:
+            - name: EMBEDDING_DEVICE
+              value: "cpu"
+            - name: RERANKER_DEVICE
+              value: "cpu"
+            - name: PDF_DEVICE
+              value: "cpu"
+            - name: MULTIMODAL_DEVICE
+              value: "cpu"
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "1"
+              memory: "4Gi"
+            limits:
+              cpu: "4"
+              memory: "16Gi"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: canary-state
+              mountPath: /canary-state
+            - name: data
+              mountPath: /app/data
+            - name: worker-logs
+              mountPath: /app/logs
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: canary-script
+          configMap:
+            name: rag-canary-script
+            defaultMode: 0444
+        - name: canary-state
+          emptyDir: {}
+        - name: data
+          emptyDir: {}
+        - name: api-logs
+          emptyDir: {}
+        - name: worker-logs
+          emptyDir: {}

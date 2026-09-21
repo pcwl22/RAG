@@ -1,0 +1,548 @@
+name: Publish production images
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_bundle_image:
+        description: Approved GHCR model-bundle image pinned by sha256 digest
+        required: true
+        type: string
+      model_manifest_sha256:
+        description: SHA-256 of /models/model-manifest.json, including sha256 prefix
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+concurrency:
+  group: production-image-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # Configure required reviewers and prevent self-review on this environment.
+    # The validation step additionally rejects every ref except refs/heads/main.
+    environment:
+      name: production-image-publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    outputs:
+      api_image: ${{ steps.refs.outputs.api }}
+      worker_image: ${{ steps.refs.outputs.worker }}
+      frontend_image: ${{ steps.refs.outputs.frontend }}
+      model_bundle_image: ${{ steps.refs.outputs.model_bundle }}
+      model_bundle_digest: ${{ steps.refs.outputs.model_bundle_digest }}
+      model_manifest_sha256: ${{ steps.refs.outputs.model_manifest_sha256 }}
+      publisher_identity: ${{ steps.refs.outputs.publisher_identity }}
+    env:
+      DISPATCH_MODEL_BUNDLE_IMAGE: ${{ inputs.model_bundle_image }}
+      DISPATCH_MODEL_MANIFEST_SHA256: ${{ inputs.model_manifest_sha256 }}
+      MODEL_BUNDLE_CERTIFICATE_IDENTITY: ${{ vars.MODEL_BUNDLE_CERTIFICATE_IDENTITY }}
+      MODEL_BUNDLE_SOURCE_REPOSITORY: ${{ vars.MODEL_BUNDLE_SOURCE_REPOSITORY }}
+      MODEL_BUNDLE_SOURCE_REVISION: ${{ vars.MODEL_BUNDLE_SOURCE_REVISION }}
+      COSIGN_CERTIFICATE_OIDC_ISSUER: https://token.actions.githubusercontent.com
+      CYCLONEDX_PREDICATE_TYPE: https://cyclonedx.org/bom
+      SLSA_PROVENANCE_PREDICATE_TYPE: https://slsa.dev/provenance/v1
+      PUBLISH_ARTIFACT_DIR: ${{ runner.temp }}/industrial-rag-image-publish
+      MODEL_VALIDATION_DIR: ${{ runner.temp }}/industrial-rag-model-validation
+
+    steps:
+      - name: Check out the exact requested source revision
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Validate protected publish inputs
+        id: prepare
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python industrial-rag/scripts/production_image_publish.py prepare \
+            --approved-model-bundle-image "$DISPATCH_MODEL_BUNDLE_IMAGE" \
+            --model-manifest-sha256 "$DISPATCH_MODEL_MANIFEST_SHA256" \
+            --model-bundle-certificate-identity "$MODEL_BUNDLE_CERTIFICATE_IDENTITY" \
+            --model-bundle-source-repository "$MODEL_BUNDLE_SOURCE_REPOSITORY" \
+            --model-bundle-source-revision "$MODEL_BUNDLE_SOURCE_REVISION" \
+            --github-repository "$GITHUB_REPOSITORY" \
+            --github-sha "$GITHUB_SHA" \
+            --github-ref "$GITHUB_REF" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Authenticate to the repository package namespace
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$REGISTRY_TOKEN"
+          printf '%s' "$REGISTRY_TOKEN" | \
+            docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: "v3.1.2"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Verify the approved model bundle before using it as a build stage
+        env:
+          MODEL_BUNDLE_IMAGE: ${{ steps.prepare.outputs.approved_model_bundle_image }}
+          MODEL_MANIFEST_SHA256: ${{ steps.prepare.outputs.model_manifest_sha256 }}
+          EXPECTED_SOURCE: ${{ steps.prepare.outputs.model_bundle_source_repository }}
+          EXPECTED_REVISION: ${{ steps.prepare.outputs.model_bundle_source_revision }}
+          MODEL_SIGNER_IDENTITY: ${{ steps.prepare.outputs.model_bundle_certificate_identity }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$PUBLISH_ARTIFACT_DIR/model" "$MODEL_VALIDATION_DIR/models"
+          cosign verify \
+            --certificate-identity "$MODEL_SIGNER_IDENTITY" \
+            --certificate-oidc-issuer "$COSIGN_CERTIFICATE_OIDC_ISSUER" \
+            --certificate-github-workflow-sha "$EXPECTED_REVISION" \
+            "$MODEL_BUNDLE_IMAGE" \
+            > "$PUBLISH_ARTIFACT_DIR/model/upstream-signature.json"
+          docker pull "$MODEL_BUNDLE_IMAGE"
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.source" }}' "$MODEL_BUNDLE_IMAGE")" = "$EXPECTED_SOURCE"
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$MODEL_BUNDLE_IMAGE")" = "$EXPECTED_REVISION"
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.model-manifest-sha256" }}' "$MODEL_BUNDLE_IMAGE")" = "$MODEL_MANIFEST_SHA256"
+          model_container="$(docker create "$MODEL_BUNDLE_IMAGE" /nonexistent)"
+          trap 'docker rm -f "$model_container" >/dev/null 2>&1 || true' EXIT
+          docker cp "${model_container}:/models/." "$MODEL_VALIDATION_DIR/models"
+          docker rm "$model_container" >/dev/null
+          trap - EXIT
+          actual_manifest_sha="sha256:$(sha256sum "$MODEL_VALIDATION_DIR/models/model-manifest.json" | awk '{print $1}')"
+          test "$actual_manifest_sha" = "$MODEL_MANIFEST_SHA256"
+          python industrial-rag/scripts/validate_model_bundle_manifest.py \
+            "$MODEL_VALIDATION_DIR/models/model-manifest.json" \
+            --models-root "$MODEL_VALIDATION_DIR/models"
+
+      - name: Build and push repository-bound production model bundle
+        id: build_model
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: industrial-rag
+          file: industrial-rag/docker/model-bundle/Dockerfile.production
+          platforms: linux/amd64
+          pull: true
+          push: true
+          provenance: false
+          sbom: false
+          tags: ${{ steps.prepare.outputs.model_bundle_tag }}
+          build-args: |
+            APPROVED_MODEL_BUNDLE_IMAGE=${{ steps.prepare.outputs.approved_model_bundle_image }}
+            APPROVED_MODEL_BUNDLE_DIGEST=${{ steps.prepare.outputs.approved_model_bundle_digest }}
+            APPROVED_MODEL_SOURCE_REPOSITORY=${{ steps.prepare.outputs.model_bundle_source_repository }}
+            APPROVED_MODEL_SOURCE_REVISION=${{ steps.prepare.outputs.model_bundle_source_revision }}
+            APPROVED_MODEL_CERTIFICATE_IDENTITY=${{ steps.prepare.outputs.model_bundle_certificate_identity }}
+            MODEL_MANIFEST_SHA256=${{ steps.prepare.outputs.model_manifest_sha256 }}
+            SOURCE_REVISION=${{ steps.prepare.outputs.source_revision }}
+            SOURCE_REPOSITORY=${{ steps.prepare.outputs.source_repository }}
+
+      - name: Validate repository-bound model bundle release contract
+        id: model_mirror
+        env:
+          APPROVED_MODEL_BUNDLE_IMAGE: ${{ steps.prepare.outputs.approved_model_bundle_image }}
+          MODEL_BUNDLE_IMAGE: ${{ steps.prepare.outputs.model_bundle_repository }}@${{ steps.build_model.outputs.digest }}
+          EXPECTED_SOURCE: ${{ steps.prepare.outputs.source_repository }}
+          EXPECTED_REVISION: ${{ steps.prepare.outputs.source_revision }}
+          MODEL_MANIFEST_SHA256: ${{ steps.prepare.outputs.model_manifest_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python industrial-rag/scripts/production_image_publish.py mirror \
+            --model-bundle-image "$MODEL_BUNDLE_IMAGE" \
+            --approved-model-bundle-image "$APPROVED_MODEL_BUNDLE_IMAGE" \
+            --model-manifest-sha256 "$MODEL_MANIFEST_SHA256" \
+            --model-bundle-certificate-identity "$MODEL_BUNDLE_CERTIFICATE_IDENTITY" \
+            --model-bundle-source-repository "$MODEL_BUNDLE_SOURCE_REPOSITORY" \
+            --model-bundle-source-revision "$MODEL_BUNDLE_SOURCE_REVISION" \
+            --github-repository "$GITHUB_REPOSITORY" \
+            --github-sha "$GITHUB_SHA" \
+            --github-ref "$GITHUB_REF" \
+            --github-output "$GITHUB_OUTPUT"
+          docker pull "$MODEL_BUNDLE_IMAGE"
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.source" }}' "$MODEL_BUNDLE_IMAGE")" = "$EXPECTED_SOURCE"
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$MODEL_BUNDLE_IMAGE")" = "$EXPECTED_REVISION"
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.model-manifest-sha256" }}' "$MODEL_BUNDLE_IMAGE")" = "$MODEL_MANIFEST_SHA256"
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.base.name" }}' "$MODEL_BUNDLE_IMAGE")" = "$APPROVED_MODEL_BUNDLE_IMAGE"
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.base.digest" }}' "$MODEL_BUNDLE_IMAGE")" = "${APPROVED_MODEL_BUNDLE_IMAGE##*@}"
+          test "$(docker image inspect --format '{{ index .Config.Labels "io.industrial-rag.model.source" }}' "$MODEL_BUNDLE_IMAGE")" = "$MODEL_BUNDLE_SOURCE_REPOSITORY"
+          test "$(docker image inspect --format '{{ index .Config.Labels "io.industrial-rag.model.source-revision" }}' "$MODEL_BUNDLE_IMAGE")" = "$MODEL_BUNDLE_SOURCE_REVISION"
+          test "$(docker image inspect --format '{{ index .Config.Labels "io.industrial-rag.model.signer-identity" }}' "$MODEL_BUNDLE_IMAGE")" = "$MODEL_BUNDLE_CERTIFICATE_IDENTITY"
+          model_container="$(docker create "$MODEL_BUNDLE_IMAGE" /nonexistent)"
+          trap 'docker rm -f "$model_container" >/dev/null 2>&1 || true' EXIT
+          docker cp "${model_container}:/models/model-manifest.json" \
+            "$PUBLISH_ARTIFACT_DIR/model/repository-model-manifest.json"
+          docker rm "$model_container" >/dev/null
+          trap - EXIT
+          actual_manifest_sha="sha256:$(sha256sum "$PUBLISH_ARTIFACT_DIR/model/repository-model-manifest.json" | awk '{print $1}')"
+          test "$actual_manifest_sha" = "$MODEL_MANIFEST_SHA256"
+
+      - name: Build and push production API image
+        id: build_api
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: industrial-rag
+          file: industrial-rag/docker/api/Dockerfile.production
+          platforms: linux/amd64
+          pull: true
+          push: true
+          provenance: false
+          sbom: false
+          tags: ${{ steps.prepare.outputs.api_tag }}
+          build-args: |
+            MODEL_BUNDLE_IMAGE=${{ steps.model_mirror.outputs.model_bundle_image }}
+            MODEL_BUNDLE_DIGEST=${{ steps.model_mirror.outputs.model_bundle_digest }}
+            MODEL_MANIFEST_SHA256=${{ steps.prepare.outputs.model_manifest_sha256 }}
+            SOURCE_REVISION=${{ steps.prepare.outputs.source_revision }}
+            SOURCE_REPOSITORY=${{ steps.prepare.outputs.source_repository }}
+
+      - name: Build and push production Worker image
+        id: build_worker
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: industrial-rag
+          file: industrial-rag/docker/worker/Dockerfile.production
+          platforms: linux/amd64
+          pull: true
+          push: true
+          provenance: false
+          sbom: false
+          tags: ${{ steps.prepare.outputs.worker_tag }}
+          build-args: |
+            MODEL_BUNDLE_IMAGE=${{ steps.model_mirror.outputs.model_bundle_image }}
+            MODEL_BUNDLE_DIGEST=${{ steps.model_mirror.outputs.model_bundle_digest }}
+            MODEL_MANIFEST_SHA256=${{ steps.prepare.outputs.model_manifest_sha256 }}
+            SOURCE_REVISION=${{ steps.prepare.outputs.source_revision }}
+            SOURCE_REPOSITORY=${{ steps.prepare.outputs.source_repository }}
+
+      - name: Build and push production Frontend image
+        id: build_frontend
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: rag-frontend
+          file: rag-frontend/Dockerfile.production
+          platforms: linux/amd64
+          pull: true
+          push: true
+          provenance: false
+          sbom: false
+          tags: ${{ steps.prepare.outputs.frontend_tag }}
+          build-args: |
+            SOURCE_REVISION=${{ steps.prepare.outputs.source_revision }}
+            SOURCE_REPOSITORY=${{ steps.prepare.outputs.source_repository }}
+
+      - name: Materialize immutable release references and provenance predicates
+        id: refs
+        env:
+          API_IMAGE: ${{ steps.prepare.outputs.api_repository }}@${{ steps.build_api.outputs.digest }}
+          WORKER_IMAGE: ${{ steps.prepare.outputs.worker_repository }}@${{ steps.build_worker.outputs.digest }}
+          FRONTEND_IMAGE: ${{ steps.prepare.outputs.frontend_repository }}@${{ steps.build_frontend.outputs.digest }}
+          MODEL_BUNDLE_IMAGE: ${{ steps.model_mirror.outputs.model_bundle_image }}
+          APPROVED_MODEL_BUNDLE_IMAGE: ${{ steps.prepare.outputs.approved_model_bundle_image }}
+          MODEL_MANIFEST_SHA256: ${{ steps.prepare.outputs.model_manifest_sha256 }}
+          GITHUB_RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python industrial-rag/scripts/production_image_publish.py finalize \
+            --api-image "$API_IMAGE" \
+            --worker-image "$WORKER_IMAGE" \
+            --frontend-image "$FRONTEND_IMAGE" \
+            --model-bundle-image "$MODEL_BUNDLE_IMAGE" \
+            --approved-model-bundle-image "$APPROVED_MODEL_BUNDLE_IMAGE" \
+            --model-manifest-sha256 "$MODEL_MANIFEST_SHA256" \
+            --model-bundle-certificate-identity "$MODEL_BUNDLE_CERTIFICATE_IDENTITY" \
+            --model-bundle-source-repository "$MODEL_BUNDLE_SOURCE_REPOSITORY" \
+            --model-bundle-source-revision "$MODEL_BUNDLE_SOURCE_REVISION" \
+            --github-repository "$GITHUB_REPOSITORY" \
+            --github-sha "$GITHUB_SHA" \
+            --github-ref "$GITHUB_REF" \
+            --github-run-url "$GITHUB_RUN_URL" \
+            --output-dir "$PUBLISH_ARTIFACT_DIR" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Verify production image identity, user, and embedded model manifest
+        env:
+          API_IMAGE: ${{ steps.refs.outputs.api }}
+          WORKER_IMAGE: ${{ steps.refs.outputs.worker }}
+          FRONTEND_IMAGE: ${{ steps.refs.outputs.frontend }}
+          MODEL_BUNDLE_DIGEST: ${{ steps.refs.outputs.model_bundle_digest }}
+          MODEL_MANIFEST_SHA256: ${{ steps.refs.outputs.model_manifest_sha256 }}
+          EXPECTED_SOURCE: ${{ steps.prepare.outputs.source_repository }}
+          EXPECTED_REVISION: ${{ steps.prepare.outputs.source_revision }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for image in "$API_IMAGE" "$WORKER_IMAGE" "$FRONTEND_IMAGE"; do
+            docker pull "$image"
+            test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$image")" = "$EXPECTED_REVISION"
+            test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.source" }}' "$image")" = "$EXPECTED_SOURCE"
+          done
+          test "$(docker image inspect --format '{{.Config.User}}' "$API_IMAGE")" = "10001:10001"
+          test "$(docker image inspect --format '{{.Config.User}}' "$WORKER_IMAGE")" = "10001:10001"
+          test "$(docker image inspect --format '{{.Config.User}}' "$FRONTEND_IMAGE")" = "101:101"
+          for entry in "api=$API_IMAGE" "worker=$WORKER_IMAGE"; do
+            name="${entry%%=*}"
+            image="${entry#*=}"
+            test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.model-bundle-digest" }}' "$image")" = "$MODEL_BUNDLE_DIGEST"
+            test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.model-manifest-sha256" }}' "$image")" = "$MODEL_MANIFEST_SHA256"
+            application_container="$(docker create "$image" /nonexistent)"
+            trap 'docker rm -f "$application_container" >/dev/null 2>&1 || true' EXIT
+            docker cp "${application_container}:/app/models/model-manifest.json" \
+              "$PUBLISH_ARTIFACT_DIR/$name-model-manifest.json"
+            docker rm "$application_container" >/dev/null
+            trap - EXIT
+            actual_manifest_sha="sha256:$(sha256sum "$PUBLISH_ARTIFACT_DIR/$name-model-manifest.json" | awk '{print $1}')"
+            test "$actual_manifest_sha" = "$MODEL_MANIFEST_SHA256"
+          done
+
+      - name: Scan production API image
+        if: ${{ !cancelled() && steps.refs.outcome == 'success' }}
+        uses: aquasecurity/trivy-action@76071ef0d7ec797419534a183b498b4d6366cf37 # v0.31.0
+        with:
+          image-ref: ${{ steps.refs.outputs.api }}
+          scanners: vuln,secret,misconfig
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          format: sarif
+          output: ${{ runner.temp }}/industrial-rag-image-publish/trivy-api.sarif
+          exit-code: 1
+
+      - name: Scan repository-bound production model image
+        if: ${{ !cancelled() && steps.refs.outcome == 'success' }}
+        uses: aquasecurity/trivy-action@76071ef0d7ec797419534a183b498b4d6366cf37 # v0.31.0
+        with:
+          image-ref: ${{ steps.refs.outputs.model_bundle }}
+          scanners: vuln,secret,misconfig
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          format: sarif
+          output: ${{ runner.temp }}/industrial-rag-image-publish/trivy-model-bundle.sarif
+          exit-code: 1
+
+      - name: Scan production Worker image
+        if: ${{ !cancelled() && steps.refs.outcome == 'success' }}
+        uses: aquasecurity/trivy-action@76071ef0d7ec797419534a183b498b4d6366cf37 # v0.31.0
+        with:
+          image-ref: ${{ steps.refs.outputs.worker }}
+          scanners: vuln,secret,misconfig
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          format: sarif
+          output: ${{ runner.temp }}/industrial-rag-image-publish/trivy-worker.sarif
+          exit-code: 1
+
+      - name: Scan production Frontend image
+        if: ${{ !cancelled() && steps.refs.outcome == 'success' }}
+        uses: aquasecurity/trivy-action@76071ef0d7ec797419534a183b498b4d6366cf37 # v0.31.0
+        with:
+          image-ref: ${{ steps.refs.outputs.frontend }}
+          scanners: vuln,secret,misconfig
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          format: sarif
+          output: ${{ runner.temp }}/industrial-rag-image-publish/trivy-frontend.sarif
+          exit-code: 1
+
+      - name: Generate production API SBOM
+        if: ${{ !cancelled() && steps.refs.outcome == 'success' }}
+        uses: anchore/sbom-action@da167eac915b4e86f08b264dbdbc867b61be6f0c # v0.20.5
+        with:
+          image: ${{ steps.refs.outputs.api }}
+          format: cyclonedx-json
+          artifact-name: industrial-rag-publish-api-sbom.cdx.json
+          output-file: ${{ runner.temp }}/industrial-rag-image-publish/api-sbom.cdx.json
+
+      - name: Generate repository-bound production model SBOM
+        if: ${{ !cancelled() && steps.refs.outcome == 'success' }}
+        uses: anchore/sbom-action@da167eac915b4e86f08b264dbdbc867b61be6f0c # v0.20.5
+        with:
+          image: ${{ steps.refs.outputs.model_bundle }}
+          format: cyclonedx-json
+          artifact-name: industrial-rag-publish-model-bundle-sbom.cdx.json
+          output-file: ${{ runner.temp }}/industrial-rag-image-publish/model-bundle-sbom.cdx.json
+
+      - name: Generate production Worker SBOM
+        if: ${{ !cancelled() && steps.refs.outcome == 'success' }}
+        uses: anchore/sbom-action@da167eac915b4e86f08b264dbdbc867b61be6f0c # v0.20.5
+        with:
+          image: ${{ steps.refs.outputs.worker }}
+          format: cyclonedx-json
+          artifact-name: industrial-rag-publish-worker-sbom.cdx.json
+          output-file: ${{ runner.temp }}/industrial-rag-image-publish/worker-sbom.cdx.json
+
+      - name: Generate production Frontend SBOM
+        if: ${{ !cancelled() && steps.refs.outcome == 'success' }}
+        uses: anchore/sbom-action@da167eac915b4e86f08b264dbdbc867b61be6f0c # v0.20.5
+        with:
+          image: ${{ steps.refs.outputs.frontend }}
+          format: cyclonedx-json
+          artifact-name: industrial-rag-publish-frontend-sbom.cdx.json
+          output-file: ${{ runner.temp }}/industrial-rag-image-publish/frontend-sbom.cdx.json
+
+      - name: Attest SBOM and SLSA provenance; then keyless-sign approved images
+        env:
+          API_IMAGE: ${{ steps.refs.outputs.api }}
+          WORKER_IMAGE: ${{ steps.refs.outputs.worker }}
+          FRONTEND_IMAGE: ${{ steps.refs.outputs.frontend }}
+          MODEL_BUNDLE_IMAGE: ${{ steps.refs.outputs.model_bundle }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for entry in \
+            "model-bundle=$MODEL_BUNDLE_IMAGE" \
+            "api=$API_IMAGE" \
+            "worker=$WORKER_IMAGE" \
+            "frontend=$FRONTEND_IMAGE"; do
+            name="${entry%%=*}"
+            image="${entry#*=}"
+            cosign attest --yes --type "$CYCLONEDX_PREDICATE_TYPE" \
+              --predicate "$PUBLISH_ARTIFACT_DIR/$name-sbom.cdx.json" "$image"
+            cosign attest --yes --type "$SLSA_PROVENANCE_PREDICATE_TYPE" \
+              --predicate "$PUBLISH_ARTIFACT_DIR/$name-slsa-provenance.json" "$image"
+          done
+          # Only issue release-consumable signatures after every attestation
+          # was attached successfully in this protected run.
+          for image in "$MODEL_BUNDLE_IMAGE" "$API_IMAGE" "$WORKER_IMAGE" "$FRONTEND_IMAGE"; do
+            cosign sign --yes "$image"
+          done
+
+      - name: Verify signatures and attestations against this exact workflow identity
+        env:
+          API_IMAGE: ${{ steps.refs.outputs.api }}
+          WORKER_IMAGE: ${{ steps.refs.outputs.worker }}
+          FRONTEND_IMAGE: ${{ steps.refs.outputs.frontend }}
+          MODEL_BUNDLE_IMAGE: ${{ steps.refs.outputs.model_bundle }}
+          PUBLISHER_IDENTITY: ${{ steps.refs.outputs.publisher_identity }}
+          EXPECTED_REVISION: ${{ steps.prepare.outputs.source_revision }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for entry in \
+            "model-bundle=$MODEL_BUNDLE_IMAGE" \
+            "api=$API_IMAGE" \
+            "worker=$WORKER_IMAGE" \
+            "frontend=$FRONTEND_IMAGE"; do
+            name="${entry%%=*}"
+            image="${entry#*=}"
+            cosign verify \
+              --certificate-identity "$PUBLISHER_IDENTITY" \
+              --certificate-oidc-issuer "$COSIGN_CERTIFICATE_OIDC_ISSUER" \
+              --certificate-github-workflow-sha "$EXPECTED_REVISION" \
+              "$image" > "$PUBLISH_ARTIFACT_DIR/$name-publisher-signature.json"
+          done
+          for entry in \
+            "model-bundle=$MODEL_BUNDLE_IMAGE" \
+            "api=$API_IMAGE" \
+            "worker=$WORKER_IMAGE" \
+            "frontend=$FRONTEND_IMAGE"; do
+            name="${entry%%=*}"
+            image="${entry#*=}"
+            cosign verify-attestation \
+              --certificate-identity "$PUBLISHER_IDENTITY" \
+              --certificate-oidc-issuer "$COSIGN_CERTIFICATE_OIDC_ISSUER" \
+              --certificate-github-workflow-sha "$EXPECTED_REVISION" \
+              --type "$CYCLONEDX_PREDICATE_TYPE" "$image" \
+              > "$PUBLISH_ARTIFACT_DIR/$name-sbom-attestation.json"
+            python industrial-rag/scripts/production_image_publish.py \
+              verify-attestation-output \
+              --verification-output "$PUBLISH_ARTIFACT_DIR/$name-sbom-attestation.json" \
+              --expected-predicate "$PUBLISH_ARTIFACT_DIR/$name-sbom.cdx.json" \
+              --expected-image "$image" \
+              --expected-predicate-type "$CYCLONEDX_PREDICATE_TYPE"
+            cosign verify-attestation \
+              --certificate-identity "$PUBLISHER_IDENTITY" \
+              --certificate-oidc-issuer "$COSIGN_CERTIFICATE_OIDC_ISSUER" \
+              --certificate-github-workflow-sha "$EXPECTED_REVISION" \
+              --type "$SLSA_PROVENANCE_PREDICATE_TYPE" "$image" \
+              > "$PUBLISH_ARTIFACT_DIR/$name-provenance-attestation.json"
+            python industrial-rag/scripts/production_image_publish.py \
+              verify-attestation-output \
+              --verification-output "$PUBLISH_ARTIFACT_DIR/$name-provenance-attestation.json" \
+              --expected-predicate "$PUBLISH_ARTIFACT_DIR/$name-slsa-provenance.json" \
+              --expected-image "$image" \
+              --expected-predicate-type "$SLSA_PROVENANCE_PREDICATE_TYPE"
+          done
+
+      - name: Create, attest, and verify atomic production image set
+        env:
+          API_IMAGE: ${{ steps.refs.outputs.api }}
+          WORKER_IMAGE: ${{ steps.refs.outputs.worker }}
+          FRONTEND_IMAGE: ${{ steps.refs.outputs.frontend }}
+          MODEL_BUNDLE_IMAGE: ${{ steps.refs.outputs.model_bundle }}
+          MODEL_MANIFEST_SHA256: ${{ steps.refs.outputs.model_manifest_sha256 }}
+          PUBLISHER_IDENTITY: ${{ steps.refs.outputs.publisher_identity }}
+          WORKFLOW_RUN: ${{ steps.refs.outputs.workflow_run }}
+          EXPECTED_REVISION: ${{ steps.prepare.outputs.source_revision }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_set_type="$(python industrial-rag/scripts/release_set_attestation.py \
+            predicate-type --github-repository "$GITHUB_REPOSITORY")"
+          predicate="$PUBLISH_ARTIFACT_DIR/image-set-predicate.json"
+          verification_output="$PUBLISH_ARTIFACT_DIR/image-set-attestation.json"
+          python industrial-rag/scripts/release_set_attestation.py create \
+            --project-root industrial-rag \
+            --github-repository "$GITHUB_REPOSITORY" \
+            --source-revision "$EXPECTED_REVISION" \
+            --workflow-run "$WORKFLOW_RUN" \
+            --publisher-identity "$PUBLISHER_IDENTITY" \
+            --model-bundle-image "$MODEL_BUNDLE_IMAGE" \
+            --api-image "$API_IMAGE" \
+            --worker-image "$WORKER_IMAGE" \
+            --frontend-image "$FRONTEND_IMAGE" \
+            --model-manifest-sha256 "$MODEL_MANIFEST_SHA256" \
+            --output "$predicate"
+          cosign attest --yes --type "$image_set_type" \
+            --predicate "$predicate" "$API_IMAGE"
+          cosign verify-attestation \
+            --certificate-identity "$PUBLISHER_IDENTITY" \
+            --certificate-oidc-issuer "$COSIGN_CERTIFICATE_OIDC_ISSUER" \
+            --certificate-github-workflow-sha "$EXPECTED_REVISION" \
+            --type "$image_set_type" "$API_IMAGE" > "$verification_output"
+          python industrial-rag/scripts/release_set_attestation.py verify-attestation \
+            --verification-output "$verification_output" \
+            --project-root industrial-rag \
+            --github-repository "$GITHUB_REPOSITORY" \
+            --source-revision "$EXPECTED_REVISION" \
+            --workflow-run "$WORKFLOW_RUN" \
+            --publisher-identity "$PUBLISHER_IDENTITY" \
+            --model-bundle-image "$MODEL_BUNDLE_IMAGE" \
+            --api-image "$API_IMAGE" \
+            --worker-image "$WORKER_IMAGE" \
+            --frontend-image "$FRONTEND_IMAGE" \
+            --model-manifest-sha256 "$MODEL_MANIFEST_SHA256"
+
+      - name: Upload production image publication evidence
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: industrial-rag-production-image-publication
+          path: ${{ runner.temp }}/industrial-rag-image-publish
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload failed-publication diagnostics without release inputs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: industrial-rag-production-image-publication-failed
+          path: |
+            ${{ runner.temp }}/industrial-rag-image-publish/model/upstream-signature.json
+            ${{ runner.temp }}/industrial-rag-image-publish/trivy-*.sarif
+            ${{ runner.temp }}/industrial-rag-image-publish/*-sbom.cdx.json
+          if-no-files-found: warn
+          retention-days: 30

@@ -1,6 +1,6 @@
 import { computed, nextTick, ref } from 'vue'
 import { normalizeProcessTrace } from '../utils/processTrace.js'
-import { buildChatStorageKey, saveSessions } from '../utils/chatStorage.js'
+import { buildChatStorageKey, loadSessions, saveSessions } from '../utils/chatStorage.js'
 
 const normalizeStoredMessages = (items = []) =>
   items.map(msg => {
@@ -95,27 +95,14 @@ export const useChatSessions = ({ onAfterSwitch, storageKey = buildChatStorageKe
   }
 
   const initChats = () => {
-    const saved = localStorage.getItem(storageKey)
-    if (!saved) {
-      createNewChat()
-      return
-    }
-
-    try {
-      const parsed = JSON.parse(saved)
-      if (!Array.isArray(parsed)) throw new TypeError('Stored chat sessions must be an array')
-      chatSessions.value = parsed
-      chatSessions.value.forEach(session => {
-        session.messages = normalizeStoredMessages(session.messages || [])
-      })
-      if (chatSessions.value.length > 0) {
-        currentSessionId.value = chatSessions.value[0].id
-        messages.value = chatSessions.value[0].messages
-      } else {
-        createNewChat()
-      }
-    } catch (error) {
-      console.error('Failed to load chat sessions:', error)
+    chatSessions.value = loadSessions(localStorage, storageKey)
+    chatSessions.value.forEach(session => {
+      session.messages = normalizeStoredMessages(session.messages)
+    })
+    if (chatSessions.value.length > 0) {
+      currentSessionId.value = chatSessions.value[0].id
+      messages.value = chatSessions.value[0].messages
+    } else {
       createNewChat()
     }
   }

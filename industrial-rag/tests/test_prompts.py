@@ -34,12 +34,14 @@ def test_rag_prompt_uses_template_parts():
     assert "test question" in prompt
     assert "test context" in prompt
     assert "用户问题" in prompt
-    assert "【回答】" in prompt
+    assert '"conclusion"' in prompt
+    assert '"evidence"' in prompt
     assert "依据" in prompt
     assert "不同观点" in prompt
     assert "单线逻辑" in prompt
-    assert "相邻条文" in prompt
-    assert "基础主体、法律关系或权利义务" in prompt
+    assert "context_id" in prompt
+    assert "quote" in prompt
+    assert "基础法律关系" in prompt
 
 
 def test_system_prompt_combines_role_business_and_citation():
@@ -57,12 +59,16 @@ def test_system_prompt_combines_role_business_and_citation():
 
 def test_generator_builds_normal_and_stream_prompts_from_templates():
     generator = Generator.__new__(Generator)
-    generator.config = {"max_context_length": 200}
+    generator.config = {
+        "max_context_length": 200,
+        "answer_contract": {"enabled": True},
+    }
 
     normal_prompt = generator._build_prompt("test question", "test context")
     stream_prompt = generator._build_prompt("test question", "test context", stream=True)
 
     assert "test question" in normal_prompt
-    assert "【回答】" in normal_prompt
+    assert '"conclusion"' in normal_prompt
+    assert '"evidence"' in normal_prompt
     assert STREAM_ANSWER_INSTRUCTIONS in stream_prompt
-    assert "流式输出要求" in stream_prompt
+    assert "单个完整 JSON 对象" in stream_prompt

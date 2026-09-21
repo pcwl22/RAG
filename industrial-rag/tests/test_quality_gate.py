@@ -1,10 +1,22 @@
 """Tests for combined Ragas and citation regression thresholds."""
+import hashlib
+import json
+
+import pytest
+
+from app.evaluation.native_judge import EVALUATION_ENGINE_VERSION
 from app.evaluation.quality_gate import build_quality_gate
+from app.evaluation.retrieval_contract import build_retrieval_runtime_contract
+from app.llm.request_policy import build_structured_output_policy
+from scripts.check_quality_gate import _export_evaluation_contract
 
 
 def _ragas_report(value: float = 0.9):
     return {
         "sample_count": 9,
+        "evaluation_engine": "industrial-rag-native-text-judge",
+        "evaluation_engine_version": EVALUATION_ENGINE_VERSION,
+        "judge_model": "judge-model",
         "metrics": {
             name: {"mean": value}
             for name in (
@@ -25,6 +37,7 @@ def test_quality_gate_passes_when_all_metrics_meet_thresholds():
     )
 
     assert report["passed"] is True
+    assert report["judge_sample_count"] == 9
     assert report["checks"]["citation_mrr"]["status"] == "passed"
 
 
@@ -50,3 +63,52 @@ def test_quality_gate_can_skip_missing_retrieval_labels():
 
     assert report["passed"] is True
     assert report["checks"]["citation_recall"]["status"] == "skipped"
+
+
+def test_export_evaluation_contract_binds_source_and_runtime_identity(tmp_path):
+    path = tmp_path / "export.jsonl"
+    identity = {
+        "provider": "openai_compatible",
+        "model_name": "model-a",
+        "endpoint_sha256": "a" * 64,
+    }
+    retrieval_contract = build_retrieval_runtime_contract(
+        {
+            "_meta": {"config_path": "config/base.yaml"},
+            "rag": {"retrieval": {}},
+        }
+    )
+    answer_policy = build_structured_output_policy(
+        provider="openai_compatible",
+        model_name="model-a",
+        base_url="https://provider.example/v1",
+    )
+    sample = {
+        "id": "case-1",
+        "metadata": {
+            "evaluation_contract": {
+                "source_dataset_sha256": "b" * 64,
+                "llm_runtime_identity": identity,
+                "retrieval_runtime_contract": retrieval_contract,
+                "answer_generation_policy": answer_policy,
+            }
+        },
+    }
+    path.write_text(json.dumps(sample) + "\n", encoding="utf-8")
+
+    export_sha256, contract = _export_evaluation_contract(path)
+
+    assert export_sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert contract == {
+        "export_sample_count": 1,
+        "source_dataset_sha256": "b" * 64,
+        "retrieval_llm_runtime_identity": identity,
+        "retrieval_runtime_contract_sha256": retrieval_contract["sha256"],
+        "answer_generation_policy_sha256": answer_policy["sha256"],
+    }
+
+    sample["metadata"]["evaluation_contract"]["source_dataset_sha256"] = "c" * 64
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(sample) + "\n")
+    with pytest.raises(ValueError, match="mixed evaluation contracts"):
+        _export_evaluation_contract(path)

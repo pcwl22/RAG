@@ -32,6 +32,229 @@ def _integration_config() -> dict:
     }
 
 
+def test_real_postgres_fresh_schema_is_created_at_the_final_contract(monkeypatch):
+    cfg = _integration_config()
+    setup = psycopg2.connect(
+        host=cfg["host"],
+        port=cfg["port"],
+        database=cfg["database"],
+        user=cfg["user"],
+        password=cfg["password"],
+    )
+    setup.autocommit = True
+    cur = setup.cursor()
+    try:
+        cur.execute(
+            "DROP TABLE IF EXISTS documents, rag_schema_metadata, "
+            "rag_schema_migrations, rag_tenants CASCADE"
+        )
+    finally:
+        cur.close()
+        setup.close()
+
+    monkeypatch.setattr(postgres_store, "_postgres_config", _integration_config)
+    monkeypatch.setattr(postgres_store, "_embedding_dimension", lambda: 1024)
+
+    async def run():
+        await postgres_store.close_postgres_store()
+        await postgres_store.init_postgres_store()
+        conn = postgres_store._connection()
+        cur = conn.cursor()
+        try:
+            assert postgres_store._primary_key_state(cur) == (
+                "documents_pkey",
+                ("tenant_id", "id"),
+            )
+            cur.execute("SELECT COUNT(*) FROM documents WHERE tenant_id IS NULL")
+            assert cur.fetchone()[0] == 0
+            cur.execute(
+                "SELECT migration_id, checksum FROM rag_schema_migrations "
+                "WHERE migration_id = ANY(%s)",
+                ([migration[0] for migration in postgres_store.SCHEMA_MIGRATIONS],),
+            )
+            assert dict(cur.fetchall()) == dict(postgres_store.SCHEMA_MIGRATIONS)
+
+            await postgres_store.replace_document(
+                source_key="receipt-source-1",
+                filename="receipt.txt",
+                ids=["receipt-row-1"],
+                embeddings=[[0.0] * 1024],
+                documents=["receipt verification content"],
+                metadatas=[
+                    {
+                        "tenant_id": "00000000-0000-0000-0000-000000000001",
+                        "document_id": "receipt-doc-1",
+                        "source_key": "receipt-source-1",
+                        "upload_task_id": "receipt-task-1",
+                        "upload_object_key": "tenants/t/uploads/receipt-task-1/payload.txt",
+                        "total_chunks": 1,
+                    }
+                ],
+                partition="text",
+            )
+            assert postgres_store.document_commit_matches(
+                tenant_id="00000000-0000-0000-0000-000000000001",
+                document_id="receipt-doc-1",
+                source_key="receipt-source-1",
+                upload_task_id="receipt-task-1",
+                upload_object_key="tenants/t/uploads/receipt-task-1/payload.txt",
+                total_chunks=1,
+            )
+            assert not postgres_store.document_commit_matches(
+                tenant_id="00000000-0000-0000-0000-000000000001",
+                document_id="receipt-doc-1",
+                source_key="receipt-source-1",
+                upload_task_id="different-task",
+                upload_object_key="tenants/t/uploads/receipt-task-1/payload.txt",
+                total_chunks=1,
+            )
+        finally:
+            cur.close()
+            postgres_store._return_connection(conn)
+            await postgres_store.close_postgres_store()
+
+    asyncio.run(run())
+
+
+def test_real_postgres_legacy_upgrade_is_staged_and_lock_failure_is_rerunnable(
+    monkeypatch,
+):
+    cfg = _integration_config()
+    setup = psycopg2.connect(
+        host=cfg["host"],
+        port=cfg["port"],
+        database=cfg["database"],
+        user=cfg["user"],
+        password=cfg["password"],
+    )
+    setup.autocommit = True
+    cur = setup.cursor()
+    try:
+        cur.execute(
+            "DROP TABLE IF EXISTS documents, rag_schema_metadata, "
+            "rag_schema_migrations, rag_tenants CASCADE"
+        )
+        cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        cur.execute(
+            """
+            CREATE TABLE documents (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                embedding vector(1024),
+                metadata JSONB DEFAULT '{}',
+                partition TEXT DEFAULT 'general',
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+            """
+        )
+        cur.execute(
+            """
+            INSERT INTO documents (id, content)
+            SELECT 'legacy-' || value::text, 'legacy content ' || value::text
+            FROM generate_series(1, 2505) AS value
+            """
+        )
+    finally:
+        cur.close()
+        setup.close()
+
+    monkeypatch.setattr(postgres_store, "_postgres_config", _integration_config)
+    monkeypatch.setattr(postgres_store, "_embedding_dimension", lambda: 1024)
+    monkeypatch.setenv("POSTGRES_MIGRATION_BATCH_SIZE", "1000")
+    monkeypatch.setenv("POSTGRES_PK_CUTOVER_LOCK_TIMEOUT_SECONDS", "1")
+    monkeypatch.setenv("POSTGRES_ALLOW_LEGACY_PK_CUTOVER", "false")
+
+    async def run():
+        await postgres_store.close_postgres_store()
+        with pytest.raises(RuntimeError, match="not authorized"):
+            await postgres_store.init_postgres_store()
+
+        inspect_conn = psycopg2.connect(
+            host=cfg["host"],
+            port=cfg["port"],
+            database=cfg["database"],
+            user=cfg["user"],
+            password=cfg["password"],
+        )
+        inspect_cur = inspect_conn.cursor()
+        try:
+            inspect_cur.execute("SELECT COUNT(*) FROM documents WHERE tenant_id IS NULL")
+            assert inspect_cur.fetchone()[0] == 0
+            inspect_cur.execute(
+                "SELECT attnotnull FROM pg_attribute "
+                "WHERE attrelid = 'documents'::regclass AND attname = 'tenant_id'"
+            )
+            assert inspect_cur.fetchone()[0] is True
+            inspect_cur.execute(
+                """
+                SELECT array_agg(attribute.attname ORDER BY key_column.ordinality)
+                FROM pg_constraint AS constraint_row
+                CROSS JOIN LATERAL unnest(constraint_row.conkey)
+                    WITH ORDINALITY AS key_column(attnum, ordinality)
+                JOIN pg_attribute AS attribute
+                  ON attribute.attrelid = constraint_row.conrelid
+                 AND attribute.attnum = key_column.attnum
+                WHERE constraint_row.conrelid = 'documents'::regclass
+                  AND constraint_row.contype = 'p'
+                """
+            )
+            assert inspect_cur.fetchone()[0] == ["id"]
+            inspect_cur.execute(
+                "SELECT migration_id FROM rag_schema_migrations "
+                "WHERE migration_id = ANY(%s)",
+                ([migration[0] for migration in postgres_store.STAGED_TENANT_MIGRATIONS],),
+            )
+            applied = {row[0] for row in inspect_cur.fetchall()}
+            assert applied == {
+                migration[0]
+                for migration in postgres_store.STAGED_TENANT_MIGRATIONS[:4]
+            }
+        finally:
+            inspect_cur.close()
+            inspect_conn.rollback()
+            inspect_conn.close()
+
+        blocker = psycopg2.connect(
+            host=cfg["host"],
+            port=cfg["port"],
+            database=cfg["database"],
+            user=cfg["user"],
+            password=cfg["password"],
+        )
+        blocker_cur = blocker.cursor()
+        blocker_cur.execute("SELECT COUNT(*) FROM documents")
+        monkeypatch.setenv("POSTGRES_ALLOW_LEGACY_PK_CUTOVER", "true")
+        try:
+            with pytest.raises(psycopg2.errors.LockNotAvailable):
+                await postgres_store.init_postgres_store()
+        finally:
+            blocker_cur.close()
+            blocker.rollback()
+            blocker.close()
+
+        await postgres_store.init_postgres_store()
+        assert await postgres_store.check_postgres_health() is True
+        final_conn = postgres_store._connection()
+        final_cur = final_conn.cursor()
+        try:
+            assert postgres_store._primary_key_state(final_cur)[1] == (
+                "tenant_id",
+                "id",
+            )
+            final_cur.execute(
+                "SELECT migration_id, checksum FROM rag_schema_migrations "
+                "WHERE migration_id = ANY(%s)",
+                ([migration[0] for migration in postgres_store.SCHEMA_MIGRATIONS],),
+            )
+            assert dict(final_cur.fetchall()) == dict(postgres_store.SCHEMA_MIGRATIONS)
+        finally:
+            final_cur.close()
+            postgres_store._return_connection(final_conn)
+            await postgres_store.close_postgres_store()
+
+    asyncio.run(run())
+
+
 def test_real_postgres_runtime_role_has_no_owner_privileges(monkeypatch):
     runtime_user = os.getenv("POSTGRES_RUNTIME_USER")
     runtime_password = os.getenv("POSTGRES_RUNTIME_PASSWORD")

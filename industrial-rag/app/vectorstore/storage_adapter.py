@@ -102,6 +102,8 @@ async def hybrid_search(
     query_embedding: list[float],
     top_k: int = 10,
     partition: str | None = None,
+    enable_rrf: bool | None = None,
+    enable_dynamic_topk: bool | None = None,
 ) -> list[dict]:
     """Run PostgreSQL hybrid search (vector + keyword) with RRF fusion."""
     from app.vectorstore.postgres_store import hybrid_search as hybrid_pg
@@ -112,8 +114,16 @@ async def hybrid_search(
         query_embedding=query_embedding,
         top_k=top_k,
         partition=partition,
-        enable_rrf=True,
-        enable_dynamic_topk=config.get("enable_dynamic_topk", True),
+        enable_rrf=(
+            bool(config.get("enable_rrf", True))
+            if enable_rrf is None
+            else enable_rrf
+        ),
+        enable_dynamic_topk=(
+            bool(config.get("enable_dynamic_topk", True))
+            if enable_dynamic_topk is None
+            else enable_dynamic_topk
+        ),
         rrf_k=config.get("rrf_k", 60),
         threshold_ratio=config.get("dynamic_topk_threshold", 0.5),
     )

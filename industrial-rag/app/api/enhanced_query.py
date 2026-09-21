@@ -95,6 +95,7 @@ async def enhanced_query(request: EnhancedQueryRequest) -> EnhancedQueryResponse
             except Exception as exc:
                 logger.error("Enhanced query stream failed: %s", exc, exc_info=True)
                 yield _sse_payload({"type": "error", "error": "Enhanced query failed"})
+                yield _sse_payload({"type": "done", "error": True})
 
         return StreamingResponse(
             stream_generator(),

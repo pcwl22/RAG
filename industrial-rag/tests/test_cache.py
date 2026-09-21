@@ -1,6 +1,8 @@
 """Answer-cache correctness tests."""
 import asyncio
 
+import pytest
+
 import app.utils.cache as cache_module
 from app.auth import Principal, reset_current_principal, set_current_principal
 
@@ -138,3 +140,124 @@ def test_tenant_rate_limit_requires_explicit_fail_open(monkeypatch):
         ) == (True, 2)
 
     asyncio.run(run())
+
+
+def test_tenant_rate_limit_has_an_application_deadline(monkeypatch):
+    class HangingRedis:
+        async def eval(self, *_args):
+            await asyncio.Event().wait()
+
+    async def run():
+        monkeypatch.setattr(cache_module, "_redis_client", HangingRedis())
+        monkeypatch.setattr(
+            cache_module,
+            "_redis_config",
+            lambda: {"operation_timeout_seconds": 0.01},
+        )
+        with pytest.raises(TimeoutError):
+            await cache_module.consume_tenant_rate_limit(
+                "00000000-0000-0000-0000-00000000000a",
+                limit=2,
+            )
+
+    asyncio.run(run())
+
+
+def test_redis_client_receives_transport_timeouts(monkeypatch):
+    captured = {}
+
+    class ClosableRedis(FakeRedis):
+        async def aclose(self):
+            captured["closed"] = True
+
+    class FakeRedisModule:
+        @staticmethod
+        def from_url(url, **kwargs):
+            captured["url"] = url
+            captured["kwargs"] = kwargs
+            return ClosableRedis()
+
+    async def run():
+        monkeypatch.setattr(cache_module, "_redis_client", None)
+        monkeypatch.setattr(cache_module, "aioredis", FakeRedisModule())
+        monkeypatch.setattr(
+            cache_module,
+            "_redis_config",
+            lambda: {
+                "url": "redis://:secret@redis.internal:6379/0",
+                "max_connections": 13,
+                "socket_connect_timeout_seconds": 1.5,
+                "socket_timeout_seconds": 2.5,
+                "operation_timeout_seconds": 3.5,
+                "health_check_interval_seconds": 17,
+            },
+        )
+
+        assert await cache_module.init_redis() is True
+        assert captured["url"] == "redis://:secret@redis.internal:6379/0"
+        assert captured["kwargs"] == {
+            "encoding": "utf-8",
+            "decode_responses": True,
+            "max_connections": 13,
+            "socket_connect_timeout": 1.5,
+            "socket_timeout": 2.5,
+            "health_check_interval": 17,
+            "retry_on_timeout": True,
+        }
+        await cache_module.close_redis()
+        assert captured["closed"] is True
+
+    asyncio.run(run())
+
+
+def test_invalid_operation_timeout_does_not_start_redis_operation(monkeypatch):
+    calls = 0
+
+    class TrackingRedis:
+        async def ping(self):
+            nonlocal calls
+            calls += 1
+            return True
+
+    async def run():
+        monkeypatch.setattr(cache_module, "_redis_client", TrackingRedis())
+        monkeypatch.setattr(
+            cache_module,
+            "_redis_config",
+            lambda: {"operation_timeout_seconds": 0},
+        )
+        assert await cache_module.check_redis_health() is False
+        assert calls == 0
+
+    asyncio.run(run())
+
+
+def test_task_dispatch_lease_is_tenant_scoped_and_atomic(monkeypatch):
+    captured = {}
+
+    class LeaseRedis:
+        async def set(self, key, value, **kwargs):
+            captured.update({"key": key, "value": value, **kwargs})
+            return True
+
+    async def run():
+        monkeypatch.setattr(cache_module, "_redis_client", LeaseRedis())
+        monkeypatch.setattr(
+            cache_module,
+            "_redis_config",
+            lambda: {"operation_timeout_seconds": 1},
+        )
+        acquired = await cache_module.acquire_task_dispatch_lease(
+            "task-123",
+            tenant_id="00000000-0000-0000-0000-00000000000a",
+            ttl_seconds=45,
+        )
+        assert acquired is True
+
+    asyncio.run(run())
+    assert captured == {
+        "key": "rag:00000000-0000-0000-0000-00000000000a:task-dispatch:task-123",
+        "value": "1",
+        "ex": 45,
+        "nx": True,
+    }

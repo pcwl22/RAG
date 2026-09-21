@@ -1,7 +1,5 @@
-# Optional Ragas evaluation stack. Install separately from the production GPU stack.
-# Ragas 0.4.3 imports an integration removed in langchain-community 0.4.x.
-ragas==0.4.3
-langchain==0.3.27
-langchain-community==0.3.31
-langchain-core==0.3.80
-langchain-openai==0.3.35
+# Isolated text-only judge stack. Regenerate with pip-tools 7.5.3 on Python 3.12:
+# pip-compile --generate-hashes --no-emit-index-url --strip-extras requirements-evaluation.txt
+# Keep this surface free of Ragas, LangChain, cache deserializers, URL loaders,
+# and multimodal fetchers; the release audit enforces that invariant.
+openai==3.6.0

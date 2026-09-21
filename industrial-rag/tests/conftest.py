@@ -9,6 +9,27 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
+# Protected CI can provide a temporary Secret Manager snapshot through
+# RAG_ENV_FILE.  Load it before collection so integration tests can use the
+# managed PostgreSQL credentials without copying the file into the checkout.
+_configured_env_file = os.getenv("RAG_ENV_FILE", "").strip()
+if _configured_env_file:
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        pass
+    else:
+        load_dotenv(_configured_env_file, override=False)
+        # PostgreSQL integration tests use libpq's conventional variables for
+        # the administrator connection, while the application itself uses the
+        # restricted runtime role.  Keep that separation explicit.
+        os.environ.setdefault("PGHOST", os.getenv("POSTGRES_HOST", ""))
+        os.environ.setdefault("PGPORT", os.getenv("POSTGRES_PORT", ""))
+        os.environ.setdefault("PGDATABASE", os.getenv("POSTGRES_DB", ""))
+        os.environ.setdefault("PGUSER", os.getenv("POSTGRES_ADMIN_USER", ""))
+        os.environ.setdefault("PGPASSWORD", os.getenv("POSTGRES_PASSWORD", ""))
+
+
 # Importing app.main calls get_settings(), which calls load_dotenv() and injects
 # the developer .env into the process. Authentication code then reads those
 # values straight from os.environ, so a local .env silently decides whether OIDC

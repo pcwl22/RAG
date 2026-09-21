@@ -1,0 +1,5 @@
+# Resolver-only constraint for the Linux/Python 3.12 application lock.
+# The deployed worker installs the matching artifact from
+# requirements-torch-cpu.lock.txt; the API supplies the CUDA build from its
+# digest-pinned base image. The URL hash is published by download.pytorch.org.
+torch @ https://download-r2.pytorch.org/whl/cpu/torch-2.13.0%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=4ca4a9394b0c771238a4f73590fdbbc4debad85ed0fa63d026ae1b085da7d6e2

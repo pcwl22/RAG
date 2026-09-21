@@ -11,6 +11,7 @@ import os
 import time
 from typing import Any
 
+from app.embedding.model_bundle import validate_runtime_model_manifest
 from app.utils.config import get_settings
 from app.utils.logger import get_logger
 from app.utils.metrics import EMBEDDING_DURATION, EMBEDDING_REQUESTS
@@ -20,8 +21,12 @@ logger = get_logger(__name__)
 _embedding_model = None
 
 
-def resolve_torch_device(configured_device: str | None) -> str:
-    """Return a usable torch device, falling back to CPU when CUDA is unavailable."""
+def resolve_torch_device(
+    configured_device: str | None,
+    *,
+    allow_cpu_fallback: bool = True,
+) -> str:
+    """Return a usable device and optionally reject an unavailable accelerator."""
     device = str(configured_device or "cpu")
     if not device.startswith("cuda"):
         return device
@@ -34,6 +39,8 @@ def resolve_torch_device(configured_device: str | None) -> str:
     except Exception:
         pass
 
+    if not allow_cpu_fallback:
+        raise RuntimeError(f"Configured accelerator {device} is unavailable")
     logger.warning("Configured device %s is unavailable; falling back to cpu", device)
     return "cpu"
 
@@ -89,16 +96,18 @@ def load_embedding_model() -> Any:
     if _embedding_model is not None:
         return _embedding_model
 
-    from sentence_transformers import SentenceTransformer
-
     config = get_settings()
+    validate_runtime_model_manifest(config)
     embed_config = config["embedding"]
     model_path = embed_config["model_path"]
+
+    from sentence_transformers import SentenceTransformer
 
     # Device selection is driven by embedding.device in config, with a local
     # CPU fallback for environments where torch was installed without CUDA.
     device = resolve_torch_device(
-        os.getenv("EMBEDDING_DEVICE") or embed_config.get("device", "cuda")
+        os.getenv("EMBEDDING_DEVICE") or embed_config.get("device", "cuda"),
+        allow_cpu_fallback=bool(embed_config.get("allow_cpu_fallback", True)),
     )
 
     logger.info(f"Loading embedding model: {model_path} (device={device})")

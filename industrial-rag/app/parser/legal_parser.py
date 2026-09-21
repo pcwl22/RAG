@@ -441,8 +441,16 @@ def legal_section_metadata(
 def build_legal_article_chunks(
     text: str,
     filename: str | None = None,
+    *,
+    max_chunk_size: int | None = None,
+    chunk_overlap: int = 0,
 ) -> list[dict[str, Any]]:
-    """Return one chunk per legal article with structured metadata."""
+    """Return bounded legal-article chunks with structured metadata.
+
+    Most provisions fit in one embedding window. Exceptionally long articles
+    are split without losing their law/article identity; every returned
+    ``content`` value is guaranteed not to exceed ``max_chunk_size``.
+    """
     parser = LegalDocumentParser()
     sections = parser.parse(text)
     articles = [section for section in sections if section.level == 5 and section.content.strip()]
@@ -451,13 +459,55 @@ def build_legal_article_chunks(
     if not articles or (not law_name and len(articles) < 3):
         return []
 
-    return [
-        {
-            "content": article.content,
-            "metadata": legal_section_metadata(article, law_name, filename),
-        }
-        for article in articles
-    ]
+    if max_chunk_size is not None and max_chunk_size <= 0:
+        raise ValueError("max_chunk_size must be greater than 0")
+    if max_chunk_size is not None:
+        chunk_overlap = max(0, min(int(chunk_overlap), max_chunk_size - 1))
+
+    chunks: list[dict[str, Any]] = []
+    for article in articles:
+        if max_chunk_size is None or len(article.content) <= max_chunk_size:
+            parts = [article.content]
+        else:
+            parts = []
+            start = 0
+            while start < len(article.content):
+                hard_end = min(len(article.content), start + max_chunk_size)
+                end = hard_end
+                if hard_end < len(article.content):
+                    lower_bound = start + max(1, max_chunk_size // 2)
+                    candidates = [
+                        article.content.rfind(separator, lower_bound, hard_end)
+                        for separator in ("。", "；", "！", "？", "\n", "，")
+                    ]
+                    boundary = max(candidates, default=-1)
+                    if boundary >= lower_bound:
+                        end = boundary + 1
+                part = article.content[start:end].strip()
+                if part:
+                    parts.append(part)
+                if end >= len(article.content):
+                    break
+                start = max(start + 1, end - chunk_overlap)
+
+        base_metadata = legal_section_metadata(article, law_name, filename)
+        base_semantic_id = str(base_metadata.get("semantic_chunk_id") or "")
+        for part_index, part in enumerate(parts):
+            metadata = dict(base_metadata)
+            metadata.update(
+                {
+                    "article_text": part,
+                    "article_part_index": part_index,
+                    "article_part_count": len(parts),
+                    "article_full_length": len(article.content),
+                }
+            )
+            if len(parts) > 1:
+                metadata["semantic_article_id"] = base_semantic_id
+                if part_index:
+                    metadata["semantic_chunk_id"] = f"{base_semantic_id}_part_{part_index + 1}"
+            chunks.append({"content": part, "metadata": metadata})
+    return chunks
 
 
 __all__ = [

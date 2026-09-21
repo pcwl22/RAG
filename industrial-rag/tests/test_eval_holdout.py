@@ -1,27 +1,30 @@
 """Guards for the fact-pattern hold-out suite.
 
-Every citation-bearing question in ``eval/legal_expanded_240.jsonl`` contains,
-verbatim, the article number it is scored on. Its ``citation_recall = 1.0`` in
-``eval/release_baseline.json`` therefore measures string echo, not retrieval.
-
-``eval/legal_holdout_150.jsonl`` exists to measure what the expanded suite cannot.
-These tests pin the properties that make it different so it cannot drift back into
-the same defect.
+The committed expanded suites are derived from screened fact patterns and must
+not contain the citation they are scored on. ``eval/legal_holdout_150.jsonl`` is
+the source corpus for those cases and remains the independent retrieval contract.
+These tests pin the properties that keep the suites from drifting back to
+answer-echo evaluation; the rejection test uses a synthetic historical leak.
 """
 import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from scripts.build_holdout_eval import (
     MAX_SHARED_SUBSTRING,
     Article,
+    is_discriminative,
     longest_shared_substring,
     screen_question,
 )
+from scripts.validate_evaluation_assets import load_and_validate
 
 EVAL_DIR = Path(__file__).resolve().parents[1] / "eval"
 HOLDOUT_PATH = EVAL_DIR / "legal_holdout_150.jsonl"
 EXPANDED_PATH = EVAL_DIR / "legal_expanded_240.jsonl"
+CORRECTIONS_PATH = EVAL_DIR / "legal_holdout_semantic_corrections.json"
 
 
 def _load(path: Path) -> list[dict[str, Any]]:
@@ -75,29 +78,67 @@ def test_holdout_covers_every_legal_domain():
     assert domains == {"civil", "criminal", "labor"}
 
 
-def test_screen_rejects_every_leaky_expanded_question():
-    """The screen must have teeth, so prove it against the known-bad suite."""
-    slipped = [
+def test_legislative_purpose_clause_is_not_used_as_a_fact_pattern_target():
+    assert not is_discriminative(
+        "第一条　为了完善劳动合同制度，明确双方权利和义务，制定本法。"
+    )
+    assert is_discriminative(
+        "第七条　用人单位自用工之日起即与劳动者建立劳动关系。"
+    )
+
+
+def test_reviewed_semantic_corrections_are_applied_to_holdout():
+    rows_by_id = {row["id"]: row for row in _load(HOLDOUT_PATH)}
+    corrections = json.loads(CORRECTIONS_PATH.read_text(encoding="utf-8"))
+
+    for correction in corrections:
+        row_id = correction.get("replacement_id", correction["id"])
+        row = rows_by_id[row_id]
+        assert row["query"] == correction["query"]
+        if "expected_citations" in correction:
+            assert row["expected_citations"] == correction["expected_citations"]
+        if "expected_answer" in correction:
+            assert row["expected_answer"] == correction["expected_answer"]
+        if "replacement_article_id" in correction:
+            assert row["metadata"]["article_ids"] == [
+                correction["replacement_article_id"]
+            ]
+
+
+def test_expanded_questions_pass_the_fact_pattern_screen():
+    """Every cited case in the committed suite remains a usable fact pattern."""
+    rejected = [
         record["id"]
         for record in _cited(_load(EXPANDED_PATH))
-        if screen_question(record["query"], _as_article(record)) is None
+        if screen_question(record["query"], _as_article(record)) is not None
     ]
 
-    assert slipped == [], f"screen accepted leaky questions: {slipped[:5]}"
+    assert rejected == [], f"screen rejected current fact patterns: {rejected[:5]}"
 
 
-def test_expanded_suite_still_cannot_measure_retrieval():
-    """Tripwire: stops the expanded suite's 1.0 being quoted as a retrieval result.
-
-    This asserts a defect on purpose. If the suite is ever regenerated so that
-    questions no longer hand over their own answer, this test fails -- at which
-    point re-run the release evaluation, update eval/release_baseline.json, and
-    delete this guard.
-    """
-    records = _cited(_load(EXPANDED_PATH))
-    leaking = [record for record in records if _names_own_citation(record)]
-
-    assert len(leaking) == len(records) == 200, (
-        "legal_expanded_240.jsonl no longer leaks every answer; re-approve the "
-        "release baseline and remove this tripwire"
+def test_asset_gate_rejects_a_synthetic_leaky_question(tmp_path: Path):
+    """The release gate still rejects the historical citation-echo failure."""
+    leaky_path = tmp_path / "leaky.jsonl"
+    leaky_path.write_text(
+        json.dumps(
+            {
+                "id": "synthetic-leak-01",
+                "query": "请说明第一条规定的主要内容。",
+                "expected_citations": ["第一条"],
+                "expected_sources": ["测试法"],
+                "expected_answer": "第一条 测试内容。",
+                "metadata": {"category": "standard", "domain": "civil"},
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
     )
+
+    with pytest.raises(ValueError, match="citation leakage"):
+        load_and_validate(
+            leaky_path,
+            expected_count=1,
+            expected_categories={"standard": 1},
+            reject_citation_leakage=True,
+        )

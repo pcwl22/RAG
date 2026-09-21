@@ -13,27 +13,19 @@ Industrial RAG 是一个面向中文法律文本的本地知识库问答项目�
 
 > 本项目用于知识检索和技术验证，不构成法律意见。正式业务使用时，应由具备资质的专业人员复核法律依据、法规时效和个案事实。
 
-## 质量基线（需发布前重新验证）
+## 发布质量状态
 
-当前评估集包含 240 条分层样本：140 条常规法条、40 条对抗性表达、20 条跨法条比较和 40 条无答案问题。
+截至 2026-09-20，发布质量门禁已解除，当前实现已批准为生产基线。真实 PostgreSQL +
+Embedding + Reranker 的 240 条完整检索评估 citation recall@5 为 0.9909，对抗集和比较集均为
+1.0000，无答案拒答率为 1.0000；150 条独立保留集 citation recall@5 为 0.9867、MRR@5 为
+0.9383。使用 `deepseek-flash` 官方端点完成的 40 条代表性正式裁判评估中，answer accuracy 为
+0.7500、faithfulness 为 0.8417、上下文精度为 0.9944、上下文召回为 0.9239，全部达到发布阈值。
 
-| 指标 | 当前结果 |
-|---|---:|
-| 域内 Citation Recall@5 | 1.0000 |
-| 域内 Citation MRR@5 | 0.9545 |
-| 对抗问题 Citation Recall@5 | 1.0000 |
-| 跨法条比较 Citation Recall@5 | 1.0000 |
-| 无答案拒答率 | 1.0000 |
-| Ragas Answer Accuracy | 0.9625 |
-| Ragas Faithfulness | 0.9141 |
-| Ragas Context Precision | 1.0000（历史基线） |
-| Ragas Context Recall | 1.0000 |
+`validate_evaluation_assets.py` 会拒绝引用泄漏；`validate_release_baseline.py` 已通过 3 个受保护
+数据集、12 项质量检查和实现指纹校验。批准基线绑定本次评测使用的模型及端点身份；运行时仍可
+通过 `.env` 切换模型、API Key 和 URL，但身份改变后必须重新执行受保护评测并批准新基线。
 
-上述数字是历史评估基线，不代表当前工作树的实时结果。发布前必须重新生成完整检索报告、
-Ragas 报告和 release gate；生成报告位于被忽略的 `industrial-rag/data/`，应在 CI artifact
-或评估存储中保留数据集、模型、提示词和代码版本信息。
-
-后端目前收集 166 项自动化测试（包含真实 pgvector 集成测试），覆盖率约 69%，并通过 Ruff、评估集完整性门禁、前端测试、生产构建和 Compose 配置验证。
+测试数量、覆盖率和质量门禁结果由 CI 实时生成，不在 README 中维护容易过期的数字。
 
 ## 主要功能
 
@@ -181,9 +173,28 @@ REDIS_PASSWORD=replace-with-a-third-strong-password
 REDIS_URL=redis://:replace-with-a-third-strong-password@localhost:16379/0
 COMPOSE_REDIS_URL=redis://:replace-with-a-third-strong-password@redis:6379/0
 DEEPSEEK_API_KEY=replace-with-your-key
+DEEPSEEK_API_URL=https://api.deepseek.com/v1
+DEEPSEEK_MODEL=deepseek-chat
 ```
 
 也可以切换到 Claude 或智谱，具体 provider 在 `industrial-rag/config/laptop.yaml` 中配置。
+
+如需切换 OpenAI-compatible 网关、模型或密钥，可在 `industrial-rag` 目录执行原子切换命令。密钥通过隐藏输入读取，不会出现在命令行、日志或命令输出中；只切换 URL/model 时会保留现有密钥：
+
+```powershell
+python scripts\switch_llm_env.py --env-file .env --api-url https://api.deepseek.com/v1 --model deepseek-chat --prompt-api-key
+python scripts\switch_llm_env.py --env-file .env --api-url https://gateway.example.com/v1 --model approved-model
+```
+
+如果同一 `.env` 中按空行保存了多组完整配置，并用 `#` 注释备用组，可在不回显密钥的情况下列出并激活指定组。一个组包含多个模型时必须用 `--profile-model` 明确选择：
+
+```powershell
+python scripts\switch_llm_env.py --env-file .env --list-profiles
+python scripts\switch_llm_env.py --env-file .env --activate-profile 3
+python scripts\switch_llm_env.py --env-file .env --activate-profile 1 --profile-model approved-model
+```
+
+切换会在写入前校验全部新值，并以同目录临时文件原子替换 `.env`；重复变量、带凭据或查询参数的 URL、非本机 HTTP 地址会被拒绝。应用和评测进程在启动时读取配置，因此切换后需重启相应进程/容器。发布评测报告仍绑定 URL 的非敏感哈希与模型名，切换后不能沿用旧 checkpoint 或审批结果。
 
 > 不要提交 `.env`。仓库只跟踪不含真实凭据的 `.env.example`。
 
@@ -203,10 +214,10 @@ docker compose --env-file industrial-rag\.env ps
 ```powershell
 Set-Location industrial-rag
 pwsh -File scripts\setup_gpu_env.ps1 -EnvironmentName industrial-rag
-conda run -n industrial-rag python -m pip install -e .
 ```
 
-脚本会先从 PyTorch CUDA 12.1 专用索引安装 PyTorch，再安装固定版本依赖，并运行 CUDA smoke test。
+脚本会先从 PyTorch CUDA 12.6 专用索引安装经过 SHA-256 校验的 PyTorch，
+再安装完整哈希锁、以 `--no-deps` 安装项目元数据，并运行 `pip check` 与 CUDA smoke test。
 
 如果环境已经创建，可以单独检查：
 
@@ -336,6 +347,10 @@ OIDC 前后端配置一致。主 `docker-compose.yml` 是可移植的 CPU 配置
 `POSTGRES_PASSWORD` 完成 DDL，并创建或轮换 `rag_runtime`；API 和 worker 只使用
 `POSTGRES_APP_PASSWORD` 对应的非所有者账号。两个密码必须不同。
 
+本地 Compose 会在 `postgres_tls` 命名卷中生成仅用于该栈的自签 PostgreSQL 证书，
+API、worker 和迁移任务统一以 `sslmode=verify-full` 校验 `postgres` 主机名。该证书只用于
+本机容器化验收；生产 Kustomize 部署仍必须挂载组织签发的 CA 与服务端证书，不能复用本地卷。
+
 ```powershell
 docker compose --env-file industrial-rag\.env `
   --profile api `
@@ -371,12 +386,13 @@ docker compose --env-file industrial-rag\.env `
 - API：<http://127.0.0.1:18000>
 - API 文档：<http://127.0.0.1:18000/docs>
 
-API 镜像基于官方 PyTorch 2.4.0 + CUDA 12.1 runtime，但主 Compose 默认以 CPU
-运行；GPU 覆盖文件才申请 NVIDIA 设备。worker 保持 CPU，避免在单张显卡上重复
-加载模型。模型目录以只读方式挂载到 `/app/models`。如果只运行前端容器并把 API
+API 镜像基于固定 digest 的官方 PyTorch 2.13.0 + CUDA 12.6 runtime，但主 Compose
+默认以 CPU 运行；GPU 覆盖文件才申请 NVIDIA 设备。worker 使用独立固定 digest 的
+Python 3.12 基础镜像和 CPU Torch 载体，避免在单张显卡上重复加载模型。模型目录以
+只读方式挂载到 `/app/models`。如果只运行前端容器并把 API
 运行在主机，请设置：
 
-首次构建需要拉取较大的官方 PyTorch runtime 基础镜像。API 和 worker 共享同一基础层，建议顺序构建以充分复用本地镜像缓存。
+首次构建需要拉取较大的官方 PyTorch runtime 基础镜像。
 
 ```dotenv
 RAG_API_UPSTREAM=http://host.docker.internal:8000
@@ -513,6 +529,7 @@ Invoke-RestMethod `
 
 - `RAG_ENV=laptop`：Windows 主机运行，数据库端口为 15432，模型路径为本地绝对路径。
 - `RAG_ENV=base`：Docker/服务器运行，服务通过 Compose DNS 名连接，模型路径为 `/app/models`。
+- `RAG_SECURE_MODE=true`：共享或生产环境的安全运行模式，强制 OIDC HTTPS 和 Redis TLS；仅本机回环验收可设为 `false`。
 - `rag.retrieval.top_k`：默认最终上下文数量。
 - `rag.retrieval.similarity_threshold`：首轮检索最低分。
 - `reranker.score_threshold`：交叉编码器绝对相关性阈值。
@@ -532,19 +549,25 @@ Invoke-RestMethod `
 ### 评估数据
 
 - `eval/legal_core.jsonl`：9 条核心法律回归样本。
-- `eval/legal_expanded_240.jsonl`：240 条分层全量检索集。
-- `eval/legal_expanded_ragas_40.jsonl`：40 条平衡 Ragas 代表集。
+- `eval/legal_expanded_240.jsonl`：240 条分层全量检索集，已通过引用泄漏检查。
+- `eval/legal_expanded_ragas_40.jsonl`：40 条平衡 Ragas 代表集，已通过引用泄漏检查。
+- `eval/legal_holdout_150.jsonl`：150 条事实情景 holdout 集，发布评估必须包含且通过泄漏检查。
 
-扩展集可从当前 PostgreSQL 法条语料按固定种子重建：
+扩展集由已筛查的事实情景 holdout 按固定种子重建，不从目标法条反向拼接问题：
 
 ```powershell
 Set-Location industrial-rag
 python scripts\build_expanded_eval.py `
-  --tenant-id 00000000-0000-0000-0000-000000000001 `
   --output eval\legal_expanded_240.jsonl
 python scripts\sample_eval_suite.py `
   --input eval\legal_expanded_240.jsonl `
   --output eval\legal_expanded_ragas_40.jsonl
+```
+
+重建后必须运行泄漏检查；任何未通过的数据都不能进入发布评估：
+
+```powershell
+python scripts\validate_evaluation_assets.py
 ```
 
 ### 全量本地检索评估
@@ -557,6 +580,9 @@ python scripts\evaluate_retrieval_suite.py `
   --output data\ragas_eval\legal_expanded_240_retrieval.json `
   --top-k 5
 ```
+
+检索评估通过生产同款 `build_retrieval_engine()` 工厂创建引擎，并在初始化数据库前拒绝
+引用泄漏数据。发布还必须对 `eval/legal_holdout_150.jsonl` 执行同样的无泄漏校验。
 
 ### 导出增强 RAG 运行结果
 
@@ -574,7 +600,7 @@ python scripts\export_lrage.py `
 建议使用独立评估环境，避免与 GPU 推理环境的依赖发生冲突：
 
 ```powershell
-pip install -r requirements-evaluation.txt
+pip install --require-hashes -r requirements-evaluation.lock.txt
 
 python scripts\evaluate_ragas.py `
   --input data\lrage_exports\legal_expanded_ragas_40.jsonl `
@@ -582,7 +608,7 @@ python scripts\evaluate_ragas.py `
   --max-tokens 8192
 ```
 
-默认裁判为 `deepseek-chat`。评估问题、答案和上下文会发送到配置的裁判端点；Ragas telemetry 在脚本中关闭。
+默认裁判从 `DEEPSEEK_MODEL` 读取，未配置时回退到 `deepseek-chat`。评估问题、答案和上下文会发送到配置的裁判端点；Ragas telemetry 在脚本中关闭。评测请求默认串行执行，并对限流/连接瞬态错误做有界重试；可用 `--max-concurrency`、`--max-retries` 和 `--retry-backoff-seconds` 调整，但发布门禁建议保持默认值。
 
 ### 质量门禁
 
@@ -651,8 +677,9 @@ Set-Location industrial-rag
 python scripts\validate_production_env.py --env-file .env
 ```
 
-该门禁要求非占位强密钥、独立的数据库管理员/运行时密码、Celery、OIDC HTTPS 和
-`rediss://`。本地 Keycloak/Redis 验收可显式附加 `--allow-local-http`；此参数不应用于生产。
+该门禁要求非占位强密钥、独立的数据库管理员/运行时密码、Celery、`RAG_SECURE_MODE=true`、
+OIDC HTTPS 和 `rediss://`。本地 Keycloak/Redis 验收可显式附加 `--allow-local-http`；
+此参数不应用于生产。
 
 ### PostgreSQL 备份与恢复
 
@@ -692,6 +719,8 @@ python scripts\restore_postgres.py `
 - 生产模式下，如果启用了 API Key 却未配置安全值，应用会拒绝启动。
 - 错误响应不会向客户端返回底层异常和数据库细节。
 - 上传文件名会被规范化，metadata 必须是合法 JSON 对象，文件大小和格式均受限制。
+- Celery 上传会先写入租户隔离的 S3 对象及服务端 manifest；任务消息只携带 `tenant_id` 和
+  `object_key`，Worker 在自身临时目录下载，成功删除对象，处理失败转入失败保留前缀。
 
 ## 监控与健康检查
 
@@ -712,10 +741,12 @@ Prometheus 指标默认只在 `/internal/metrics` 暴露。生产环境应设置
 由规范化后的实际 SQL 内容计算。
 
 发布基线不仅校验评估数据集，还绑定检索、分块、Prompt、Embedding、Reranker 和生成
-实现的统一 SHA-256。修改这些路径后，`validate_release_baseline.py` 会失败，必须重跑
-240 条检索集、40 条 RAGAS 代表集和两级质量门禁，再批准新的实现指纹：
+实现的统一 SHA-256。修改这些路径后，`validate_release_baseline.py` 会失败，必须先通过
+无泄漏的 240 条检索集、40 条 Ragas 代表集和 150 条 holdout 集评估，再批准新的实现指纹：
 
 ```powershell
+python scripts\validate_evaluation_assets.py
+python scripts\evaluate_retrieval_suite.py --input eval\legal_expanded_240.jsonl --output data\ragas_eval\legal_expanded_240_retrieval.json --top-k 5
 python scripts\validate_release_baseline.py
 python scripts\validate_release_baseline.py --print-implementation-sha256
 ```
@@ -731,7 +762,7 @@ pwsh -File industrial-rag\scripts\setup_gpu_env.ps1 -EnvironmentName industrial-
 conda run -n industrial-rag python industrial-rag\scripts\check_cuda.py
 ```
 
-确认输出包含 `torch_cuda_build: "12.1"` 和 `cuda_available: true`。
+确认输出包含 `torch_cuda_build: "12.6"` 和 `cuda_available: true`。
 
 ### PostgreSQL 连接失败
 
@@ -745,7 +776,8 @@ docker compose --env-file industrial-rag\.env logs --tail 100 postgres
 ### Redis 不可用
 
 `laptop` profile 中 Redis 是可选缓存，连接失败时会降级运行；`base` 生产 profile 会要求
-带密码的 Redis URL，设置 `REDIS_REQUIRE_TLS=true` 时还必须使用 `rediss://`。Celery 模式下
+带密码的 Redis URL，设置 `REDIS_REQUIRE_TLS=true` 或 `RAG_SECURE_MODE=true` 时还必须使用
+`rediss://`。Celery 模式下
 Redis 同时承担任务传输，故不可按可选依赖处理。生产 profile 的租户限流默认 fail-closed，
 Redis 限流后端不可用时返回 503；仅 laptop profile 显式允许 fail-open。
 
@@ -771,7 +803,7 @@ Reranker 使用绝对相关性阈值，低于阈值时返回 0 条是合法结�
 - 当前受控映射和评估重点覆盖民法、刑法、劳动法；扩展到新部门法时应同步增加真实语料和回归集。
 - 无答案识别依赖语料范围和检索证据，不能替代完备的法律领域分类器。
 - API Key 适合单服务边界，不提供用户级授权。
-- Ragas 指标受裁判模型影响，发布门禁同时保留确定性的 Citation Recall/MRR。
+- Ragas 指标受裁判模型和外部端点可用性影响，发布门禁同时保留确定性的 Citation Recall/MRR；裁判端点不可用时门禁必须失败关闭。
 - 法律法规可能更新，生产知识库必须记录来源、版本、生效状态和废止状态。
 
 ## 参与开发

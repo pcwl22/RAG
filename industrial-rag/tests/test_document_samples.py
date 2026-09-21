@@ -17,6 +17,26 @@ def test_parse_real_docx_sample(tmp_path):
     assert "Second paragraph from docx." in parsed
 
 
+def test_parse_real_docx_sample_keeps_tables_in_document_order(tmp_path):
+    from docx import Document
+
+    path = tmp_path / "table.docx"
+    document = Document()
+    document.add_paragraph("Before table")
+    table = document.add_table(rows=2, cols=2)
+    table.cell(0, 0).text = "name"
+    table.cell(0, 1).text = "status"
+    table.cell(1, 0).text = "pump"
+    table.cell(1, 1).text = "ok"
+    document.add_paragraph("After table")
+    document.save(path)
+
+    parsed = parse_document(str(path))
+
+    assert parsed.index("Before table") < parsed.index("| name | status |") < parsed.index("After table")
+    assert "| pump | ok |" in parsed
+
+
 def test_parse_real_xlsx_sample(tmp_path):
     import pandas as pd
 

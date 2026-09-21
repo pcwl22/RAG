@@ -55,12 +55,19 @@ python scripts/validate_evaluation_assets.py
 python scripts/validate_release_baseline.py
 ```
 
-For the lightweight CI/test environment, install `requirements-ci.txt`. For
-the verified Windows CUDA stack, use `requirements-gpu-verified.txt`; do not
-mix unconstrained upgrades into that environment.
+For the lightweight CI/test environment, install `requirements-ci.lock.txt` with
+`--require-hashes`. For the controlled Windows CUDA stack, run
+`scripts/setup_gpu_env.ps1`; it installs the SHA-256-locked CUDA 12.6 Torch
+carrier and then `requirements-gpu.lock.txt`. Linux workers use the separate
+CPU Torch carrier; API images inherit Torch only from the digest-pinned CUDA
+base. `requirements-runtime.lock.txt` intentionally excludes Torch itself so it
+cannot replace either carrier. Do not install the project with unconstrained
+dependencies in production.
 
-The starter retrieval benchmark is `eval/legal_core.jsonl`. See
+The starter retrieval benchmark is `eval/legal_core.jsonl`. The committed expanded and representative
+judge files are generated from the screened fact-pattern holdout and pass the leakage-aware asset
+validator. See `../README.md#发布质量状态` for the current release gate status. See
 `docs/lrage_export.md` for export and Recall/MRR scoring commands.
 
-For LLM-judged answer and context evaluation with Ragas, see
+For zero-exception, hash-locked LLM-judged answer and context evaluation, see
 `docs/ragas_evaluation.md`.

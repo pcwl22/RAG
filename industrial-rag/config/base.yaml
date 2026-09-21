@@ -20,12 +20,14 @@ llm:
       timeout: 60
       healthcheck_ttl_seconds: 30
     openai_compatible:
-      model_name: "deepseek-chat"
+      model_name: "${DEEPSEEK_MODEL}"
       api_key: "${DEEPSEEK_API_KEY}"
-      base_url: "https://api.deepseek.com/v1"
+      base_url: "${DEEPSEEK_API_URL}"
       temperature: 0.3
       max_tokens: 4096
       timeout: 60
+      max_retries: 2
+      retry_backoff_seconds: 0.5
       healthcheck_ttl_seconds: 30
     zhipu:
       model_name: "glm-4-plus"
@@ -45,6 +47,8 @@ embedding:
   model_revision: "bge-m3-local-2026-06"
   model_path: "/app/models/bge-m3"
   device: "cuda"
+  # Production GPU workloads must fail readiness if the accelerator is absent.
+  allow_cpu_fallback: false
   batch_size: 32
   max_length: 8192
   normalize_embeddings: true
@@ -60,12 +64,17 @@ reranker:
   model_name: "BAAI/bge-reranker-v2-m3"
   model_path: "/app/models/bge-reranker-v2-m3"
   device: "cuda"
+  allow_cpu_fallback: false
   batch_size: 16
+  # Bound cross-encoder attention cost for unusually large parent chunks. Normal
+  # child chunks are much shorter, so this preserves useful evidence while
+  # preventing a single fallback candidate from saturating an 8 GB GPU.
+  max_length: 1024
   top_n: 5
-  # 重排后的绝对相关性阈值；多查询分数需再用原始问题统一重排后才可比较。
-  # 低于此值的文档被丢弃，允许返回 0 条（"无相关法条" 是合法答案）。
-  # null = 关闭阈值过滤（仅按概率排序后取 top_n）。需在真实法律语料上校准后再设值，建议从 0.5 起步。
-  score_threshold: 0.5
+  # 不对交叉编码器概率使用未经校准的绝对阈值。范围判定由确定性的
+  # out-of-scope 规则负责，相关性由排序与 top_n 控制；如重新启用阈值，
+  # 必须先在独立校准集上证明不会删除有效法条。
+  score_threshold: null
 
 postgres:
   host: "postgres"
@@ -73,12 +82,15 @@ postgres:
   database: "rag_db"
   user: "${POSTGRES_USER}"
   password: "${POSTGRES_PASSWORD}"
+  sslmode: "${POSTGRES_SSLMODE}"
+  sslrootcert: "${POSTGRES_SSLROOTCERT}"
   auto_migrate: false
   min_pool_size: 1
   max_pool_size: 10
   ivfflat_probes: 10
   connect_timeout: 5
   command_timeout: 60
+  lock_timeout: 5
   keepalives_idle: 30
   keepalives_interval: 10
   keepalives_count: 3
@@ -90,6 +102,10 @@ redis:
   decode_responses: true
   require_tls: false
   max_connections: 50
+  socket_connect_timeout_seconds: 2
+  socket_timeout_seconds: 2
+  operation_timeout_seconds: 2
+  health_check_interval_seconds: 30
 
   # 语义缓存配置
   semantic_cache:
@@ -97,6 +113,37 @@ redis:
     ttl: 3600  # 1小时
     # Deterministic context-aware answer cache. This is not vector similarity.
     cache_version: "1"
+
+# Celery producer delivery is at-least-once. Durable S3 manifests are scanned
+# after ambiguous publish failures and replayed with the original task id.
+queue:
+  provider: "memory"
+  reconciliation:
+    enabled: true
+    interval_seconds: 30
+    redispatch_after_seconds: 90
+    batch_size: 100
+    dispatch_lease_seconds: 60
+    max_dispatch_attempts: 10
+    completion_receipt_retention_seconds: 86400
+    producer_timeout_seconds: 10
+
+# S3-compatible object storage. Production Celery uploads must enable this
+# section; local memory mode may leave it disabled.
+object_storage:
+  enabled: false
+  endpoint_url: "${S3_ENDPOINT_URL}"
+  bucket: "${S3_BUCKET}"
+  region: "${S3_REGION}"
+  access_key_id: "${S3_ACCESS_KEY_ID}"
+  secret_access_key: "${S3_SECRET_ACCESS_KEY}"
+  require_tls: true
+  addressing_style: "path"
+  failed_prefix: "failed"
+  ca_bundle: "${S3_CA_BUNDLE}"
+  connect_timeout_seconds: 3
+  read_timeout_seconds: 15
+  max_pool_connections: 20
 
 # RabbitMQ配置
 rabbitmq:
@@ -147,22 +194,32 @@ document_processing:
 rag:
   # 检索配置
   retrieval:
-    top_k: 10
+    # Keep the deployed retrieval contract identical to the approved evaluation
+    # contract. Exact legal-citation lookup is implemented by the hybrid engine.
+    top_k: 5
     # 重排前的召回分兜底阈值，仅挡掉完全无关的召回；真正的相关性裁决交给重排器
     # （reranker.score_threshold，作用于 sigmoid 校准概率）。
     similarity_threshold: 0.05
     enable_rerank: true
-    max_chunks_per_document: 12
-    # 多查询召回后，用原始问题统一重排并动态裁剪生成上下文。
+    # 0 = 不在重排前按源文件截断；法典通常是一份文件，过早截断会丢掉正确条文。
+    # 最终上下文数量仍由 top_k 和动态上下文选择控制。
+    max_chunks_per_document: 0
+    rerank_min_candidates: 80
+    rerank_max_candidates: 120
+    # 多查询合并后保留足够候选，再用共同查询重排并动态裁剪生成上下文。
+    merge_candidate_multiplier: 8
     dynamic_context_selection: true
     flat_score_top_n: 2
     min_final_rerank_spread: 0.05
     min_final_rerank_gap: 0.08
-    enable_hybrid: false  # 混合检索（BM25+向量）
+    enable_hybrid: true  # 混合检索（BM25+向量）
     alpha: 0.5  # 混合权重
 
   # 生成配置
   generation:
+    answer_contract:
+      enabled: true
+      max_retries: 1
     system_prompt: |
       你是一个专业的问答助手。请基于提供的上下文信息回答用户问题。
       回答要求：
@@ -172,6 +229,8 @@ rag:
       4. 引用来源：在答案中标注信息来源
 
     max_context_length: 8000
+    temperature: 0.0
+    max_tokens: 1024
     context_template: |
       ## 相关文档 {index}
       **来源**: {source}

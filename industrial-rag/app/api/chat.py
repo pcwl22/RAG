@@ -55,6 +55,16 @@ class ChatResponse(BaseModel):
     sources: list[dict] | None = None
 
 
+def _last_user_message_and_history(
+    messages: list[Message],
+) -> tuple[Message | None, list[dict[str, str]]]:
+    """Select the current user turn and exclude any trailing stale messages."""
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].role == "user":
+            return messages[index], [message.model_dump() for message in messages[:index]]
+    return None, []
+
+
 @router.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest) -> ChatResponse:
     """
@@ -66,7 +76,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
     Returns:
         对话响应
     """
-    user_message = next((msg for msg in reversed(request.messages) if msg.role == "user"), None)
+    user_message, chat_history = _last_user_message_and_history(request.messages)
     if not user_message:
         raise HTTPException(status_code=400, detail="No user message found")
 
@@ -86,7 +96,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
             )
             result = await EnhancedQueryService().run(EnhancedQueryOptions(
                 query=user_message.content,
-                chat_history=[msg.model_dump() for msg in request.messages[:-1]],
+                chat_history=chat_history,
                 top_k=params.top_k,
                 similarity_threshold=params.similarity_threshold,
                 enable_rerank=params.enable_rerank,
@@ -127,9 +137,7 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
             generator = Generator()
 
             # 获取最后一条用户消息
-            user_message = next(
-                (msg for msg in reversed(request.messages) if msg.role == "user"), None
-            )
+            user_message, chat_history = _last_user_message_and_history(request.messages)
             if not user_message:
                 yield f"data: {json.dumps({'type': 'error', 'error': 'No user message found'}, ensure_ascii=False)}\n\n"
                 yield f"data: {json.dumps({'type': 'done', 'error': True}, ensure_ascii=False)}\n\n"
@@ -144,7 +152,7 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
                 )
                 options = EnhancedQueryOptions(
                     query=user_message.content,
-                    chat_history=[msg.model_dump() for msg in request.messages[:-1]],
+                    chat_history=chat_history,
                     top_k=params.top_k,
                     similarity_threshold=params.similarity_threshold,
                     enable_rerank=params.enable_rerank,

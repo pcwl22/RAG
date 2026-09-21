@@ -7,7 +7,7 @@ from app.parser.chunk import chunk_text_recursive
 from app.parser.document_parser import SUPPORTED_EXTENSIONS, parse_document
 from app.parser.legal_parser import build_legal_article_chunks
 from app.parser.parent_child_chunker import ParentChildChunker
-from app.parser.parent_child_chunking import chunk_text_parent_child
+from app.parser.parent_child_chunking import chunk_text_parent_child, create_parent_child_chunks
 
 
 def test_pdf_parser_honors_pymupdf_engine(monkeypatch):
@@ -35,6 +35,7 @@ def test_recursive_chunking_produces_chunks():
 
     assert chunks
     assert all(chunk.strip() for chunk in chunks)
+    assert all(len(chunk) <= 120 for chunk in chunks)
 
 
 def test_parent_child_chunking_shape():
@@ -45,6 +46,20 @@ def test_parent_child_chunking_shape():
     assert "parent_chunks" in result
     assert "child_chunks" in result
     assert result["child_chunks"]
+
+
+def test_parent_child_chunks_enforce_parent_and_child_hard_limits():
+    chunks = create_parent_child_chunks(
+        "甲" * 5000,
+        parent_size=500,
+        child_size=128,
+        child_overlap=64,
+        separators=[""],
+    )
+
+    assert chunks
+    assert all(len(chunk["parent_content"]) <= 500 for chunk in chunks)
+    assert all(len(chunk["child_content"]) <= 128 for chunk in chunks)
 
 
 def test_parent_child_chunker_counts_tokens_without_import_side_effects():
@@ -137,3 +152,21 @@ def test_legal_article_number_suffix_is_preserved_in_semantic_id():
     ]
     assert chunks[0]["metadata"]["semantic_chunk_id"].endswith("262条之一")
     assert chunks[1]["metadata"]["semantic_chunk_id"].endswith("262条之二")
+
+
+def test_exceptionally_long_legal_article_is_split_to_embedding_limit():
+    text = "中华人民共和国测试法\n\n第一条 " + ("超长法律条文内容。" * 500)
+
+    chunks = build_legal_article_chunks(
+        text,
+        "中华人民共和国测试法.txt",
+        max_chunk_size=128,
+        chunk_overlap=16,
+    )
+
+    assert len(chunks) > 1
+    assert all(0 < len(chunk["content"]) <= 128 for chunk in chunks)
+    assert all(chunk["metadata"]["article_number"] == "第一条" for chunk in chunks)
+    assert all(chunk["metadata"]["article_text"] == chunk["content"] for chunk in chunks)
+    assert chunks[0]["metadata"]["semantic_chunk_id"].endswith("1条")
+    assert chunks[1]["metadata"]["semantic_chunk_id"].endswith("1条_part_2")

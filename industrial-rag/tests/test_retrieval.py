@@ -69,6 +69,42 @@ def test_dense_deduplicates_by_document_and_chunk():
     assert [doc["id"] for doc in deduped] == ["a", "c"]
 
 
+def test_dense_retriever_preserves_explicit_legal_citation(monkeypatch):
+    exact = {
+        "id": "article-42",
+        "content": "劳动合同法第四十二条",
+        "score": 1.0,
+        "metadata": {},
+    }
+
+    async def no_vector_results(**_kwargs):
+        return []
+
+    async def exact_lookup(pairs, partition=None):
+        assert pairs == [("中华人民共和国劳动合同法", "第四十二条")]
+        assert partition == "legal"
+        return [exact]
+
+    monkeypatch.setattr(dense, "_retrieval_config", lambda: {"enable_rerank": False})
+    monkeypatch.setattr(dense, "encode_query", lambda _query: [0.0])
+    monkeypatch.setattr(dense.storage_adapter, "search", no_vector_results)
+    monkeypatch.setattr(
+        dense.storage_adapter,
+        "get_documents_by_citations",
+        exact_lookup,
+    )
+
+    results = asyncio.run(
+        dense.RetrievalEngine().retrieve(
+            "劳动合同法第四十二条如何规定？",
+            partition="legal",
+            enable_rerank=False,
+        )
+    )
+
+    assert results == [exact]
+
+
 def test_reranker_closed_when_model_unavailable(monkeypatch):
     docs = [
         {"id": "a", "score": 0.9, "content": "first"},
@@ -99,6 +135,43 @@ def test_reranker_open_falls_back_when_model_unavailable(monkeypatch):
     assert reranker.rerank_documents("query", docs, top_n=1) == [docs[0]]
 
 
+def test_reranker_can_defer_threshold_for_merged_candidates(monkeypatch):
+    class FakeReranker:
+        def predict(self, pairs, batch_size):
+            del pairs, batch_size
+            return [0.4]
+
+    monkeypatch.setattr(reranker, "load_reranker", lambda: FakeReranker())
+    monkeypatch.setattr(
+        reranker,
+        "_reranker_config",
+        lambda: {"enabled": True, "score_threshold": 0.5},
+    )
+
+    filtered = reranker.rerank_documents(
+        "query", [{"id": "candidate", "content": "law"}], top_n=1
+    )
+    deferred = reranker.rerank_documents(
+        "query",
+        [{"id": "candidate", "content": "law"}],
+        top_n=1,
+        apply_threshold=False,
+    )
+
+    assert filtered == []
+    assert [doc["id"] for doc in deferred] == ["candidate"]
+
+
+def test_reranker_uses_child_passage_when_parent_context_is_present():
+    doc = {
+        "content": "large parent context",
+        "child_content": "focused child passage",
+        "metadata": {"parent_content": "large parent context"},
+    }
+
+    assert reranker._reranker_document_text(doc) == "focused child passage"
+
+
 class _FakeSentenceTransformer:
     """Stand-in for SentenceTransformer that records truncation settings."""
 
@@ -116,7 +189,11 @@ def _load_with_embedding_config(monkeypatch, embed_config):
         "get_settings",
         lambda: {"embedding": {"model_path": "/fake/bge-m3", "device": "cpu", **embed_config}},
     )
-    monkeypatch.setattr(embedder, "resolve_torch_device", lambda device: "cpu")
+    monkeypatch.setattr(
+        embedder,
+        "resolve_torch_device",
+        lambda device, **_kwargs: "cpu",
+    )
 
     fake_module = types.SimpleNamespace(SentenceTransformer=_FakeSentenceTransformer)
     monkeypatch.setitem(sys.modules, "sentence_transformers", fake_module)
@@ -144,6 +221,25 @@ def test_embedding_max_length_above_model_limit_keeps_model_limit(monkeypatch):
 def test_embedding_max_length_absent_leaves_model_default(monkeypatch):
     model = _load_with_embedding_config(monkeypatch, {})
     assert model.max_seq_length == 8192
+
+
+def test_accelerator_fallback_is_rejected_for_strict_runtime(monkeypatch):
+    unavailable_torch = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(is_available=lambda: False)
+    )
+    monkeypatch.setitem(sys.modules, "torch", unavailable_torch)
+
+    with pytest.raises(RuntimeError, match="accelerator cuda is unavailable"):
+        embedder.resolve_torch_device("cuda", allow_cpu_fallback=False)
+
+
+def test_accelerator_fallback_remains_available_for_laptop_runtime(monkeypatch):
+    unavailable_torch = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(is_available=lambda: False)
+    )
+    monkeypatch.setitem(sys.modules, "torch", unavailable_torch)
+
+    assert embedder.resolve_torch_device("cuda", allow_cpu_fallback=True) == "cpu"
 
 
 def test_embedding_max_length_rejects_non_positive_values(monkeypatch):
@@ -184,6 +280,30 @@ def test_merge_prioritizes_controlled_article_ids():
 
     assert [doc["id"] for doc in results] == ["mapped-low"]
     assert results[0]["mapped_article_priority"] == 1
+    assert results[0]["source_relevance_score"] == 0.2
+    assert results[0]["source_retrieval_rank"] == 2
+    assert results[0]["source_query"] == "mapped query"
+    assert results[0]["query_retrieval_ranks"] == {"mapped query": 2}
+
+
+def test_merge_preserves_each_queries_independent_rank():
+    results = merge_retrieval_results(
+        [
+            [
+                {"id": "shared", "score": 0.3, "metadata": {}},
+                {"id": "first-only", "score": 0.2, "metadata": {}},
+            ],
+            [
+                {"id": "second-only", "score": 0.9, "metadata": {}},
+                {"id": "shared", "score": 0.8, "metadata": {}},
+            ],
+        ],
+        top_k=3,
+        queries=["original", "rewrite"],
+    )
+
+    shared = next(doc for doc in results if doc["id"] == "shared")
+    assert shared["query_retrieval_ranks"] == {"original": 1, "rewrite": 2}
 
 
 def test_legal_keyword_extraction_uses_query_terms_without_article_mapping():
@@ -252,6 +372,45 @@ def test_explicit_legal_citations_normalize_common_law_aliases():
     assert hybrid._explicit_legal_citations("劳动合同法实施条例第五条") == [
         ("中华人民共和国劳动合同法实施条例", "第五条")
     ]
+
+
+def test_explicit_provisions_expand_beyond_fuzzy_top_k(monkeypatch):
+    articles = ["第一条", "第二条", "第三条", "第四条", "第五条", "第六条"]
+
+    async def fake_hybrid_search(**kwargs):
+        return [{"id": "noise", "score": 0.9, "metadata": {}}]
+
+    async def fake_exact_lookup(citation_pairs, partition=None):
+        assert [article for _law, article in citation_pairs] == articles
+        return [
+            {
+                "id": f"exact-{article}",
+                "score": 1.0,
+                "content": article,
+                "metadata": {
+                    "law_name": "中华人民共和国民法典",
+                    "article_number": article,
+                },
+            }
+            for article in articles
+        ]
+
+    monkeypatch.setattr(hybrid, "encode_query", lambda query: [0.0])
+    monkeypatch.setattr(hybrid.storage_adapter, "hybrid_search", fake_hybrid_search)
+    monkeypatch.setattr(
+        hybrid.storage_adapter, "get_documents_by_citations", fake_exact_lookup
+    )
+
+    async def run():
+        results = await hybrid.HybridRetrievalEngine().retrieve(
+            "比较民法典第一条、第二条、第三条、第四条、第五条和第六条",
+            top_k=5,
+            enable_rerank=False,
+            similarity_threshold=0.0,
+        )
+        assert [doc["id"] for doc in results] == [f"exact-{article}" for article in articles]
+
+    asyncio.run(run())
 
 
 def test_internal_recall_query_cannot_trigger_exact_citation_lookup(monkeypatch):
@@ -416,6 +575,26 @@ def test_schema_metadata_allows_first_fingerprint_backfill(monkeypatch):
     )
 
 
+def test_embedding_fingerprint_changes_with_inference_runtime(monkeypatch):
+    versions = {
+        "torch": "2.13.0+cpu",
+        "transformers": "5.16.1",
+        "sentence-transformers": "6.0.0",
+        "tokenizers": "0.23.1",
+    }
+    monkeypatch.setattr(postgres_store, "_inference_runtime_versions", lambda: versions)
+    current = postgres_store._runtime_schema_metadata()["embedding_fingerprint"]
+
+    monkeypatch.setattr(
+        postgres_store,
+        "_inference_runtime_versions",
+        lambda: {**versions, "transformers": "5.16.2"},
+    )
+    upgraded = postgres_store._runtime_schema_metadata()["embedding_fingerprint"]
+
+    assert upgraded != current
+
+
 def test_retrievers_default_threshold_matches_config_default(monkeypatch):
     docs = [
         {"id": "low", "score": 0.04, "metadata": {"document_id": "doc1", "chunk_index": 0}},
@@ -443,3 +622,30 @@ def test_retrievers_default_threshold_matches_config_default(monkeypatch):
         assert [doc["id"] for doc in hybrid_results] == ["kept"]
 
     asyncio.run(run())
+
+
+def test_hybrid_engine_passes_runtime_fusion_switches(monkeypatch):
+    captured = {}
+
+    monkeypatch.setattr(
+        hybrid,
+        "_retrieval_config",
+        lambda: {
+            "enable_rrf": False,
+            "enable_dynamic_topk": False,
+            "similarity_threshold": 0.0,
+            "enable_rerank": False,
+        },
+    )
+    monkeypatch.setattr(hybrid, "encode_query", lambda query: [0.0])
+
+    async def fake_hybrid_search(**kwargs):
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(hybrid.storage_adapter, "hybrid_search", fake_hybrid_search)
+
+    asyncio.run(hybrid.HybridRetrievalEngine().retrieve("普通法律问题", enable_rerank=False))
+
+    assert captured["enable_rrf"] is False
+    assert captured["enable_dynamic_topk"] is False

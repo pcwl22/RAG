@@ -12,7 +12,7 @@ export const buildChatStorageKey = (user = null) => {
 }
 
 const compactMessage = (message = {}) => ({
-  role: message.role,
+  role: message.role === 'assistant' ? 'assistant' : 'user',
   content: String(message.content || '').slice(0, MAX_CONTENT_LENGTH),
   ...(message.createdAt ? { createdAt: message.createdAt } : {})
 })
@@ -42,5 +42,60 @@ export const saveSessions = (storage, key, sessions) => {
       console.warn('Unable to persist chat sessions:', error)
       return false
     }
+  }
+}
+
+const normalizeMessage = (message) => {
+  if (!message || typeof message !== 'object') return null
+  if (!['user', 'assistant'].includes(message.role) || typeof message.content !== 'string') {
+    return null
+  }
+  return compactMessage(message)
+}
+
+const normalizeSession = (session) => {
+  if (
+    !session ||
+    typeof session !== 'object' ||
+    typeof session.id !== 'string' ||
+    !session.id ||
+    session.id.length > 128
+  ) {
+    return null
+  }
+  if (!Array.isArray(session.messages)) return null
+  const messages = session.messages
+    .slice(-MAX_STORED_MESSAGES)
+    .map(normalizeMessage)
+    .filter(Boolean)
+  return {
+    id: session.id,
+    title: typeof session.title === 'string' && session.title
+      ? session.title.slice(0, 200)
+      : '未命名对话',
+    messageCount: messages.length,
+    createdAt: typeof session.createdAt === 'string'
+      ? session.createdAt.slice(0, 64)
+      : new Date(0).toISOString(),
+    updatedAt: typeof session.updatedAt === 'string'
+      ? session.updatedAt.slice(0, 64)
+      : new Date(0).toISOString(),
+    messages
+  }
+}
+
+export const loadSessions = (storage, key) => {
+  try {
+    const raw = storage.getItem(key)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return parsed
+      .slice(0, MAX_STORED_SESSIONS)
+      .map(normalizeSession)
+      .filter(Boolean)
+  } catch (error) {
+    console.warn('Unable to load chat sessions:', error)
+    return []
   }
 }

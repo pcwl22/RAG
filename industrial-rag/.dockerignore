@@ -1,0 +1,21 @@
+# Send only files consumed by the backend image contracts.  The build context
+# can be handled by a remote BuildKit instance, so local secrets, corpora,
+# uploads, test artifacts and caches must fail closed by default.
+**
+
+!.dockerignore
+!pyproject.toml
+!README.md
+!requirements-runtime.lock.txt
+!requirements-torch-cpu.lock.txt
+
+!app/
+!app/**
+!config/
+!config/**
+!prompts/
+!prompts/**
+!docker/
+!docker/**
+!scripts/
+!scripts/validate_model_bundle_manifest.py

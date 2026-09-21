@@ -19,11 +19,16 @@ class _Chunk:
         self.choices = [_Choice(content)]
 
 
+class _EmptyChunk:
+    choices = []
+
+
 class _Completions:
     async def create(self, **kwargs):
         assert kwargs["stream"] is True
 
         async def _chunks():
+            yield _EmptyChunk()
             yield _Chunk("第一段")
             await asyncio.sleep(0.25)
             yield _Chunk("第二段")
@@ -81,6 +86,34 @@ def test_llm_health_probe_is_cached():
         assert await client.check_health() is True
 
     asyncio.run(probe())
+    assert client._client.models.calls == 1
+
+
+def test_openai_sdk_async_paginator_is_consumed_by_health_probe():
+    class AsyncPaginator:
+        def __aiter__(self):
+            async def items():
+                yield {"id": "model"}
+
+            return items()
+
+    class Models:
+        def __init__(self):
+            self.calls = 0
+
+        def list(self):
+            self.calls += 1
+            return AsyncPaginator()
+
+    client = object.__new__(LLMClient)
+    client.provider = "openai_compatible"
+    client.config = {"healthcheck_ttl_seconds": 30}
+    client._client = type("Client", (), {"models": Models()})()
+    client._health_lock = asyncio.Lock()
+    client._health_checked_at = 0.0
+    client._health_available = False
+
+    assert asyncio.run(client.check_health()) is True
     assert client._client.models.calls == 1
 
 

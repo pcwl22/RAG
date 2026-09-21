@@ -1,0 +1,46 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-runtime-config
+  labels:
+    app.kubernetes.io/part-of: industrial-rag
+    industrial-rag/release-resource: "true"
+data:
+  # Public release metadata is deliberately stored in this immutable object.
+  # Reusing a RELEASE_ID with different signed images therefore fails before
+  # any stable Deployment is changed.  Secret values are never included.
+  RELEASE_ID: "__RAG_RELEASE_ID__"
+  API_IMAGE: "__RAG_API_IMAGE__"
+  WORKER_IMAGE: "__RAG_WORKER_IMAGE__"
+  FRONTEND_IMAGE: "__RAG_FRONTEND_IMAGE__"
+  MODEL_BUNDLE_IMAGE: "__RAG_MODEL_BUNDLE_IMAGE__"
+  RAG_ENV: "base"
+  RAG_SECURE_MODE: "true"
+  OIDC_ENABLED: "true"
+  QUEUE_PROVIDER: "celery"
+  POSTGRES_AUTO_MIGRATE: "false"
+  REDIS_REQUIRE_TLS: "true"
+  OBJECT_STORAGE_ENABLED: "true"
+  S3_REQUIRE_TLS: "true"
+  S3_ADDRESSING_STYLE: "__RAG_S3_ADDRESSING_STYLE__"
+  S3_FAILED_PREFIX: "__RAG_S3_FAILED_PREFIX__"
+  MODEL_BUNDLE_DIGEST: "sha256:REPLACE_WITH_APPROVED_MODEL_BUNDLE_DIGEST"
+  MODEL_MANIFEST_SHA256: "sha256:REPLACE_WITH_APPROVED_MODEL_MANIFEST_SHA256"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-frontend-config
+  labels:
+    app.kubernetes.io/part-of: industrial-rag
+    industrial-rag/release-resource: "true"
+data:
+  RAG_API_UPSTREAM: "http://rag-api:8000"
+  OIDC_CONNECT_SRC: "https://id.example.invalid"
+  TRUSTED_PROXY_CIDR: "192.0.2.0/24"
+  config.js: |-
+    window.__RAG_CONFIG__ = Object.freeze({
+      oidcIssuer: "__RAG_RUNTIME_OIDC_ISSUER__",
+      oidcClientId: "__RAG_RUNTIME_OIDC_CLIENT_ID__",
+      oidcAudience: "__RAG_RUNTIME_OIDC_AUDIENCE__"
+    });

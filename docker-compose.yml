@@ -11,6 +11,7 @@ services:
     environment:
       RAG_API_UPSTREAM: ${RAG_API_UPSTREAM:-http://api:8000}
       OIDC_CONNECT_SRC: ${OIDC_CONNECT_SRC:-http://localhost:18080}
+      TRUSTED_PROXY_CIDR: ${TRUSTED_PROXY_CIDR:-127.0.0.1/32}
     ports:
       - "${RAG_BIND_ADDRESS:-127.0.0.1}:${RAG_FRONTEND_PORT:-5173}:80"
     mem_limit: ${RAG_FRONTEND_MEMORY_LIMIT:-512m}
@@ -35,9 +36,12 @@ services:
       - ./industrial-rag/.env
     environment:
       RAG_ENV: base
+      RAG_SECURE_MODE: ${RAG_SECURE_MODE:-false}
       POSTGRES_USER: ${POSTGRES_RUNTIME_USER:-rag_runtime}
       POSTGRES_PASSWORD: ${POSTGRES_APP_PASSWORD:-}
       POSTGRES_AUTO_MIGRATE: "false"
+      POSTGRES_SSLMODE: verify-full
+      POSTGRES_SSLROOTCERT: /etc/rag/postgres-tls/server.crt
       QUEUE_PROVIDER: ${QUEUE_PROVIDER:-celery}
       RAG_API_KEY: ${RAG_API_KEY:?Set RAG_API_KEY in industrial-rag/.env}
       RAG_SERVICE_TENANT_ID: ${RAG_SERVICE_TENANT_ID:-00000000-0000-0000-0000-000000000001}
@@ -59,6 +63,7 @@ services:
     volumes:
       - ./models:/app/models:ro
       - ./industrial-rag/data:/app/data
+      - postgres_tls:/etc/rag/postgres-tls:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -88,9 +93,12 @@ services:
       - ./industrial-rag/.env
     environment:
       RAG_ENV: base
+      RAG_SECURE_MODE: ${RAG_SECURE_MODE:-false}
       POSTGRES_USER: ${POSTGRES_RUNTIME_USER:-rag_runtime}
       POSTGRES_PASSWORD: ${POSTGRES_APP_PASSWORD:-}
       POSTGRES_AUTO_MIGRATE: "false"
+      POSTGRES_SSLMODE: verify-full
+      POSTGRES_SSLROOTCERT: /etc/rag/postgres-tls/server.crt
       QUEUE_PROVIDER: ${QUEUE_PROVIDER:-celery}
       REDIS_URL: ${COMPOSE_REDIS_URL:-redis://:${REDIS_PASSWORD:-}@redis:6379/0}
       CELERY_BROKER_URL: ${COMPOSE_REDIS_URL:-redis://:${REDIS_PASSWORD:-}@redis:6379/0}
@@ -104,6 +112,7 @@ services:
     volumes:
       - ./models:/app/models:ro
       - ./industrial-rag/data:/app/data
+      - postgres_tls:/etc/rag/postgres-tls:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -111,6 +120,12 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.workers.healthcheck", "readiness"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
@@ -129,12 +144,38 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in industrial-rag/.env}
       POSTGRES_AUTO_MIGRATE: "true"
+      POSTGRES_SSLMODE: verify-full
+      POSTGRES_SSLROOTCERT: /etc/rag/postgres-tls/server.crt
       POSTGRES_RUNTIME_USER: ${POSTGRES_RUNTIME_USER:-rag_runtime}
       POSTGRES_RUNTIME_PASSWORD: ${POSTGRES_APP_PASSWORD:-}
     command: ["python", "-m", "app.vectorstore.migrate"]
+    volumes:
+      - postgres_tls:/etc/rag/postgres-tls:ro
     depends_on:
       postgres:
         condition: service_healthy
+    restart: "no"
+    security_opt:
+      - no-new-privileges:true
+
+  postgres-cert-init:
+    image: pgvector/pgvector:pg16@sha256:131dcf7ff6a900545df8e7e092c270aa8c6db2f2c818e408cb45ec21316b74e6
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        umask 077
+        mkdir -p /tls
+        if [ ! -s /tls/server.key ] || [ ! -s /tls/server.crt ]; then
+          openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 3650 \
+            -keyout /tls/server.key -out /tls/server.crt \
+            -subj "/CN=postgres" -addext "subjectAltName=DNS:postgres"
+        fi
+        chown 999:999 /tls/server.key /tls/server.crt
+        chmod 600 /tls/server.key
+        chmod 644 /tls/server.crt
+    volumes:
+      - postgres_tls:/tls
     restart: "no"
     security_opt:
       - no-new-privileges:true
@@ -153,6 +194,18 @@ services:
     pids_limit: ${RAG_POSTGRES_PIDS_LIMIT:-256}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - postgres_tls:/etc/postgresql/tls:ro
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/etc/postgresql/tls/server.crt
+      - -c
+      - ssl_key_file=/etc/postgresql/tls/server.key
+    depends_on:
+      postgres-cert-init:
+        condition: service_completed_successfully
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
@@ -261,5 +314,6 @@ services:
 
 volumes:
   postgres_data:
+  postgres_tls:
   redis_data:
   keycloak_data:

@@ -80,10 +80,21 @@ def _merge_splits(splits: list[str], chunk_size: int, chunk_overlap: int) -> lis
     current: list[str] = []
     current_len = 0
 
-    for split in splits:
-        split = split.strip()
-        if not split:
-            continue
+    bounded_splits = [
+        piece
+        for raw_split in splits
+        for piece in (
+            [raw_split.strip()]
+            if len(raw_split.strip()) <= chunk_size
+            else [
+                raw_split.strip()[index : index + chunk_size]
+                for index in range(0, len(raw_split.strip()), chunk_size)
+            ]
+        )
+        if piece
+    ]
+
+    for split in bounded_splits:
         sep_len = 1 if current else 0
         if current and current_len + sep_len + len(split) > chunk_size:
             chunk = "\n".join(current).strip()
@@ -100,7 +111,11 @@ def _merge_splits(splits: list[str], chunk_size: int, chunk_overlap: int) -> lis
                 overlap_len += part_len
             current = overlap_parts
             current_len = sum(len(part) for part in current) + max(0, len(current) - 1)
+            while current and current_len + 1 + len(split) > chunk_size:
+                current.pop(0)
+                current_len = sum(len(part) for part in current) + max(0, len(current) - 1)
 
+        sep_len = 1 if current else 0
         current.append(split)
         current_len += len(split) + sep_len
 

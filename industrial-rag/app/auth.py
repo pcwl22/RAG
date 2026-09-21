@@ -7,9 +7,18 @@ import os
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import UUID
 
 DEFAULT_TENANT_ID = "00000000-0000-0000-0000-000000000001"
+
+
+class OIDCAuthenticationError(ValueError):
+    """The bearer token itself is invalid and should receive HTTP 401."""
+
+
+class OIDCProviderUnavailable(RuntimeError):
+    """The identity provider/JWKS dependency could not validate any token."""
 
 
 @dataclass(frozen=True)
@@ -97,6 +106,16 @@ class OIDCValidator:
             allowed = {"RS256", "RS384", "RS512", "ES256", "ES384", "ES512"}
             if not self.algorithms or not set(self.algorithms).issubset(allowed):
                 raise RuntimeError("OIDC algorithms must use an approved asymmetric signature")
+            secure_mode = str(os.getenv("RAG_SECURE_MODE", "")).strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            if secure_mode:
+                for name, value in (("OIDC_ISSUER", self.issuer), ("OIDC_JWKS_URL", self.jwks_url)):
+                    if urlsplit(value).scheme != "https":
+                        raise RuntimeError(f"{name} must use https:// when RAG_SECURE_MODE is enabled")
 
     def _decode(self, token: str) -> Principal:
         try:
@@ -130,11 +149,51 @@ class OIDCValidator:
         )
 
     async def validate(self, token: str) -> Principal:
-        return await asyncio.to_thread(self._decode, token)
+        try:
+            return await asyncio.to_thread(self._decode, token)
+        except (OIDCAuthenticationError, OIDCProviderUnavailable):
+            raise
+        except (TimeoutError, ConnectionError, OSError) as exc:
+            raise OIDCProviderUnavailable("OIDC provider is unavailable") from exc
+        except Exception as exc:
+            # PyJWT deliberately separates signature/claim failures from JWKS
+            # transport failures.  Avoid importing the optional dependency at
+            # module import time while still preserving that distinction.
+            try:
+                import jwt
+            except ImportError:
+                raise OIDCProviderUnavailable("OIDC validator dependency is unavailable") from exc
+
+            invalid_token_types = tuple(
+                candidate
+                for candidate in (
+                    getattr(jwt, "InvalidTokenError", None),
+                    getattr(getattr(jwt, "exceptions", None), "InvalidTokenError", None),
+                    getattr(getattr(jwt, "exceptions", None), "PyJWKClientError", None),
+                )
+                if isinstance(candidate, type)
+            )
+            connection_type = getattr(
+                getattr(jwt, "exceptions", None),
+                "PyJWKClientConnectionError",
+                None,
+            )
+            jwk_set_type = getattr(getattr(jwt, "exceptions", None), "PyJWKSetError", None)
+            if isinstance(connection_type, type) and isinstance(exc, connection_type):
+                raise OIDCProviderUnavailable("OIDC JWKS endpoint is unavailable") from exc
+            if isinstance(jwk_set_type, type) and isinstance(exc, jwk_set_type):
+                raise OIDCProviderUnavailable("OIDC JWKS response is invalid") from exc
+            if invalid_token_types and isinstance(exc, invalid_token_types):
+                raise OIDCAuthenticationError("Invalid bearer token") from exc
+            if isinstance(exc, ValueError | KeyError | TypeError):
+                raise OIDCAuthenticationError("Invalid bearer token") from exc
+            raise OIDCProviderUnavailable("OIDC validation is unavailable") from exc
 
 
 __all__ = [
     "DEFAULT_TENANT_ID",
+    "OIDCAuthenticationError",
+    "OIDCProviderUnavailable",
     "OIDCValidator",
     "Principal",
     "current_principal",

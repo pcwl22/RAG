@@ -170,6 +170,26 @@ def test_oidc_rejects_symmetric_signature_algorithms(monkeypatch):
         validator.validate_configuration()
 
 
+def test_secure_mode_requires_https_oidc_endpoints(monkeypatch):
+    monkeypatch.setenv("RAG_SECURE_MODE", "true")
+    monkeypatch.delenv("OIDC_ENABLED", raising=False)
+    validator = OIDCValidator(
+        {
+            "security": {
+                "oidc": {
+                    "enabled": True,
+                    "issuer": "http://id.internal/realms/rag",
+                    "audience": "rag-api",
+                    "jwks_url": "http://id.internal/certs",
+                }
+            }
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="OIDC_ISSUER must use https"):
+        validator.validate_configuration()
+
+
 def test_api_key_middleware_protects_api_routes(monkeypatch):
     async def run():
         monkeypatch.setenv("RAG_API_KEY", "test-key")
@@ -269,7 +289,7 @@ def test_rejected_requests_still_carry_cors_headers(monkeypatch):
         origin = "https://ui.example.com"
         probe = FastAPI()
 
-        @probe.get("/api/v1/probe")
+        @probe.get("/api/v1/documents")
         async def probe_route():
             return {"ok": True}
 
@@ -297,12 +317,12 @@ def test_rejected_requests_still_carry_cors_headers(monkeypatch):
 
         transport = httpx.ASGITransport(app=probe)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-            rejected = await client.get("/api/v1/probe", headers={"Origin": origin})
+            rejected = await client.get("/api/v1/documents", headers={"Origin": origin})
             assert rejected.status_code == 401
             assert rejected.headers.get("access-control-allow-origin") == origin
 
             allowed = await client.get(
-                "/api/v1/probe",
+                    "/api/v1/documents",
                 headers={"Origin": origin, "X-API-Key": "probe-key"},
             )
             assert allowed.status_code == 200
@@ -414,6 +434,39 @@ def test_api_authorization_denies_unknown_write_routes(monkeypatch):
             return httpx.Response(200)
 
         assert (await middleware(request("/api/v1/chat"), endpoint)).status_code == 200
+        assert (await middleware(request("/api/v1/future-admin"), endpoint)).status_code == 403
+
+    asyncio.run(run())
+
+
+def test_api_authorization_denies_unknown_read_routes(monkeypatch):
+    async def run():
+        monkeypatch.setenv("RAG_API_KEY", "test-key")
+        monkeypatch.setenv("RAG_SERVICE_ROLES", "admin")
+        middleware = authentication_middleware(
+            {"security": {"api_key": {"enabled": True, "header_name": "X-API-Key"}}}
+        )
+
+        def request(path):
+            return Request(
+                {
+                    "type": "http",
+                    "http_version": "1.1",
+                    "method": "GET",
+                    "scheme": "http",
+                    "path": path,
+                    "raw_path": path.encode(),
+                    "query_string": b"",
+                    "headers": [(b"x-api-key", b"test-key")],
+                    "client": ("test", 123),
+                    "server": ("test", 80),
+                }
+            )
+
+        async def endpoint(_request):
+            return httpx.Response(200)
+
+        assert (await middleware(request("/api/v1/documents"), endpoint)).status_code == 200
         assert (await middleware(request("/api/v1/future-admin"), endpoint)).status_code == 403
 
     asyncio.run(run())

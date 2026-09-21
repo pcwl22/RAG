@@ -1,0 +1,4 @@
+# Zero-exception policy. The evaluation job uses a dependency-minimal native
+# text judge and every lock is audited without --ignore-vuln.
+schema_version = 2
+exceptions = []

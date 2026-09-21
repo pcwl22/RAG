@@ -240,6 +240,20 @@ def validate_runtime_matrix(root: Path = Path(".")) -> list[str]:
             errors.append(f"{relative}: API base image is not the approved immutable digest")
         if "requirements-torch-cpu.lock.txt" in content:
             errors.append(f"{relative}: CUDA API must not install the CPU Torch carrier")
+        for required_text in (
+            "ARG SECURITY_REFRESH=2026-09-21",
+            "--only-upgrade linux-libc-dev",
+            "pip uninstall --break-system-packages --yes",
+        ):
+            if required_text not in content:
+                errors.append(
+                    f"{relative}: missing API base security control {required_text!r}"
+                )
+        for unused in ("pillow", "spin", "torchaudio", "torchvision"):
+            if unused not in content:
+                errors.append(
+                    f"{relative}: unused API base package {unused!r} is not removed"
+                )
 
     for relative in ("docker/worker/Dockerfile", "docker/worker/Dockerfile.production"):
         content = (root / relative).read_text(encoding="utf-8")

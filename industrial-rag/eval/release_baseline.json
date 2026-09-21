@@ -72,7 +72,7 @@
       "scripts/validate_release_baseline.py",
       "security/evaluation_dependency_exceptions.toml"
     ],
-    "sha256": "916277e231c95d9c1621f4a366ae0de5c377c4c04a8f674562042c0af9056eb8"
+    "sha256": "276359b0cf7d3a40cf2597b38d5d2ae5d82e11182a89d20619ad57bd743cedd4"
   },
   "hash_contract_migration": {
     "from_schema_version": 8,
@@ -100,6 +100,27 @@
       "previous_base_digest": "sha256:09f7da3bc104798d0afb40bc08d23ab2da20a76130cec1f2ef170848f5d85217",
       "current_base_digest": "sha256:2f17fc044b579bab302c2e8054d3a686e2cb9a83de48e70534b94cd8ebbe06a9",
       "current_base_high_critical_findings": 0
+    },
+    {
+      "from_sha256": "916277e231c95d9c1621f4a366ae0de5c377c4c04a8f674562042c0af9056eb8",
+      "to_sha256": "276359b0cf7d3a40cf2597b38d5d2ae5d82e11182a89d20619ad57bd743cedd4",
+      "reason": "Refresh the API base operating-system security package and remove unused vulnerable image libraries without changing RAG application dependencies.",
+      "evaluation_results_reused": true,
+      "application_dependencies_changed": false,
+      "changed_paths": [
+        "docker/api/Dockerfile.production",
+        "scripts/validate_dependency_lock.py"
+      ],
+      "base_digest": "sha256:b2e6463673129d979402f11083769c9eaad9211487b6260f52525f55a0a82dac",
+      "security_refresh": "2026-09-21",
+      "linux_libc_dev_candidate": "6.8.0-139.139",
+      "removed_unused_base_packages": [
+        "pillow",
+        "spin",
+        "torchaudio",
+        "torchvision"
+      ],
+      "previous_scan_high_critical_findings": 148
     }
   ],
   "evaluation_contract": {

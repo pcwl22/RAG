@@ -5,6 +5,7 @@ FROM ghcr.io/pytorch/pytorch:2.13.0-cuda12.6-cudnn9-runtime@sha256:b2e6463673129
 WORKDIR /app
 
 ARG APT_MIRROR=""
+ARG SECURITY_REFRESH=2026-09-21
 
 ENV PIP_DEFAULT_TIMEOUT=1000 \
     PIP_RETRIES=10 \
@@ -18,6 +19,7 @@ COPY pyproject.toml README.md requirements-runtime.lock.txt ./
 # build-only helper and is removed in the same layer that creates the venv.
 # hadolint ignore=DL3008
 RUN set -eu; \
+    test -n "${SECURITY_REFRESH}"; \
     if [ -n "${APT_MIRROR}" ]; then \
         sed -i \
             -e "s|http://archive.ubuntu.com/ubuntu|${APT_MIRROR}|g" \
@@ -26,10 +28,12 @@ RUN set -eu; \
     fi; \
     apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=120 update; \
     apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=120 \
+        install -y --no-install-recommends --only-upgrade linux-libc-dev; \
+    apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=120 \
         install -y --no-install-recommends python3-venv; \
-    if python -m pip show spin >/dev/null 2>&1; then \
-        python -m pip uninstall --break-system-packages --yes spin; \
-    fi; \
+    python -m pip uninstall --break-system-packages --yes \
+        pillow spin torchaudio torchvision; \
+    python -m pip check; \
     python -m venv --system-site-packages /opt/venv; \
     /opt/venv/bin/python -c "import torch; assert torch.__version__.split('+', 1)[0] == '2.13.0'; assert str(torch.version.cuda).startswith('12.6')"; \
     /opt/venv/bin/pip install --no-cache-dir --timeout 1000 --retries 10 \

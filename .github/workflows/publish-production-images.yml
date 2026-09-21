@@ -323,6 +323,7 @@ jobs:
           scanners: vuln,secret,misconfig
           severity: CRITICAL,HIGH
           ignore-unfixed: true
+          timeout: 15m0s
           format: sarif
           output: ${{ runner.temp }}/industrial-rag-image-publish/trivy-api.sarif
           exit-code: 1
@@ -335,6 +336,7 @@ jobs:
           scanners: vuln,secret,misconfig
           severity: CRITICAL,HIGH
           ignore-unfixed: true
+          timeout: 15m0s
           format: sarif
           output: ${{ runner.temp }}/industrial-rag-image-publish/trivy-model-bundle.sarif
           exit-code: 1
@@ -347,6 +349,7 @@ jobs:
           scanners: vuln,secret,misconfig
           severity: CRITICAL,HIGH
           ignore-unfixed: true
+          timeout: 15m0s
           format: sarif
           output: ${{ runner.temp }}/industrial-rag-image-publish/trivy-worker.sarif
           exit-code: 1
@@ -359,6 +362,7 @@ jobs:
           scanners: vuln,secret,misconfig
           severity: CRITICAL,HIGH
           ignore-unfixed: true
+          timeout: 15m0s
           format: sarif
           output: ${{ runner.temp }}/industrial-rag-image-publish/trivy-frontend.sarif
           exit-code: 1

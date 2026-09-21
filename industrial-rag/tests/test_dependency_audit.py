@@ -210,6 +210,26 @@ def test_ci_enforces_all_lock_audits_and_release_policy() -> None:
                 assert step.get("with", {}).get("persist-credentials") == "false"
 
 
+def test_image_scans_allow_large_cuda_images_to_finish() -> None:
+    workflow_paths = (
+        PROJECT_ROOT.parent / ".github/workflows/ci.yml",
+        PROJECT_ROOT.parent / ".github/workflows/publish-production-images.yml",
+    )
+
+    for workflow_path in workflow_paths:
+        workflow = yaml.load(workflow_path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+        image_scans = [
+            step
+            for job in workflow["jobs"].values()
+            for step in job.get("steps", [])
+            if str(step.get("uses") or "").startswith("aquasecurity/trivy-action@")
+            and "image-ref" in step.get("with", {})
+        ]
+
+        assert image_scans, workflow_path
+        assert all(step["with"].get("timeout") == "15m0s" for step in image_scans)
+
+
 def test_workflows_and_images_do_not_install_project_through_pep517() -> None:
     dockerfiles = [
         PROJECT_ROOT / "docker/api/Dockerfile",

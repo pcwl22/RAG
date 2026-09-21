@@ -184,6 +184,7 @@ jobs:
           scanners: vuln,secret,misconfig
           severity: CRITICAL,HIGH
           ignore-unfixed: true
+          timeout: 15m0s
           exit-code: 1
       - name: Generate image SBOM
         uses: anchore/sbom-action@da167eac915b4e86f08b264dbdbc867b61be6f0c # v0.20.5
@@ -224,6 +225,7 @@ jobs:
           scanners: vuln,secret,misconfig
           severity: CRITICAL,HIGH
           ignore-unfixed: true
+          timeout: 15m0s
           exit-code: 1
       - name: Generate frontend image SBOM
         uses: anchore/sbom-action@da167eac915b4e86f08b264dbdbc867b61be6f0c # v0.20.5
@@ -317,6 +319,7 @@ jobs:
           scanners: vuln,secret,misconfig
           severity: CRITICAL,HIGH
           ignore-unfixed: true
+          timeout: 15m0s
           exit-code: 1
       - name: Generate production backend SBOM
         uses: anchore/sbom-action@da167eac915b4e86f08b264dbdbc867b61be6f0c # v0.20.5
@@ -364,6 +367,7 @@ jobs:
           scanners: vuln,secret,misconfig
           severity: CRITICAL,HIGH
           ignore-unfixed: true
+          timeout: 15m0s
           exit-code: 1
       - name: Generate production frontend SBOM
         uses: anchore/sbom-action@da167eac915b4e86f08b264dbdbc867b61be6f0c # v0.20.5

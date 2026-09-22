@@ -163,8 +163,6 @@ jobs:
             env.https_proxy=${{ env.BUILDKIT_PROXY_URL }}
             env.HTTP_PROXY=${{ env.BUILDKIT_PROXY_URL }}
             env.HTTPS_PROXY=${{ env.BUILDKIT_PROXY_URL }}
-            env.no_proxy=localhost,127.0.0.1
-            env.NO_PROXY=localhost,127.0.0.1
 
       - name: Build and push the approved model bundle
         id: build

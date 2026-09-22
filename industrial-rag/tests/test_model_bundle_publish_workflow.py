@@ -103,6 +103,28 @@ def test_model_bundle_publisher_installs_checksum_pinned_cosign() -> None:
     assert "sigstore/cosign-installer" not in source
 
 
+def test_model_bundle_publisher_routes_buildkit_through_protected_local_proxy() -> None:
+    source, workflow = _workflow()
+    job = workflow["jobs"]["publish"]
+    buildx = next(
+        step
+        for step in job["steps"]
+        if str(step.get("uses") or "").startswith("docker/setup-buildx-action@")
+    )
+    driver_opts = set(str(buildx["with"]["driver-opts"]).splitlines())
+
+    assert job["env"]["BUILDKIT_PROXY_URL"] == "${{ vars.BUILDKIT_PROXY_URL }}"
+    assert driver_opts == {
+        "env.http_proxy=${{ env.BUILDKIT_PROXY_URL }}",
+        "env.https_proxy=${{ env.BUILDKIT_PROXY_URL }}",
+        "env.HTTP_PROXY=${{ env.BUILDKIT_PROXY_URL }}",
+        "env.HTTPS_PROXY=${{ env.BUILDKIT_PROXY_URL }}",
+        "env.no_proxy=localhost,127.0.0.1",
+        "env.NO_PROXY=localhost,127.0.0.1",
+    }
+    assert "^http://host\\.docker\\.internal:([0-9]{1,5})$" in source
+
+
 def test_model_bundle_publisher_keeps_credentials_out_of_evidence() -> None:
     source, workflow = _workflow()
     steps = workflow["jobs"]["publish"]["steps"]

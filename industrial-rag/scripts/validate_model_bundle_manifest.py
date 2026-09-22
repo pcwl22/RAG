@@ -22,9 +22,12 @@ def tree_sha256(path: Path) -> str:
     """Hash relative names and file bytes in stable lexical order."""
     digest = hashlib.sha256()
     for file_path in sorted(
-        item
-        for item in path.rglob("*")
-        if item.is_file() and ".git" not in item.parts
+        (
+            item
+            for item in path.rglob("*")
+            if item.is_file() and ".git" not in item.parts
+        ),
+        key=lambda item: item.relative_to(path).as_posix(),
     ):
         relative = file_path.relative_to(path).as_posix().encode("utf-8")
         digest.update(len(relative).to_bytes(8, "big"))

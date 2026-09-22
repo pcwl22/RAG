@@ -72,7 +72,7 @@
       "scripts/validate_release_baseline.py",
       "security/evaluation_dependency_exceptions.toml"
     ],
-    "sha256": "276359b0cf7d3a40cf2597b38d5d2ae5d82e11182a89d20619ad57bd743cedd4"
+    "sha256": "95c9d8acdc820d679c4e5b3d24d15c50b78af2cd9e551d5b7c67745df7bec68f"
   },
   "hash_contract_migration": {
     "from_schema_version": 8,
@@ -121,6 +121,20 @@
         "torchvision"
       ],
       "previous_scan_high_critical_findings": 148
+    },
+    {
+      "from_sha256": "276359b0cf7d3a40cf2597b38d5d2ae5d82e11182a89d20619ad57bd743cedd4",
+      "to_sha256": "95c9d8acdc820d679c4e5b3d24d15c50b78af2cd9e551d5b7c67745df7bec68f",
+      "reason": "Make model-bundle tree hashing deterministic across Windows and Linux path-order semantics.",
+      "evaluation_results_reused": true,
+      "application_dependencies_changed": false,
+      "model_weights_changed": false,
+      "retrieval_behavior_changed": false,
+      "changed_paths": [
+        "scripts/validate_model_bundle_manifest.py"
+      ],
+      "failed_publication_run_id": 35676237874,
+      "portable_model_manifest_sha256": "sha256:79eebe4fea21710238cff534662107d35dfc065f8725122a684d5ad843b56c94"
     }
   ],
   "evaluation_contract": {

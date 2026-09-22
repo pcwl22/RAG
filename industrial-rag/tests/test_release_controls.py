@@ -40,7 +40,7 @@ from scripts.validate_kubernetes_manifests import (
 from scripts.validate_kubernetes_manifests import (
     validate_manifest as validate_kubernetes_manifest,
 )
-from scripts.validate_model_bundle_manifest import validate_manifest
+from scripts.validate_model_bundle_manifest import tree_sha256, validate_manifest
 from scripts.validate_release_baseline import (
     CURRENT_SCHEMA_VERSION,
     HASH_CONTRACT,
@@ -479,6 +479,32 @@ def test_model_bundle_manifest_is_generated_from_exact_model_trees(tmp_path):
 
     assert validate_manifest(manifest_path, models_root) == []
     assert build_manifest(models_root)["models"]["bge-m3"]["sha256"]
+
+
+def test_model_bundle_tree_hash_uses_platform_independent_path_order(tmp_path):
+    model_root = tmp_path / "model"
+    (model_root / "assets").mkdir(parents=True)
+    contents = {
+        "README.md": b"uppercase path\n",
+        "alpha.txt": b"lowercase path\n",
+        "assets/.metadata": b"hidden path\n",
+        "assets/Z.bin": b"nested uppercase path\n",
+    }
+    for relative, content in contents.items():
+        target = model_root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+
+    expected = hashlib.sha256()
+    for relative in sorted(contents):
+        relative_bytes = relative.encode("utf-8")
+        content = contents[relative]
+        expected.update(len(relative_bytes).to_bytes(8, "big"))
+        expected.update(relative_bytes)
+        expected.update(len(content).to_bytes(8, "big"))
+        expected.update(content)
+
+    assert tree_sha256(model_root) == expected.hexdigest()
 
 
 def test_production_manifest_renderer_replaces_every_release_placeholder(tmp_path):

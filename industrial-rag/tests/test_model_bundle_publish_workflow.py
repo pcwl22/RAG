@@ -84,6 +84,25 @@ def test_model_bundle_publisher_never_uses_mutable_release_references() -> None:
     assert ":latest" not in source
 
 
+def test_model_bundle_publisher_installs_checksum_pinned_cosign() -> None:
+    source, workflow = _workflow()
+    job = workflow["jobs"]["publish"]
+    env = job["env"]
+    steps = job["steps"]
+    install = next(step for step in steps if "checksum-pinned Cosign" in step["name"])
+    command = str(install["run"])
+
+    assert env["COSIGN_VERSION"] == "v3.1.2"
+    assert (
+        env["COSIGN_LINUX_AMD64_SHA256"]
+        == "f7622ed3cf22e55e1ae6377c080979ff77a22da9981c11df222a2e444991e7cf"
+    )
+    assert "releases/download/$COSIGN_VERSION/cosign-linux-amd64" in command
+    assert "sha256sum --check --strict" in command
+    assert "--proto '=https'" in command
+    assert "sigstore/cosign-installer" not in source
+
+
 def test_model_bundle_publisher_keeps_credentials_out_of_evidence() -> None:
     source, workflow = _workflow()
     steps = workflow["jobs"]["publish"]["steps"]

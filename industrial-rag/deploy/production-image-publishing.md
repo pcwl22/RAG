@@ -1,32 +1,44 @@
 # Production image publishing
 
-`.github/workflows/publish-production-images.yml` is the only repository-owned
-path that turns an approved model bundle and an exact source commit into
-production API, Worker, and Frontend image references.
+Two protected workflows form the image-publication chain:
+
+- `.github/workflows/publish-model-bundle.yml` packages operator-supplied,
+  revision-pinned Hugging Face files into a signed approved model bundle.
+- `.github/workflows/publish-production-images.yml` verifies that bundle and
+  turns an exact application source commit into production API, Worker,
+  Frontend, and repository-bound model image references.
 
 ## One-time GitHub configuration
 
-1. Create the `production-image-publish` environment. Require independent
+1. Create the `production-model-bundle` environment. Require reviewers and
+   restrict deployment branches to `main`. The model publisher runs only on a
+   one-job JIT Linux runner with a random dispatch-only label and a read-only
+   `/opt/rag-models` mount. Never leave this runner registered while idle.
+2. Create the `production-image-publish` environment. Require independent
    reviewers, prevent self-review, and restrict deployment branches to `main`.
    The workflow also rejects any source ref other than `refs/heads/main`.
-2. Add the protected environment variable
+3. Add the protected environment variable
    `MODEL_BUNDLE_CERTIFICATE_IDENTITY`. Its value must be the exact keyless
-   certificate identity of the approved internal or external model-builder
-   workflow, for example:
+   certificate identity of the approved model-builder workflow. For the
+   repository-owned publisher, use:
 
    ```text
-   https://github.com/MODEL_OWNER/MODEL_REPOSITORY/.github/workflows/publish-model-bundle.yml@refs/tags/model-v1
+   https://github.com/OWNER/REPOSITORY/.github/workflows/publish-model-bundle.yml@refs/heads/main
    ```
 
    Regular expressions and wildcard identities are not accepted. Also set
    `MODEL_BUNDLE_SOURCE_REPOSITORY` to that builder repository's exact URL and
    `MODEL_BUNDLE_SOURCE_REVISION` to the approved 40-character commit SHA. The
    workflow requires the image's source and revision labels to match both.
-3. Link the `api`, `worker`, `frontend`, and `model-bundle` GHCR packages to this
+4. Link the `approved-model-bundle`, `api`, `worker`, `frontend`, and
+   `model-bundle` GHCR packages to this
    repository so its scoped `GITHUB_TOKEN` can push signatures and attestations.
    Configure the immutable-tag policy where the registry supports it. Releases
    never consume tags; tags only aid discovery.
-4. In the protected `production` release environment, set
+5. Keep the approved model package private. GHCR creates new container packages
+   as private by default; repository visibility is not authorization to expose
+   the weights.
+6. In the protected `production` release environment, set
    `COSIGN_CERTIFICATE_IDENTITY` to the exact publisher identity:
 
    ```text
@@ -35,16 +47,31 @@ production API, Worker, and Frontend image references.
 
 ## Publishing
 
-Start **Publish production images** from the `main` branch and supply both:
+First register a JIT runner with the labels `self-hosted`, `Linux`, `X64`,
+`rag-model-bundle`, and a random `rag-model-bundle-<32 lowercase hex>` label.
+Mount only the local Hugging Face model directory at `/opt/rag-models:ro`, then
+start **Publish approved Hugging Face model bundle** from `main` with that exact
+label and the reviewed generated-manifest SHA-256. The workflow verifies these
+upstream revisions before reading the files:
+
+- `BAAI/bge-m3@5617a9f61b028005a4858fdac845db406aefb181`
+- `BAAI/bge-reranker-v2-m3@953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e`
+
+The runner is automatically de-registered after its one job. Preserve the
+`industrial-rag-approved-model-bundle` artifact; its `model-bundle.env` contains
+the digest-pinned image and exact signer/source values.
+
+Then start **Publish production images** from the `main` branch and supply both:
 
 - `model_bundle_image`: an approved, pullable OCI image from an internal or
   external registry, pinned as `registry/path@sha256:<64 hex>`
 - `model_manifest_sha256`: the `sha256:<64 hex>` digest of
   `/models/model-manifest.json` in that image
 
-The repository intentionally does not invent or download model weights. Its
-prerequisite is a separately approved, digest-pinned model bundle produced by the
-exact protected identity above. The job verifies that upstream signature, the
+The repository does not invent, download, or train model weights. The protected
+model workflow packages only the pre-existing operator-supplied files after
+verifying their Hugging Face origins, exact revisions, deterministic tree hashes,
+and approved manifest digest. The application-image job verifies that upstream signature, the
 exact source and revision labels, the manifest, and both model file trees. It then
 copies the verified `/models` tree into a repository-bound production model
 image. That derived image carries the application repository and exact

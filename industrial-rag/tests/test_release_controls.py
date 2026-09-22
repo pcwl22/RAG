@@ -1038,6 +1038,7 @@ def test_actionlint_knows_protected_self_hosted_runner_labels():
 
     assert set(config["self-hosted-runner"]["labels"]) == {
         "rag-evaluation-source",
+        "rag-model-bundle",
         "rag-production",
     }
 

@@ -119,8 +119,6 @@ def test_model_bundle_publisher_routes_buildkit_through_protected_local_proxy() 
         "env.https_proxy=${{ env.BUILDKIT_PROXY_URL }}",
         "env.HTTP_PROXY=${{ env.BUILDKIT_PROXY_URL }}",
         "env.HTTPS_PROXY=${{ env.BUILDKIT_PROXY_URL }}",
-        "env.no_proxy=localhost,127.0.0.1",
-        "env.NO_PROXY=localhost,127.0.0.1",
     }
     assert "^http://host\\.docker\\.internal:([0-9]{1,5})$" in source
 

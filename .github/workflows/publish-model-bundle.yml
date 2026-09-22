@@ -1,0 +1,269 @@
+name: Publish approved Hugging Face model bundle
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: One-time JIT runner label (rag-model-bundle- plus 32 lowercase hex characters)
+        required: true
+        type: string
+      model_manifest_sha256:
+        description: Expected SHA-256 of the generated model-manifest.json, including sha256 prefix
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+concurrency:
+  group: production-model-bundle
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    environment:
+      name: production-model-bundle
+    runs-on:
+      - self-hosted
+      - Linux
+      - X64
+      - rag-model-bundle
+      - ${{ inputs.runner_label }}
+    timeout-minutes: 180
+    env:
+      MODEL_SOURCE_ROOT: /opt/rag-models
+      BGE_M3_MODEL_ID: BAAI/bge-m3
+      BGE_M3_REVISION: 5617a9f61b028005a4858fdac845db406aefb181
+      BGE_M3_SOURCE: https://huggingface.co/BAAI/bge-m3
+      BGE_RERANKER_MODEL_ID: BAAI/bge-reranker-v2-m3
+      BGE_RERANKER_REVISION: 953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e
+      BGE_RERANKER_SOURCE: https://huggingface.co/BAAI/bge-reranker-v2-m3
+      EXPECTED_MANIFEST_SHA256: ${{ inputs.model_manifest_sha256 }}
+      REQUESTED_RUNNER_LABEL: ${{ inputs.runner_label }}
+      COSIGN_CERTIFICATE_OIDC_ISSUER: https://token.actions.githubusercontent.com
+
+    steps:
+      - name: Check out the exact protected source revision
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Validate the protected Hugging Face source trees
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          if [[ ! "$REQUESTED_RUNNER_LABEL" =~ ^rag-model-bundle-[0-9a-f]{32}$ ]]; then
+            echo "runner_label is not a one-time model-bundle label" >&2
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_MANIFEST_SHA256" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "model_manifest_sha256 must be a lowercase sha256 digest" >&2
+            exit 1
+          fi
+          test -d "$MODEL_SOURCE_ROOT"
+          test ! -L "$MODEL_SOURCE_ROOT"
+
+          verify_source() {
+            local directory="$1"
+            local expected_source="$2"
+            local expected_revision="$3"
+            test -d "$directory/.git"
+            test "$(git -c safe.directory="$directory" -C "$directory" remote get-url origin)" = "$expected_source"
+            test "$(git -c safe.directory="$directory" -C "$directory" rev-parse HEAD)" = "$expected_revision"
+            test "$(git -c safe.directory="$directory" -C "$directory" rev-parse refs/remotes/origin/main)" = "$expected_revision"
+          }
+
+          verify_source "$MODEL_SOURCE_ROOT/bge-m3" "$BGE_M3_SOURCE" "$BGE_M3_REVISION"
+          verify_source \
+            "$MODEL_SOURCE_ROOT/bge-reranker-v2-m3" \
+            "$BGE_RERANKER_SOURCE" \
+            "$BGE_RERANKER_REVISION"
+
+          model_build_dir="$RUNNER_TEMP/approved-model-bundle"
+          evidence_dir="$RUNNER_TEMP/approved-model-bundle-evidence"
+          mkdir -p "$model_build_dir" "$evidence_dir"
+          python industrial-rag/scripts/build_model_bundle_manifest.py \
+            --models-root "$MODEL_SOURCE_ROOT" \
+            --output "$model_build_dir/model-manifest.json"
+          python industrial-rag/scripts/validate_model_bundle_manifest.py \
+            "$model_build_dir/model-manifest.json" \
+            --models-root "$MODEL_SOURCE_ROOT"
+          actual_manifest_sha="sha256:$(sha256sum "$model_build_dir/model-manifest.json" | awk '{print $1}')"
+          test "$actual_manifest_sha" = "$EXPECTED_MANIFEST_SHA256"
+          cp "$model_build_dir/model-manifest.json" "$evidence_dir/model-manifest.json"
+          {
+            echo "MODEL_BUILD_DIR=$model_build_dir"
+            echo "MODEL_EVIDENCE_DIR=$evidence_dir"
+            echo "MODEL_MANIFEST_SHA256=$actual_manifest_sha"
+          } >> "$GITHUB_ENV"
+
+      - name: Authenticate to the repository package namespace
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$REGISTRY_TOKEN"
+          printf '%s' "$REGISTRY_TOKEN" | \
+            docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: "v3.1.2"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build and push the approved model bundle
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_repository="ghcr.io/${GITHUB_REPOSITORY,,}/approved-model-bundle"
+          image_tag="hf-$GITHUB_SHA"
+          metadata_file="$MODEL_BUILD_DIR/build-metadata.json"
+
+          tar \
+            --exclude='.git' \
+            --exclude='*/.git' \
+            --transform='s#^bge-m3#models/bge-m3#' \
+            --transform='s#^bge-reranker-v2-m3#models/bge-reranker-v2-m3#' \
+            -C "$MODEL_SOURCE_ROOT" -cf - \
+            bge-m3 bge-reranker-v2-m3 \
+            -C "$MODEL_BUILD_DIR" model-manifest.json \
+            -C "$GITHUB_WORKSPACE/industrial-rag/docker/model-bundle" Dockerfile | \
+            docker buildx build \
+              --file Dockerfile \
+              --platform linux/amd64 \
+              --push \
+              --provenance=false \
+              --sbom=false \
+              --metadata-file "$metadata_file" \
+              --build-arg "SOURCE_REVISION=$GITHUB_SHA" \
+              --build-arg "SOURCE_REPOSITORY=https://github.com/$GITHUB_REPOSITORY" \
+              --build-arg "MODEL_MANIFEST_SHA256=$MODEL_MANIFEST_SHA256" \
+              --tag "$image_repository:$image_tag" \
+              -
+
+          image_digest="$(python -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["containerimage.digest"])' "$metadata_file")"
+          if [[ ! "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Buildx did not return an immutable image digest" >&2
+            exit 1
+          fi
+          image_ref="$image_repository@$image_digest"
+          {
+            echo "MODEL_BUNDLE_IMAGE=$image_ref"
+            echo "MODEL_BUNDLE_DIGEST=$image_digest"
+            echo "MODEL_BUNDLE_TAG=$image_repository:$image_tag"
+          } >> "$GITHUB_ENV"
+          {
+            echo "image=$image_ref"
+            echo "digest=$image_digest"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Sign and verify the immutable model bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          signer_identity="https://github.com/$GITHUB_REPOSITORY/.github/workflows/publish-model-bundle.yml@refs/heads/main"
+          cosign sign --yes "$MODEL_BUNDLE_IMAGE"
+          cosign verify \
+            --certificate-identity "$signer_identity" \
+            --certificate-oidc-issuer "$COSIGN_CERTIFICATE_OIDC_ISSUER" \
+            --certificate-github-workflow-sha "$GITHUB_SHA" \
+            "$MODEL_BUNDLE_IMAGE" > "$MODEL_EVIDENCE_DIR/signature-verification.json"
+
+          docker pull "$MODEL_BUNDLE_IMAGE"
+          test "$(docker image inspect --format '{{ index .Config.Labels \"org.opencontainers.image.source\" }}' "$MODEL_BUNDLE_IMAGE")" = "https://github.com/$GITHUB_REPOSITORY"
+          test "$(docker image inspect --format '{{ index .Config.Labels \"org.opencontainers.image.revision\" }}' "$MODEL_BUNDLE_IMAGE")" = "$GITHUB_SHA"
+          test "$(docker image inspect --format '{{ index .Config.Labels \"org.opencontainers.image.model-manifest-sha256\" }}' "$MODEL_BUNDLE_IMAGE")" = "$MODEL_MANIFEST_SHA256"
+
+          model_container="$(docker create "$MODEL_BUNDLE_IMAGE" /nonexistent)"
+          trap 'docker rm -f "$model_container" >/dev/null 2>&1 || true' EXIT
+          docker cp \
+            "${model_container}:/models/model-manifest.json" \
+            "$MODEL_EVIDENCE_DIR/published-model-manifest.json"
+          docker rm "$model_container" >/dev/null
+          trap - EXIT
+          published_manifest_sha="sha256:$(sha256sum "$MODEL_EVIDENCE_DIR/published-model-manifest.json" | awk '{print $1}')"
+          test "$published_manifest_sha" = "$MODEL_MANIFEST_SHA256"
+
+      - name: Write immutable publication evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          evidence_dir = Path(os.environ["MODEL_EVIDENCE_DIR"])
+          manifest = json.loads((evidence_dir / "model-manifest.json").read_text(encoding="utf-8"))
+          record = {
+              "schema_version": 1,
+              "image": os.environ["MODEL_BUNDLE_IMAGE"],
+              "digest": os.environ["MODEL_BUNDLE_DIGEST"],
+              "manifest_sha256": os.environ["MODEL_MANIFEST_SHA256"],
+              "source_repository": f"https://github.com/{os.environ['GITHUB_REPOSITORY']}",
+              "source_revision": os.environ["GITHUB_SHA"],
+              "signer_identity": (
+                  f"https://github.com/{os.environ['GITHUB_REPOSITORY']}"
+                  "/.github/workflows/publish-model-bundle.yml@refs/heads/main"
+              ),
+              "models": {
+                  "bge-m3": {
+                      "model_id": os.environ["BGE_M3_MODEL_ID"],
+                      "huggingface_revision": os.environ["BGE_M3_REVISION"],
+                      "source": os.environ["BGE_M3_SOURCE"],
+                      "tree_sha256": manifest["models"]["bge-m3"]["sha256"],
+                  },
+                  "bge-reranker-v2-m3": {
+                      "model_id": os.environ["BGE_RERANKER_MODEL_ID"],
+                      "huggingface_revision": os.environ["BGE_RERANKER_REVISION"],
+                      "source": os.environ["BGE_RERANKER_SOURCE"],
+                      "tree_sha256": manifest["models"]["bge-reranker-v2-m3"]["sha256"],
+                  },
+              },
+          }
+          (evidence_dir / "model-bundle.json").write_text(
+              json.dumps(record, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          (evidence_dir / "model-bundle.env").write_text(
+              "\n".join(
+                  (
+                      f"MODEL_BUNDLE_IMAGE={record['image']}",
+                      f"MODEL_MANIFEST_SHA256={record['manifest_sha256']}",
+                      f"MODEL_BUNDLE_SOURCE_REPOSITORY={record['source_repository']}",
+                      f"MODEL_BUNDLE_SOURCE_REVISION={record['source_revision']}",
+                      f"MODEL_BUNDLE_CERTIFICATE_IDENTITY={record['signer_identity']}",
+                  )
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Upload approved model-bundle evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: industrial-rag-approved-model-bundle
+          path: ${{ runner.temp }}/approved-model-bundle-evidence
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Remove registry credentials
+        if: ${{ always() }}
+        shell: bash
+        run: docker logout ghcr.io >/dev/null 2>&1 || true

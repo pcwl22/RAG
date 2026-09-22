@@ -114,12 +114,13 @@ infrastructure, not a highly available production topology.
 - Build and scan every production Dockerfile in CI. Require the exact protected Cosign certificate
   identity, source repository label, release commit label, OCI digest, and model-manifest digest
   before rendering manifests.
-- Treat the approved model bundle as an external prerequisite. This repository does not contain a
-  `publish-model-bundle` workflow and the application-image workflow must not imply that it trained,
-  downloaded, or independently approved those weights. Before dispatching
-  `.github/workflows/publish-production-images.yml`, place the approved bundle under the protected
-  `ghcr.io/<owner>/<repository>/...@sha256:<digest>` namespace and obtain the exact SHA-256 of
-  `/models/model-manifest.json`.
+- Treat the approved model bundle as a separately protected prerequisite. The repository-owned
+  `publish-model-bundle` workflow packages only operator-supplied, revision-pinned Hugging Face
+  files; it must not train or download weights. Run it on a random-label, one-job JIT Linux runner
+  with only the model directory mounted read-only, preserve its evidence artifact, and keep the
+  resulting GHCR package private. Before dispatching `.github/workflows/publish-production-images.yml`,
+  obtain the approved `ghcr.io/<owner>/<repository>/...@sha256:<digest>` reference and the exact
+  SHA-256 of `/models/model-manifest.json` from that artifact.
 - Protect the `production-image-publish` environment with required reviewers and configure
   `MODEL_BUNDLE_CERTIFICATE_IDENTITY` as the exact keyless signer URI (an internal or external
   GitHub workflow is allowed), `MODEL_BUNDLE_SOURCE_REPOSITORY` as that workflow's exact GitHub

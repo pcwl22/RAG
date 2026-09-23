@@ -1,6 +1,6 @@
 # Immutable multi-platform index digest for the official PyTorch 2.13/CUDA 12.6 runtime.
 # GHCR remains reachable in environments where Docker Hub authentication is blocked.
-FROM ghcr.io/pytorch/pytorch:2.13.0-cuda12.6-cudnn9-runtime@sha256:b2e6463673129d979402f11083769c9eaad9211487b6260f52525f55a0a82dac
+FROM ghcr.io/pytorch/pytorch:2.14.0-cuda12.6-cudnn9-runtime@sha256:ac7effd0cd05c10c7ae8458b7c864fea6eaccfed31123db648bb080085635901
 
 WORKDIR /app
 

@@ -231,6 +231,26 @@ def test_image_scans_allow_large_cuda_images_to_finish() -> None:
         assert all(step["with"].get("timeout") == "15m0s" for step in image_scans)
 
 
+def test_production_sarif_scans_preserve_the_high_critical_gate() -> None:
+    workflow_path = PROJECT_ROOT.parent / ".github/workflows/publish-production-images.yml"
+    workflow = yaml.load(workflow_path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+    sarif_scans = [
+        step
+        for job in workflow["jobs"].values()
+        for step in job.get("steps", [])
+        if str(step.get("uses") or "").startswith("aquasecurity/trivy-action@")
+        and step.get("with", {}).get("format") == "sarif"
+    ]
+
+    assert len(sarif_scans) == 4
+    assert all(step["with"].get("severity") == "CRITICAL,HIGH" for step in sarif_scans)
+    assert all(
+        step["with"].get("limit-severities-for-sarif") == "true"
+        for step in sarif_scans
+    )
+    assert all(step["with"].get("exit-code") == "1" for step in sarif_scans)
+
+
 def test_workflows_and_images_do_not_install_project_through_pep517() -> None:
     dockerfiles = [
         PROJECT_ROOT / "docker/api/Dockerfile",

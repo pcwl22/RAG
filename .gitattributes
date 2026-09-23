@@ -1,0 +1,4 @@
+# The signed model-source descriptor has a byte-level release digest. Keep its
+# bytes identical on Windows and Linux checkouts.
+industrial-rag/model-sources/model-manifest.json text eol=lf
+industrial-rag/docker/model-bundle/model-manifest.example.json text eol=lf

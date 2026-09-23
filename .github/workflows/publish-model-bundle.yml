@@ -1,16 +1,7 @@
-name: Publish approved Hugging Face model bundle
+name: Publish approved Hugging Face model source descriptor
 
 on:
   workflow_dispatch:
-    inputs:
-      runner_label:
-        description: One-time JIT runner label (rag-model-bundle- plus 32 lowercase hex characters)
-        required: true
-        type: string
-      model_manifest_sha256:
-        description: Expected SHA-256 of the generated model-manifest.json, including sha256 prefix
-        required: true
-        type: string
 
 permissions:
   contents: read
@@ -18,34 +9,19 @@ permissions:
   id-token: write
 
 concurrency:
-  group: production-model-bundle
+  group: production-model-source
   cancel-in-progress: false
 
 jobs:
   publish:
     environment:
       name: production-model-bundle
-    runs-on:
-      - self-hosted
-      - Linux
-      - X64
-      - rag-model-bundle
-      - ${{ inputs.runner_label }}
-    timeout-minutes: 180
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     env:
-      MODEL_SOURCE_ROOT: /opt/rag-models
-      BGE_M3_MODEL_ID: BAAI/bge-m3
-      BGE_M3_REVISION: 5617a9f61b028005a4858fdac845db406aefb181
-      BGE_M3_SOURCE: https://huggingface.co/BAAI/bge-m3
-      BGE_RERANKER_MODEL_ID: BAAI/bge-reranker-v2-m3
-      BGE_RERANKER_REVISION: 953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e
-      BGE_RERANKER_SOURCE: https://huggingface.co/BAAI/bge-reranker-v2-m3
-      EXPECTED_MANIFEST_SHA256: ${{ inputs.model_manifest_sha256 }}
-      REQUESTED_RUNNER_LABEL: ${{ inputs.runner_label }}
       COSIGN_CERTIFICATE_OIDC_ISSUER: https://token.actions.githubusercontent.com
       COSIGN_VERSION: v3.1.2
       COSIGN_LINUX_AMD64_SHA256: f7622ed3cf22e55e1ae6377c080979ff77a22da9981c11df222a2e444991e7cf
-      BUILDKIT_PROXY_URL: ${{ vars.BUILDKIT_PROXY_URL }}
 
     steps:
       - name: Check out the exact protected source revision
@@ -59,61 +35,29 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Validate the protected Hugging Face source trees
+      - name: Validate the immutable model source descriptor
         shell: bash
         run: |
           set -euo pipefail
           test "$GITHUB_REF" = "refs/heads/main"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          if [[ ! "$REQUESTED_RUNNER_LABEL" =~ ^rag-model-bundle-[0-9a-f]{32}$ ]]; then
-            echo "runner_label is not a one-time model-bundle label" >&2
-            exit 1
-          fi
-          if [[ ! "$EXPECTED_MANIFEST_SHA256" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "model_manifest_sha256 must be a lowercase sha256 digest" >&2
-            exit 1
-          fi
-          if [[ "$BUILDKIT_PROXY_URL" =~ ^http://host\.docker\.internal:([0-9]{1,5})$ ]]; then
-            proxy_port="${BASH_REMATCH[1]}"
-          else
-            echo "BUILDKIT_PROXY_URL must use the local host.docker.internal HTTP proxy" >&2
-            exit 1
-          fi
-          if (( proxy_port < 1 || proxy_port > 65535 )); then
-            echo "BUILDKIT_PROXY_URL contains an invalid port" >&2
-            exit 1
-          fi
-          test -d "$MODEL_SOURCE_ROOT"
-          test ! -L "$MODEL_SOURCE_ROOT"
 
-          verify_source() {
-            local directory="$1"
-            local expected_source="$2"
-            local expected_revision="$3"
-            test -d "$directory/.git"
-            test "$(git -c safe.directory="$directory" -C "$directory" remote get-url origin)" = "$expected_source"
-            test "$(git -c safe.directory="$directory" -C "$directory" rev-parse HEAD)" = "$expected_revision"
-            test "$(git -c safe.directory="$directory" -C "$directory" rev-parse refs/remotes/origin/main)" = "$expected_revision"
-          }
+          descriptor="industrial-rag/model-sources/model-manifest.json"
+          example="industrial-rag/docker/model-bundle/model-manifest.example.json"
+          generated="$RUNNER_TEMP/generated-model-manifest.json"
+          model_build_dir="$RUNNER_TEMP/approved-model-source"
+          evidence_dir="$RUNNER_TEMP/approved-model-source-evidence"
 
-          verify_source "$MODEL_SOURCE_ROOT/bge-m3" "$BGE_M3_SOURCE" "$BGE_M3_REVISION"
-          verify_source \
-            "$MODEL_SOURCE_ROOT/bge-reranker-v2-m3" \
-            "$BGE_RERANKER_SOURCE" \
-            "$BGE_RERANKER_REVISION"
+          python industrial-rag/scripts/validate_model_bundle_manifest.py "$descriptor"
+          python industrial-rag/scripts/build_model_bundle_manifest.py --output "$generated"
+          cmp --silent "$generated" "$descriptor"
+          cmp --silent "$descriptor" "$example"
 
-          model_build_dir="$RUNNER_TEMP/approved-model-bundle"
-          evidence_dir="$RUNNER_TEMP/approved-model-bundle-evidence"
           mkdir -p "$model_build_dir" "$evidence_dir"
-          python industrial-rag/scripts/build_model_bundle_manifest.py \
-            --models-root "$MODEL_SOURCE_ROOT" \
-            --output "$model_build_dir/model-manifest.json"
-          python industrial-rag/scripts/validate_model_bundle_manifest.py \
-            "$model_build_dir/model-manifest.json" \
-            --models-root "$MODEL_SOURCE_ROOT"
-          actual_manifest_sha="sha256:$(sha256sum "$model_build_dir/model-manifest.json" | awk '{print $1}')"
-          test "$actual_manifest_sha" = "$EXPECTED_MANIFEST_SHA256"
-          cp "$model_build_dir/model-manifest.json" "$evidence_dir/model-manifest.json"
+          cp "$descriptor" "$model_build_dir/model-manifest.json"
+          cp industrial-rag/docker/model-bundle/Dockerfile "$model_build_dir/Dockerfile"
+          cp "$descriptor" "$evidence_dir/model-manifest.json"
+          actual_manifest_sha="sha256:$(sha256sum "$descriptor" | awk '{print $1}')"
           {
             echo "MODEL_BUILD_DIR=$model_build_dir"
             echo "MODEL_EVIDENCE_DIR=$evidence_dir"
@@ -127,7 +71,7 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$REGISTRY_TOKEN"
-          printf '%s' "$REGISTRY_TOKEN" | \
+          printf '%s' "$REGISTRY_TOKEN" |
             docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
 
       - name: Install the checksum-pinned Cosign binary
@@ -149,7 +93,7 @@ jobs:
             --location \
             "https://github.com/sigstore/cosign/releases/download/$COSIGN_VERSION/cosign-linux-amd64" \
             --output "$cosign_path"
-          printf '%s  %s\n' "$COSIGN_LINUX_AMD64_SHA256" "$cosign_path" | \
+          printf '%s  %s\n' "$COSIGN_LINUX_AMD64_SHA256" "$cosign_path" |
             sha256sum --check --strict
           chmod 0500 "$cosign_path"
           "$cosign_path" version
@@ -157,43 +101,28 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-        with:
-          driver-opts: |
-            env.http_proxy=${{ env.BUILDKIT_PROXY_URL }}
-            env.https_proxy=${{ env.BUILDKIT_PROXY_URL }}
-            env.HTTP_PROXY=${{ env.BUILDKIT_PROXY_URL }}
-            env.HTTPS_PROXY=${{ env.BUILDKIT_PROXY_URL }}
 
-      - name: Build and push the approved model bundle
+      - name: Build and push the descriptor-only artifact
         id: build
         shell: bash
         run: |
           set -euo pipefail
-          image_repository="ghcr.io/${GITHUB_REPOSITORY,,}/approved-model-bundle"
-          image_tag="hf-$GITHUB_SHA"
-          metadata_file="$MODEL_BUILD_DIR/build-metadata.json"
+          image_repository="ghcr.io/${GITHUB_REPOSITORY,,}/approved-model-source"
+          image_tag="hf-source-$GITHUB_SHA"
+          metadata_file="$RUNNER_TEMP/approved-model-source-build-metadata.json"
 
-          tar \
-            --exclude='.git' \
-            --exclude='*/.git' \
-            --transform='s#^bge-m3#models/bge-m3#' \
-            --transform='s#^bge-reranker-v2-m3#models/bge-reranker-v2-m3#' \
-            -C "$MODEL_SOURCE_ROOT" -cf - \
-            bge-m3 bge-reranker-v2-m3 \
-            -C "$MODEL_BUILD_DIR" model-manifest.json \
-            -C "$GITHUB_WORKSPACE/industrial-rag/docker/model-bundle" Dockerfile | \
-            docker buildx build \
-              --file Dockerfile \
-              --platform linux/amd64 \
-              --push \
-              --provenance=false \
-              --sbom=false \
-              --metadata-file "$metadata_file" \
-              --build-arg "SOURCE_REVISION=$GITHUB_SHA" \
-              --build-arg "SOURCE_REPOSITORY=https://github.com/$GITHUB_REPOSITORY" \
-              --build-arg "MODEL_MANIFEST_SHA256=$MODEL_MANIFEST_SHA256" \
-              --tag "$image_repository:$image_tag" \
-              -
+          docker buildx build \
+            --file "$MODEL_BUILD_DIR/Dockerfile" \
+            --platform linux/amd64 \
+            --push \
+            --provenance=false \
+            --sbom=false \
+            --metadata-file "$metadata_file" \
+            --build-arg "SOURCE_REVISION=$GITHUB_SHA" \
+            --build-arg "SOURCE_REPOSITORY=https://github.com/$GITHUB_REPOSITORY" \
+            --build-arg "MODEL_MANIFEST_SHA256=$MODEL_MANIFEST_SHA256" \
+            --tag "$image_repository:$image_tag" \
+            "$MODEL_BUILD_DIR"
 
           image_digest="$(python -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["containerimage.digest"])' "$metadata_file")"
           if [[ ! "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
@@ -209,9 +138,10 @@ jobs:
           {
             echo "image=$image_ref"
             echo "digest=$image_digest"
+            echo "manifest_sha256=$MODEL_MANIFEST_SHA256"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Sign and verify the immutable model bundle
+      - name: Sign and verify the immutable source descriptor
         shell: bash
         run: |
           set -euo pipefail
@@ -224,15 +154,20 @@ jobs:
             "$MODEL_BUNDLE_IMAGE" > "$MODEL_EVIDENCE_DIR/signature-verification.json"
 
           docker pull "$MODEL_BUNDLE_IMAGE"
-          test "$(docker image inspect --format '{{ index .Config.Labels \"org.opencontainers.image.source\" }}' "$MODEL_BUNDLE_IMAGE")" = "https://github.com/$GITHUB_REPOSITORY"
-          test "$(docker image inspect --format '{{ index .Config.Labels \"org.opencontainers.image.revision\" }}' "$MODEL_BUNDLE_IMAGE")" = "$GITHUB_SHA"
-          test "$(docker image inspect --format '{{ index .Config.Labels \"org.opencontainers.image.model-manifest-sha256\" }}' "$MODEL_BUNDLE_IMAGE")" = "$MODEL_MANIFEST_SHA256"
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.source" }}' "$MODEL_BUNDLE_IMAGE")" = "https://github.com/$GITHUB_REPOSITORY"
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$MODEL_BUNDLE_IMAGE")" = "$GITHUB_SHA"
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.model-manifest-sha256" }}' "$MODEL_BUNDLE_IMAGE")" = "$MODEL_MANIFEST_SHA256"
+          test "$(docker image inspect --format '{{ index .Config.Labels "io.industrial-rag.model-weights" }}' "$MODEL_BUNDLE_IMAGE")" = "absent"
 
           model_container="$(docker create "$MODEL_BUNDLE_IMAGE" /nonexistent)"
           trap 'docker rm -f "$model_container" >/dev/null 2>&1 || true' EXIT
           docker cp \
-            "${model_container}:/models/model-manifest.json" \
+            "$model_container:/models/model-manifest.json" \
             "$MODEL_EVIDENCE_DIR/published-model-manifest.json"
+          if docker cp "$model_container:/models/bge-m3" "$RUNNER_TEMP/unexpected-model"; then
+            echo "descriptor artifact unexpectedly contains model weights" >&2
+            exit 1
+          fi
           docker rm "$model_container" >/dev/null
           trap - EXIT
           published_manifest_sha="sha256:$(sha256sum "$MODEL_EVIDENCE_DIR/published-model-manifest.json" | awk '{print $1}')"
@@ -250,7 +185,9 @@ jobs:
           evidence_dir = Path(os.environ["MODEL_EVIDENCE_DIR"])
           manifest = json.loads((evidence_dir / "model-manifest.json").read_text(encoding="utf-8"))
           record = {
-              "schema_version": 1,
+              "schema_version": 2,
+              "artifact_kind": "huggingface-model-source-descriptor",
+              "contains_model_weights": False,
               "image": os.environ["MODEL_BUNDLE_IMAGE"],
               "digest": os.environ["MODEL_BUNDLE_DIGEST"],
               "manifest_sha256": os.environ["MODEL_MANIFEST_SHA256"],
@@ -260,26 +197,13 @@ jobs:
                   f"https://github.com/{os.environ['GITHUB_REPOSITORY']}"
                   "/.github/workflows/publish-model-bundle.yml@refs/heads/main"
               ),
-              "models": {
-                  "bge-m3": {
-                      "model_id": os.environ["BGE_M3_MODEL_ID"],
-                      "huggingface_revision": os.environ["BGE_M3_REVISION"],
-                      "source": os.environ["BGE_M3_SOURCE"],
-                      "tree_sha256": manifest["models"]["bge-m3"]["sha256"],
-                  },
-                  "bge-reranker-v2-m3": {
-                      "model_id": os.environ["BGE_RERANKER_MODEL_ID"],
-                      "huggingface_revision": os.environ["BGE_RERANKER_REVISION"],
-                      "source": os.environ["BGE_RERANKER_SOURCE"],
-                      "tree_sha256": manifest["models"]["bge-reranker-v2-m3"]["sha256"],
-                  },
-              },
+              "models": manifest["models"],
           }
-          (evidence_dir / "model-bundle.json").write_text(
+          (evidence_dir / "model-source.json").write_text(
               json.dumps(record, ensure_ascii=False, indent=2) + "\n",
               encoding="utf-8",
           )
-          (evidence_dir / "model-bundle.env").write_text(
+          (evidence_dir / "model-source.env").write_text(
               "\n".join(
                   (
                       f"MODEL_BUNDLE_IMAGE={record['image']}",
@@ -294,11 +218,11 @@ jobs:
           )
           PY
 
-      - name: Upload approved model-bundle evidence
+      - name: Upload approved model-source evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: industrial-rag-approved-model-bundle
-          path: ${{ runner.temp }}/approved-model-bundle-evidence
+          name: industrial-rag-approved-model-source
+          path: ${{ runner.temp }}/approved-model-source-evidence
           if-no-files-found: error
           retention-days: 90
 

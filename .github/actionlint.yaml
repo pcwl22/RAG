@@ -1,5 +1,4 @@
 self-hosted-runner:
   labels:
     - rag-evaluation-source
-    - rag-model-bundle
     - rag-production

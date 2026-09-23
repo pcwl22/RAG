@@ -52,6 +52,36 @@ spec:
                 labelSelector:
                   matchLabels:
                     app.kubernetes.io/name: rag-api
+      initContainers:
+        - name: model-source-init
+          image: industrial-rag-api
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "app.embedding.model_bundle", "prepare"]
+          envFrom:
+            - configMapRef:
+                name: rag-runtime-config
+            - secretRef:
+                name: rag-runtime
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+              ephemeral-storage: "8Gi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+              ephemeral-storage: "16Gi"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: model-cache
+              mountPath: /app/models
       containers:
         - name: api
           image: industrial-rag-api
@@ -110,6 +140,9 @@ spec:
               mountPath: /app/data
             - name: logs
               mountPath: /app/logs
+            - name: model-cache
+              mountPath: /app/models
+              readOnly: true
       volumes:
         - name: tmp
           emptyDir: {}
@@ -117,6 +150,9 @@ spec:
           emptyDir: {}
         - name: logs
           emptyDir: {}
+        - name: model-cache
+          emptyDir:
+            sizeLimit: 16Gi
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -172,6 +208,36 @@ spec:
                 labelSelector:
                   matchLabels:
                     app.kubernetes.io/name: rag-worker
+      initContainers:
+        - name: model-source-init
+          image: industrial-rag-worker
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "app.embedding.model_bundle", "prepare"]
+          envFrom:
+            - configMapRef:
+                name: rag-runtime-config
+            - secretRef:
+                name: rag-runtime
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+              ephemeral-storage: "8Gi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+              ephemeral-storage: "16Gi"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: model-cache
+              mountPath: /app/models
       containers:
         - name: worker
           image: industrial-rag-worker
@@ -232,6 +298,9 @@ spec:
               mountPath: /app/data
             - name: logs
               mountPath: /app/logs
+            - name: model-cache
+              mountPath: /app/models
+              readOnly: true
       volumes:
         - name: tmp
           emptyDir: {}
@@ -239,6 +308,9 @@ spec:
           emptyDir: {}
         - name: logs
           emptyDir: {}
+        - name: model-cache
+          emptyDir:
+            sizeLimit: 16Gi
 ---
 apiVersion: apps/v1
 kind: Deployment

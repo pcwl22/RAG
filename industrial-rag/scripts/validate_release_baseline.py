@@ -36,6 +36,7 @@ REQUIRED_IMPLEMENTATION_PATHS = frozenset(
         "docker/model-bundle/Dockerfile.production",
         "docker/model-bundle/model-manifest.example.json",
         "docker/worker/Dockerfile.production",
+        "model-sources/model-manifest.json",
         "pyproject.toml",
         "requirements-evaluation.lock.txt",
         "requirements-evaluation.txt",

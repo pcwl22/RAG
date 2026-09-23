@@ -389,7 +389,10 @@ docker compose --env-file industrial-rag\.env `
 API 镜像基于固定 digest 的官方 PyTorch 2.13.0 + CUDA 12.6 runtime，但主 Compose
 默认以 CPU 运行；GPU 覆盖文件才申请 NVIDIA 设备。worker 使用独立固定 digest 的
 Python 3.12 基础镜像和 CPU Torch 载体，避免在单张显卡上重复加载模型。模型目录以
-只读方式挂载到 `/app/models`。如果只运行前端容器并把 API
+只读方式挂载到 `/app/models`。这是本地 Compose 的快速路径；受保护的 Kubernetes
+发布不会上传或嵌入权重，而是由 init container 按
+`industrial-rag/model-sources/model-manifest.json` 中的固定 Hugging Face commit 下载、
+校验后再以只读方式提供给 API/Worker。如果只运行前端容器并把 API
 运行在主机，请设置：
 
 首次构建需要拉取较大的官方 PyTorch runtime 基础镜像。

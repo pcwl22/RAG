@@ -11,7 +11,7 @@ import os
 import time
 from typing import Any
 
-from app.embedding.model_bundle import validate_runtime_model_manifest
+from app.embedding.model_bundle import prepare_runtime_model
 from app.utils.config import get_settings
 from app.utils.logger import get_logger
 from app.utils.metrics import EMBEDDING_DURATION, EMBEDDING_REQUESTS
@@ -97,7 +97,7 @@ def load_embedding_model() -> Any:
         return _embedding_model
 
     config = get_settings()
-    validate_runtime_model_manifest(config)
+    prepare_runtime_model(config, "bge-m3")
     embed_config = config["embedding"]
     model_path = embed_config["model_path"]
 

@@ -536,6 +536,7 @@ huggingface-hub==1.29.0 \
     --hash=sha256:b00f7782afc14db4bc6572763810a635bdfbab8623d957bfb553bd18e03852cd
     # via
     #   -c constraints-docker.txt
+    #   industrial-rag (pyproject.toml)
     #   sentence-transformers
     #   tokenizers
     #   transformers

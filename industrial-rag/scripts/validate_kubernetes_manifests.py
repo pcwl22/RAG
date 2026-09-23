@@ -52,6 +52,11 @@ _RELEASE_CONTAINER_ROLES = {
     ("Job", "rag-postgres-migration"): {"migration": "api"},
     ("Job", "rag-canary"): {"smoke": "api", "candidate-worker": "worker"},
 }
+_RELEASE_INIT_CONTAINER_ROLES = {
+    ("Deployment", "rag-api"): {"model-source-init": "api"},
+    ("Deployment", "rag-worker"): {"model-source-init": "worker"},
+    ("Job", "rag-canary"): {"model-source-init": "api"},
+}
 _WORKLOAD_SERVICE_ACCOUNTS = {
     ("Deployment", "rag-api"): "rag-api",
     ("Deployment", "rag-worker"): "rag-worker",
@@ -139,8 +144,23 @@ def _validate_pod_security_contract(kind: str, name: str, pod_spec: dict[str, An
         )
 
     init_containers = pod_spec.get("initContainers") or []
-    if init_containers:
-        errors.append(f"{kind}/{name} must not contain initContainers")
+    expected_init_containers = set(
+        (_RELEASE_INIT_CONTAINER_ROLES.get(workload_key) or {}).keys()
+    )
+    actual_init_names = [
+        str(container.get("name") or "")
+        for container in init_containers
+        if isinstance(container, dict)
+    ]
+    if (
+        len(init_containers) != len(expected_init_containers)
+        or len(actual_init_names) != len(expected_init_containers)
+        or set(actual_init_names) != expected_init_containers
+    ):
+        expected_text = ", ".join(sorted(expected_init_containers)) or "none"
+        errors.append(
+            f"{kind}/{name} must contain exactly these initContainers: {expected_text}"
+        )
 
     for container_kind, declared_containers in (
         ("container", containers),
@@ -200,6 +220,80 @@ def _container_gpu_contract(pod_spec: dict[str, Any], container_name: str) -> tu
     request = str((resources.get("requests") or {}).get("nvidia.com/gpu") or "")
     limit = str((resources.get("limits") or {}).get("nvidia.com/gpu") or "")
     return request, limit
+
+
+def _validate_model_cache_contract(
+    kind: str, name: str, pod_spec: dict[str, Any]
+) -> list[str]:
+    """Require one writable downloader and read-only model consumer mounts."""
+    consumers = {
+        ("Deployment", "rag-api"): {"api"},
+        ("Deployment", "rag-worker"): {"worker"},
+        ("Job", "rag-canary"): {"smoke", "candidate-worker"},
+    }.get((kind, name))
+    if consumers is None:
+        return []
+
+    errors: list[str] = []
+    init_containers = {
+        str(container.get("name") or ""): container
+        for container in pod_spec.get("initContainers") or []
+        if isinstance(container, dict)
+    }
+    initializer = init_containers.get("model-source-init") or {}
+    if initializer.get("command") != [
+        "python",
+        "-m",
+        "app.embedding.model_bundle",
+        "prepare",
+    ]:
+        errors.append(f"{kind}/{name} model-source-init must run the pinned downloader")
+
+    init_mount: dict[str, Any] = next(
+        (
+            mount
+            for mount in initializer.get("volumeMounts") or []
+            if mount.get("name") == "model-cache"
+        ),
+        {},
+    )
+    if init_mount.get("mountPath") != "/app/models" or init_mount.get("readOnly") is True:
+        errors.append(
+            f"{kind}/{name} model-source-init must mount writable model-cache at /app/models"
+        )
+
+    by_container = {
+        str(container.get("name") or ""): container
+        for container in pod_spec.get("containers") or []
+        if isinstance(container, dict)
+    }
+    for consumer_name in sorted(consumers):
+        consumer = by_container.get(consumer_name) or {}
+        mount: dict[str, Any] = next(
+            (
+                item
+                for item in consumer.get("volumeMounts") or []
+                if item.get("name") == "model-cache"
+            ),
+            {},
+        )
+        if mount.get("mountPath") != "/app/models" or mount.get("readOnly") is not True:
+            errors.append(
+                f"{kind}/{name} container {consumer_name} must mount model-cache read-only"
+            )
+
+    model_volume: dict[str, Any] = next(
+        (
+            volume
+            for volume in pod_spec.get("volumes") or []
+            if volume.get("name") == "model-cache"
+        ),
+        {},
+    )
+    empty_dir = model_volume.get("emptyDir")
+    if not isinstance(empty_dir, dict) or empty_dir.get("sizeLimit") != "16Gi":
+        errors.append(f"{kind}/{name} must provide a 16Gi emptyDir model-cache")
+    return errors
 
 
 def _valid_probe_port(value: Any, *, allow_named: bool) -> bool:
@@ -290,14 +384,27 @@ def validate_expected_release_images(
         seen.add((kind, name))
         pod_spec = ((item.get("spec") or {}).get("template") or {}).get("spec") or {}
         containers = pod_spec.get("containers") or []
-        if pod_spec.get("initContainers"):
-            errors.append(f"{kind}/{name} must not contain unbound initContainers")
+        init_containers = pod_spec.get("initContainers") or []
+        expected_init_containers = _RELEASE_INIT_CONTAINER_ROLES.get((kind, name)) or {}
         actual_names = {str(container.get("name") or "") for container in containers}
         if len(containers) != len(expected_containers) or actual_names != set(expected_containers):
             errors.append(f"{kind}/{name} must contain the exact bound container set")
-        for container in containers:
+        actual_init_names = {
+            str(container.get("name") or "") for container in init_containers
+        }
+        if (
+            len(init_containers) != len(expected_init_containers)
+            or actual_init_names != set(expected_init_containers)
+        ):
+            errors.append(f"{kind}/{name} must contain the exact bound initContainer set")
+        bound_containers = [
+            (container, expected_containers) for container in containers
+        ] + [
+            (container, expected_init_containers) for container in init_containers
+        ]
+        for container, roles in bound_containers:
             container_name = str(container.get("name") or "")
-            role = expected_containers.get(container_name)
+            role = roles.get(container_name)
             if role is None:
                 continue
             expected = str(expected_images.get(role) or "").strip()
@@ -422,11 +529,12 @@ def validate_manifest(
             errors.append(f"Deployment/{name} must set maxUnavailable=0")
         template = (spec.get("template") or {}).get("spec") or {}
         errors.extend(_validate_pod_security_contract("Deployment", name, template))
+        errors.extend(_validate_model_cache_contract("Deployment", name, template))
         containers = template.get("containers") or []
         if not containers:
             errors.append(f"Deployment/{name} has no container")
             continue
-        for container in containers:
+        for container in containers + (template.get("initContainers") or []):
             image = str(container.get("image") or "")
             if not _DIGEST.search(image):
                 errors.append(f"Deployment/{name} image is not digest-pinned")
@@ -525,13 +633,14 @@ def validate_manifest(
             continue
         pod_spec = ((job.get("spec") or {}).get("template") or {}).get("spec") or {}
         errors.extend(_validate_pod_security_contract("Job", name, pod_spec))
+        errors.extend(_validate_model_cache_contract("Job", name, pod_spec))
         if pod_spec.get("restartPolicy") != "Never":
             errors.append(f"Job/{name} must set restartPolicy=Never")
         containers = pod_spec.get("containers") or []
         if not containers:
             errors.append(f"Job/{name} has no container")
             continue
-        for container in containers:
+        for container in containers + (pod_spec.get("initContainers") or []):
             image = str(container.get("image") or "")
             if not _DIGEST.search(image):
                 errors.append(f"Job/{name} image is not digest-pinned")

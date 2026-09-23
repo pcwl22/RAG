@@ -44,7 +44,9 @@ llm:
 # 嵌入模型配置
 embedding:
   model_name: "BAAI/bge-m3"
-  model_revision: "bge-m3-local-2026-06"
+  # Immutable Hugging Face commit; weights are downloaded at runtime and are
+  # never embedded in or uploaded with the application images.
+  model_revision: "5617a9f61b028005a4858fdac845db406aefb181"
   model_path: "/app/models/bge-m3"
   device: "cuda"
   # Production GPU workloads must fail readiness if the accelerator is absent.
@@ -62,6 +64,7 @@ reranker:
   enabled: true
   failure_mode: "closed"
   model_name: "BAAI/bge-reranker-v2-m3"
+  model_revision: "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e"
   model_path: "/app/models/bge-reranker-v2-m3"
   device: "cuda"
   allow_cpu_fallback: false

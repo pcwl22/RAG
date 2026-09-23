@@ -104,7 +104,9 @@ jobs:
           DEEPSEEK_API_KEY: validation-deepseek-key-012345678901234567890
         run: python scripts/validate_production_env.py --env-file ../.env.example --allow-placeholders --allow-local-http
       - run: python scripts/validate_evaluation_assets.py
-      - run: python scripts/validate_model_bundle_manifest.py docker/model-bundle/model-manifest.example.json --allow-placeholders
+      - run: |
+          python scripts/validate_model_bundle_manifest.py model-sources/model-manifest.json
+          cmp --silent model-sources/model-manifest.json docker/model-bundle/model-manifest.example.json
       - run: python scripts/validate_dependency_lock.py
       - run: python -m pytest tests -q
 
@@ -266,12 +268,12 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
-      - name: Create deterministic CI-only model bundle
+      - name: Create deterministic CI-only model source descriptor
         id: model
         run: >-
           python industrial-rag/scripts/create_model_bundle_ci_fixture.py
           --output "$RUNNER_TEMP/model-bundle"
-      - name: Build model-bundle contract image
+      - name: Build descriptor-only model source contract image
         id: model_bundle
         env:
           MODEL_MANIFEST_SHA256: ${{ steps.model.outputs.manifest_sha256 }}
@@ -402,7 +404,9 @@ jobs:
       - run: python -m pip install --require-hashes -r requirements-ci.lock.txt
       - run: kubectl kustomize deploy/kustomize/production > "$RUNNER_TEMP/industrial-rag-production.yaml"
       - run: python scripts/validate_kubernetes_manifests.py --manifest "$RUNNER_TEMP/industrial-rag-production.yaml" --allow-placeholders
-      - run: python scripts/validate_model_bundle_manifest.py docker/model-bundle/model-manifest.example.json --allow-placeholders
+      - run: |
+          python scripts/validate_model_bundle_manifest.py model-sources/model-manifest.json
+          cmp --silent model-sources/model-manifest.json docker/model-bundle/model-manifest.example.json
       - name: Upload rendered Kubernetes manifest
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

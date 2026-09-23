@@ -17,7 +17,7 @@ from starlette.middleware.base import RequestResponseEndpoint
 from app.api import chat, search, upload
 from app.auth import OIDCValidator
 from app.embedding.embedder import load_embedding_model
-from app.embedding.model_bundle import validate_runtime_model_manifest
+from app.embedding.model_bundle import prepare_runtime_models
 from app.llm.model import get_llm_client
 from app.retrieval.reranker import load_reranker
 from app.security import authentication_middleware, validate_security_config
@@ -206,8 +206,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("Starting RAG System...")
 
     # This is a release integrity boundary, not an optional dependency health
-    # check.  Validate before opening the database or accepting degraded mode.
-    validate_runtime_model_manifest(config)
+    # check. Validate the signed descriptor and materialize its pinned models
+    # before opening the database or accepting degraded mode.
+    prepare_runtime_models(config)
 
     recovery_task: asyncio.Task[None] | None = None
     reconciliation_task: asyncio.Task[None] | None = None

@@ -9,7 +9,7 @@ metadata:
 spec:
   backoffLimit: 0
   ttlSecondsAfterFinished: 86400
-  activeDeadlineSeconds: 900
+  activeDeadlineSeconds: 3600
   template:
     metadata:
       labels:
@@ -27,6 +27,36 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
+      initContainers:
+        - name: model-source-init
+          image: industrial-rag-api
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "app.embedding.model_bundle", "prepare"]
+          envFrom:
+            - configMapRef:
+                name: rag-runtime-config
+            - secretRef:
+                name: rag-runtime
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+              ephemeral-storage: "8Gi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+              ephemeral-storage: "16Gi"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: model-cache
+              mountPath: /app/models
       containers:
         - name: smoke
           image: industrial-rag-api
@@ -41,8 +71,8 @@ spec:
               set +e
               python /opt/industrial-rag-canary/run_release_canary.py \
                 --api-base-url http://127.0.0.1:18000 \
-                --readiness-timeout 240 \
-                --ingest-timeout 480 \
+                --readiness-timeout 900 \
+                --ingest-timeout 900 \
                 --request-timeout 60
               canary_status=$?
               touch /canary-state/done
@@ -88,6 +118,9 @@ spec:
               mountPath: /app/data
             - name: api-logs
               mountPath: /app/logs
+            - name: model-cache
+              mountPath: /app/models
+              readOnly: true
         - name: candidate-worker
           image: industrial-rag-worker
           imagePullPolicy: IfNotPresent
@@ -147,6 +180,9 @@ spec:
               mountPath: /app/data
             - name: worker-logs
               mountPath: /app/logs
+            - name: model-cache
+              mountPath: /app/models
+              readOnly: true
       volumes:
         - name: tmp
           emptyDir: {}
@@ -162,3 +198,6 @@ spec:
           emptyDir: {}
         - name: worker-logs
           emptyDir: {}
+        - name: model-cache
+          emptyDir:
+            sizeLimit: 16Gi

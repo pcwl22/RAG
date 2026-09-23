@@ -19,6 +19,7 @@ dependencies = [
     "transformers>=5.16.1,<6",
     "torch>=2.13.0,<2.14",
     "sentence-transformers>=6.0.0,<7",
+    "huggingface-hub>=1.29.0,<2",
 
     # LLM API Clients
     "anthropic>=0.25.0",     # Claude
@@ -188,6 +189,7 @@ plugins = ["pydantic.mypy"]
 module = [
     "celery.*",
     "fitz.*",
+    "huggingface_hub.*",
     "jinja2.*",
     "magic_pdf.*",
     "sentence_transformers.*",

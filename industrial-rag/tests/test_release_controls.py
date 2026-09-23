@@ -467,18 +467,16 @@ def test_kubernetes_secret_renderer_separates_runtime_and_migration_credentials(
     assert Path(runtime_path).is_file() and Path(migration_path).is_file()
 
 
-def test_model_bundle_manifest_is_generated_from_exact_model_trees(tmp_path):
-    models_root = tmp_path / "models"
-    for name in ("bge-m3", "bge-reranker-v2-m3"):
-        model_dir = models_root / name
-        model_dir.mkdir(parents=True)
-        (model_dir / "config.json").write_text('{"model": true}\n', encoding="utf-8")
-
+def test_model_source_manifest_is_generated_without_reading_model_weights(tmp_path):
     manifest_path = tmp_path / "model-manifest.json"
-    write_manifest(models_root, manifest_path)
+    write_manifest(manifest_path)
 
-    assert validate_manifest(manifest_path, models_root) == []
-    assert build_manifest(models_root)["models"]["bge-m3"]["sha256"]
+    assert validate_manifest(manifest_path) == []
+    assert build_manifest()["models"]["bge-m3"]["revision"] == (
+        "5617a9f61b028005a4858fdac845db406aefb181"
+    )
+    canonical = Path("model-sources/model-manifest.json")
+    assert manifest_path.read_bytes() == canonical.read_bytes()
 
 
 def test_model_bundle_tree_hash_uses_platform_independent_path_order(tmp_path):
@@ -614,11 +612,25 @@ def test_final_workload_images_must_match_verified_release_outputs():
                 {"name": "smoke", "image": images["api"]},
                 {"name": "candidate-worker", "image": images["worker"]},
             ]
+        init_containers = []
+        if (kind, name) in {
+            ("Deployment", "rag-api"),
+            ("Deployment", "rag-worker"),
+            ("Job", "rag-canary"),
+        }:
+            init_containers = [{"name": "model-source-init", "image": image}]
         return {
             "apiVersion": "apps/v1" if kind == "Deployment" else "batch/v1",
             "kind": kind,
             "metadata": {"name": name},
-            "spec": {"template": {"spec": {"containers": containers}}},
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": containers,
+                        **({"initContainers": init_containers} if init_containers else {}),
+                    }
+                }
+            },
         }
 
     documents = [
@@ -643,12 +655,14 @@ def test_final_workload_images_must_match_verified_release_outputs():
     ]
     documents.append(workload("Deployment", "rogue", images["api"]))
     assert validate_expected_release_images(documents, images) == [
-        "Deployment/rag-api must not contain unbound initContainers",
+        "Deployment/rag-api must contain the exact bound initContainer set",
         "unexpected release workload Deployment/rogue",
     ]
 
     documents.pop()
-    documents[0]["spec"]["template"]["spec"].pop("initContainers")
+    documents[0]["spec"]["template"]["spec"]["initContainers"] = [
+        {"name": "model-source-init", "image": images["api"]}
+    ]
     canary_containers = documents[4]["spec"]["template"]["spec"]["containers"]
     canary_containers[1]["image"] = images["api"]
     assert validate_expected_release_images(documents, images) == [
@@ -831,6 +845,13 @@ def test_workload_identity_and_security_contract_is_exact_and_fail_closed():
         ("Job", "rag-postgres-migration"): ["migration"],
         ("Job", "rag-canary"): ["smoke", "candidate-worker"],
     }
+    init_container_names = {
+        ("Deployment", "rag-api"): ["model-source-init"],
+        ("Deployment", "rag-worker"): ["model-source-init"],
+        ("Deployment", "rag-frontend"): [],
+        ("Job", "rag-postgres-migration"): [],
+        ("Job", "rag-canary"): ["model-source-init"],
+    }
 
     def hardened_pod(kind: str, name: str) -> dict:
         numeric_id = 101 if (kind, name) == ("Deployment", "rag-frontend") else 10001
@@ -859,6 +880,17 @@ def test_workload_identity_and_security_contract_is_exact_and_fail_closed():
                     },
                 }
                 for container_name in container_names[(kind, name)]
+            ],
+            "initContainers": [
+                {
+                    "name": container_name,
+                    "securityContext": copy.deepcopy(container_security),
+                    "resources": {
+                        "requests": {"cpu": "100m", "memory": "128Mi"},
+                        "limits": {"cpu": "1", "memory": "1Gi"},
+                    },
+                }
+                for container_name in init_container_names[(kind, name)]
             ],
         }
 
@@ -898,7 +930,7 @@ def test_workload_identity_and_security_contract_is_exact_and_fail_closed():
     pod["initContainers"] = [
         {"name": "unexpected-init", "securityContext": pod["containers"][0]["securityContext"]}
     ]
-    assert "Deployment/rag-worker must not contain initContainers" in (
+    assert "Deployment/rag-worker must contain exactly these initContainers: model-source-init" in (
         _validate_pod_security_contract("Deployment", "rag-worker", pod)
     )
 
@@ -1064,7 +1096,6 @@ def test_actionlint_knows_protected_self_hosted_runner_labels():
 
     assert set(config["self-hosted-runner"]["labels"]) == {
         "rag-evaluation-source",
-        "rag-model-bundle",
         "rag-production",
     }
 

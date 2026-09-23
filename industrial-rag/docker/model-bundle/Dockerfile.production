@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1.7
-# The approved upstream bundle is verified by exact signature, source revision,
-# manifest digest, and deterministic model-tree hashes before this build runs.
+# The approved upstream descriptor is verified by exact signature, source
+# revision, and manifest digest before this repository-bound mirror is built.
+# Neither stage contains model weights.
 ARG APPROVED_MODEL_BUNDLE_IMAGE
 FROM ${APPROVED_MODEL_BUNDLE_IMAGE} AS approved_model
 
@@ -20,5 +21,6 @@ LABEL org.opencontainers.image.revision=$SOURCE_REVISION \
       org.opencontainers.image.base.digest=$APPROVED_MODEL_BUNDLE_DIGEST \
       io.industrial-rag.model.source=$APPROVED_MODEL_SOURCE_REPOSITORY \
       io.industrial-rag.model.source-revision=$APPROVED_MODEL_SOURCE_REVISION \
-      io.industrial-rag.model.signer-identity=$APPROVED_MODEL_CERTIFICATE_IDENTITY
+      io.industrial-rag.model.signer-identity=$APPROVED_MODEL_CERTIFICATE_IDENTITY \
+      io.industrial-rag.model-weights=absent
 COPY --from=approved_model /models/ /models/

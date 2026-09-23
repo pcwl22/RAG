@@ -335,6 +335,7 @@ jobs:
           ignore-unfixed: true
           timeout: 15m0s
           format: sarif
+          limit-severities-for-sarif: true
           output: ${{ runner.temp }}/industrial-rag-image-publish/trivy-api.sarif
           exit-code: 1
 
@@ -348,6 +349,7 @@ jobs:
           ignore-unfixed: true
           timeout: 15m0s
           format: sarif
+          limit-severities-for-sarif: true
           output: ${{ runner.temp }}/industrial-rag-image-publish/trivy-model-bundle.sarif
           exit-code: 1
 
@@ -361,6 +363,7 @@ jobs:
           ignore-unfixed: true
           timeout: 15m0s
           format: sarif
+          limit-severities-for-sarif: true
           output: ${{ runner.temp }}/industrial-rag-image-publish/trivy-worker.sarif
           exit-code: 1
 
@@ -374,6 +377,7 @@ jobs:
           ignore-unfixed: true
           timeout: 15m0s
           format: sarif
+          limit-severities-for-sarif: true
           output: ${{ runner.temp }}/industrial-rag-image-publish/trivy-frontend.sarif
           exit-code: 1
 

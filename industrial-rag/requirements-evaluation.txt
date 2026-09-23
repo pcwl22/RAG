@@ -2,4 +2,4 @@
 # pip-compile --generate-hashes --no-emit-index-url --strip-extras requirements-evaluation.txt
 # Keep this surface free of Ragas, LangChain, cache deserializers, URL loaders,
 # and multimodal fetchers; the release audit enforces that invariant.
-openai==3.6.0
+openai==3.16.2

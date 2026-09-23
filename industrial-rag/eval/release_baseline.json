@@ -42,6 +42,7 @@
       "docker/model-bundle/Dockerfile.production",
       "docker/model-bundle/model-manifest.example.json",
       "docker/worker/Dockerfile.production",
+      "model-sources/model-manifest.json",
       "prompts/business.txt",
       "prompts/citation.txt",
       "prompts/output.txt",
@@ -72,7 +73,7 @@
       "scripts/validate_release_baseline.py",
       "security/evaluation_dependency_exceptions.toml"
     ],
-    "sha256": "95c9d8acdc820d679c4e5b3d24d15c50b78af2cd9e551d5b7c67745df7bec68f"
+    "sha256": "9b296635b35ad28eef826d131e0db0a5de91c8b8115996f460b48b5f11a506f1"
   },
   "hash_contract_migration": {
     "from_schema_version": 8,
@@ -135,6 +136,38 @@
       ],
       "failed_publication_run_id": 35676237874,
       "portable_model_manifest_sha256": "sha256:79eebe4fea21710238cff534662107d35dfc065f8725122a684d5ad843b56c94"
+    },
+    {
+      "from_sha256": "95c9d8acdc820d679c4e5b3d24d15c50b78af2cd9e551d5b7c67745df7bec68f",
+      "to_sha256": "9b296635b35ad28eef826d131e0db0a5de91c8b8115996f460b48b5f11a506f1",
+      "reason": "Replace uploaded model weights with a signed source-only descriptor and runtime exact-commit Hugging Face download while preserving the validated model trees.",
+      "evaluation_results_reused": true,
+      "application_dependencies_changed": false,
+      "model_weights_changed": false,
+      "retrieval_behavior_changed": false,
+      "model_distribution_changed": true,
+      "changed_paths": [
+        "app/embedding/embedder.py",
+        "app/embedding/model_bundle.py",
+        "app/retrieval/reranker.py",
+        "config/base.yaml",
+        "config/laptop.yaml",
+        "docker/api/Dockerfile.production",
+        "docker/model-bundle/Dockerfile.production",
+        "docker/model-bundle/model-manifest.example.json",
+        "docker/worker/Dockerfile.production",
+        "model-sources/model-manifest.json",
+        "pyproject.toml",
+        "requirements-runtime.lock.txt",
+        "scripts/build_model_bundle_manifest.py",
+        "scripts/validate_model_bundle_manifest.py",
+        "scripts/validate_release_baseline.py"
+      ],
+      "approved_model_manifest_sha256": "sha256:b15a4508f03592196cdbd464346f14c85703e623b87da720922aff39bced4ba3",
+      "approved_model_revisions": {
+        "BAAI/bge-m3": "5617a9f61b028005a4858fdac845db406aefb181",
+        "BAAI/bge-reranker-v2-m3": "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e"
+      }
     }
   ],
   "evaluation_contract": {

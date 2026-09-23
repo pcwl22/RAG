@@ -93,7 +93,8 @@ spec:
           protocol: UDP
         - port: 53
           protocol: TCP
-    # HTTPS is used for the configured LLM, OIDC and S3 endpoints. Operators
+    # HTTPS is used for Hugging Face model initialization and the configured
+    # LLM, OIDC and S3 endpoints. Operators
     # must narrow this CIDR or add egress CIDRs in the production overlay when
     # the cluster's network policy implementation supports that contract.
     - ports:

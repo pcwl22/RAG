@@ -114,21 +114,26 @@ infrastructure, not a highly available production topology.
 - Build and scan every production Dockerfile in CI. Require the exact protected Cosign certificate
   identity, source repository label, release commit label, OCI digest, and model-manifest digest
   before rendering manifests.
-- Treat the approved model bundle as a separately protected prerequisite. The repository-owned
-  `publish-model-bundle` workflow packages only operator-supplied, revision-pinned Hugging Face
-  files; it must not train or download weights. Run it on a random-label, one-job JIT Linux runner
-  with only the model directory mounted read-only, preserve its evidence artifact, and keep the
-  resulting GHCR package private. Before dispatching `.github/workflows/publish-production-images.yml`,
-  obtain the approved `ghcr.io/<owner>/<repository>/...@sha256:<digest>` reference and the exact
-  SHA-256 of `/models/model-manifest.json` from that artifact.
+- Treat the approved model-source descriptor as a separately protected prerequisite. The
+  repository-owned `publish-model-bundle` workflow runs on a GitHub-hosted runner and publishes
+  only the revision-pinned Hugging Face URLs, deterministic tree hashes, and manifest; it never
+  reads or uploads local model weights. Preserve the `industrial-rag-approved-model-source`
+  evidence artifact. Before dispatching `.github/workflows/publish-production-images.yml`, obtain
+  its approved `ghcr.io/<owner>/<repository>/approved-model-source@sha256:<digest>` reference and
+  the exact SHA-256 of `/models/model-manifest.json`.
 - Protect the `production-image-publish` environment with required reviewers and configure
   `MODEL_BUNDLE_CERTIFICATE_IDENTITY` as the exact keyless signer URI (an internal or external
   GitHub workflow is allowed), `MODEL_BUNDLE_SOURCE_REPOSITORY` as that workflow's exact GitHub
   repository URL, and `MODEL_BUNDLE_SOURCE_REVISION` as the full 40-character source commit. The
   workflow rejects mutable/cross-namespace images, verifies that exact signer and source labels,
-  binds the signing certificate's workflow-SHA claim, validates every file hash in the manifest,
-  then builds the API, worker, frontend, and repository-bound model images only from `main` at the
-  exact dispatch SHA.
+  binds the signing certificate's workflow-SHA claim, and proves the descriptor image contains no
+  weights. It then builds the API, worker, frontend, and repository-bound descriptor images only
+  from `main` at the exact dispatch SHA.
+- Require outbound HTTPS to `huggingface.co` for the API, Worker, and Canary init containers. Each
+  init container must download the exact manifest commits, verify both downloaded-tree SHA-256
+  values, and atomically populate the 16 GiB model cache. Runtime containers must mount that cache
+  read-only. The portable `emptyDir` cache downloads per pod; any production persistent-cache
+  overlay must preserve the single-writer/read-only-consumer contract.
 - Preserve the successful `industrial-rag-production-image-publication` artifact. Its
   `release-images.env` contains only digest-pinned release inputs; its record, Trivy reports,
   CycloneDX SBOMs, signatures, and SLSA v1 attestations bind all four images to the protected

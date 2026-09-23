@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       model_bundle_image:
-        description: Approved GHCR model-bundle image pinned by sha256 digest
+        description: Approved descriptor-only model source image pinned by sha256 digest
         required: true
         type: string
       model_manifest_sha256:
@@ -102,7 +102,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-      - name: Verify the approved model bundle before using it as a build stage
+      - name: Verify the approved model source descriptor before using it
         env:
           MODEL_BUNDLE_IMAGE: ${{ steps.prepare.outputs.approved_model_bundle_image }}
           MODEL_MANIFEST_SHA256: ${{ steps.prepare.outputs.model_manifest_sha256 }}
@@ -112,7 +112,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$PUBLISH_ARTIFACT_DIR/model" "$MODEL_VALIDATION_DIR/models"
+          mkdir -p "$PUBLISH_ARTIFACT_DIR/model" "$MODEL_VALIDATION_DIR"
           cosign verify \
             --certificate-identity "$MODEL_SIGNER_IDENTITY" \
             --certificate-oidc-issuer "$COSIGN_CERTIFICATE_OIDC_ISSUER" \
@@ -123,18 +123,22 @@ jobs:
           test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.source" }}' "$MODEL_BUNDLE_IMAGE")" = "$EXPECTED_SOURCE"
           test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$MODEL_BUNDLE_IMAGE")" = "$EXPECTED_REVISION"
           test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.model-manifest-sha256" }}' "$MODEL_BUNDLE_IMAGE")" = "$MODEL_MANIFEST_SHA256"
+          test "$(docker image inspect --format '{{ index .Config.Labels "io.industrial-rag.model-weights" }}' "$MODEL_BUNDLE_IMAGE")" = "absent"
           model_container="$(docker create "$MODEL_BUNDLE_IMAGE" /nonexistent)"
           trap 'docker rm -f "$model_container" >/dev/null 2>&1 || true' EXIT
-          docker cp "${model_container}:/models/." "$MODEL_VALIDATION_DIR/models"
+          docker cp "${model_container}:/models/model-manifest.json" "$MODEL_VALIDATION_DIR/model-manifest.json"
+          if docker cp "${model_container}:/models/bge-m3" "$MODEL_VALIDATION_DIR/unexpected-model"; then
+            echo "approved model source artifact unexpectedly contains model weights" >&2
+            exit 1
+          fi
           docker rm "$model_container" >/dev/null
           trap - EXIT
-          actual_manifest_sha="sha256:$(sha256sum "$MODEL_VALIDATION_DIR/models/model-manifest.json" | awk '{print $1}')"
+          actual_manifest_sha="sha256:$(sha256sum "$MODEL_VALIDATION_DIR/model-manifest.json" | awk '{print $1}')"
           test "$actual_manifest_sha" = "$MODEL_MANIFEST_SHA256"
           python industrial-rag/scripts/validate_model_bundle_manifest.py \
-            "$MODEL_VALIDATION_DIR/models/model-manifest.json" \
-            --models-root "$MODEL_VALIDATION_DIR/models"
+            "$MODEL_VALIDATION_DIR/model-manifest.json"
 
-      - name: Build and push repository-bound production model bundle
+      - name: Build and push repository-bound model source descriptor
         id: build_model
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -156,7 +160,7 @@ jobs:
             SOURCE_REVISION=${{ steps.prepare.outputs.source_revision }}
             SOURCE_REPOSITORY=${{ steps.prepare.outputs.source_repository }}
 
-      - name: Validate repository-bound model bundle release contract
+      - name: Validate repository-bound model source release contract
         id: model_mirror
         env:
           APPROVED_MODEL_BUNDLE_IMAGE: ${{ steps.prepare.outputs.approved_model_bundle_image }}
@@ -187,6 +191,7 @@ jobs:
           test "$(docker image inspect --format '{{ index .Config.Labels "io.industrial-rag.model.source" }}' "$MODEL_BUNDLE_IMAGE")" = "$MODEL_BUNDLE_SOURCE_REPOSITORY"
           test "$(docker image inspect --format '{{ index .Config.Labels "io.industrial-rag.model.source-revision" }}' "$MODEL_BUNDLE_IMAGE")" = "$MODEL_BUNDLE_SOURCE_REVISION"
           test "$(docker image inspect --format '{{ index .Config.Labels "io.industrial-rag.model.signer-identity" }}' "$MODEL_BUNDLE_IMAGE")" = "$MODEL_BUNDLE_CERTIFICATE_IDENTITY"
+          test "$(docker image inspect --format '{{ index .Config.Labels "io.industrial-rag.model-weights" }}' "$MODEL_BUNDLE_IMAGE")" = "absent"
           model_container="$(docker create "$MODEL_BUNDLE_IMAGE" /nonexistent)"
           trap 'docker rm -f "$model_container" >/dev/null 2>&1 || true' EXIT
           docker cp "${model_container}:/models/model-manifest.json" \
@@ -280,7 +285,7 @@ jobs:
             --output-dir "$PUBLISH_ARTIFACT_DIR" \
             --github-output "$GITHUB_OUTPUT"
 
-      - name: Verify production image identity, user, and embedded model manifest
+      - name: Verify production image identity, user, and embedded source manifest
         env:
           API_IMAGE: ${{ steps.refs.outputs.api }}
           WORKER_IMAGE: ${{ steps.refs.outputs.worker }}
@@ -307,8 +312,13 @@ jobs:
             test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.model-manifest-sha256" }}' "$image")" = "$MODEL_MANIFEST_SHA256"
             application_container="$(docker create "$image" /nonexistent)"
             trap 'docker rm -f "$application_container" >/dev/null 2>&1 || true' EXIT
-            docker cp "${application_container}:/app/models/model-manifest.json" \
+            docker cp "${application_container}:/app/model-source-manifest.json" \
               "$PUBLISH_ARTIFACT_DIR/$name-model-manifest.json"
+            if docker cp "${application_container}:/app/models/bge-m3" \
+              "$PUBLISH_ARTIFACT_DIR/unexpected-$name-model"; then
+              echo "$name image unexpectedly contains model weights" >&2
+              exit 1
+            fi
             docker rm "$application_container" >/dev/null
             trap - EXIT
             actual_manifest_sha="sha256:$(sha256sum "$PUBLISH_ARTIFACT_DIR/$name-model-manifest.json" | awk '{print $1}')"
@@ -328,7 +338,7 @@ jobs:
           output: ${{ runner.temp }}/industrial-rag-image-publish/trivy-api.sarif
           exit-code: 1
 
-      - name: Scan repository-bound production model image
+      - name: Scan repository-bound production model source descriptor
         if: ${{ !cancelled() && steps.refs.outcome == 'success' }}
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
@@ -376,7 +386,7 @@ jobs:
           artifact-name: industrial-rag-publish-api-sbom.cdx.json
           output-file: ${{ runner.temp }}/industrial-rag-image-publish/api-sbom.cdx.json
 
-      - name: Generate repository-bound production model SBOM
+      - name: Generate repository-bound production model source SBOM
         if: ${{ !cancelled() && steps.refs.outcome == 'success' }}
         uses: anchore/sbom-action@da167eac915b4e86f08b264dbdbc867b61be6f0c # v0.20.5
         with:

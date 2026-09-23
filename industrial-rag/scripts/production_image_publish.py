@@ -117,13 +117,13 @@ def _immutable_image_reference(value: str, *, name: str) -> str:
 
 
 def _approved_model_reference(value: str) -> str:
-    """Return a shell-safe upstream bundle reference pinned by OCI digest.
+    """Return a shell-safe upstream descriptor reference pinned by OCI digest.
 
-    The upstream model builder can live in a separately governed repository or
-    registry.  Registry ownership is therefore not the trust boundary: the
+    The descriptor publisher can live in a separately governed repository or
+    registry. Registry ownership is therefore not the trust boundary: the
     publish workflow verifies the exact keyless workflow identity, source
-    repository/revision labels, manifest digest, and model-tree contents before
-    copying the tree into this repository's own GHCR namespace.
+    repository/revision labels, manifest digest, and explicit no-weights label
+    before mirroring the descriptor into this repository's GHCR namespace.
     """
     return _immutable_image_reference(
         value,
@@ -230,7 +230,7 @@ def validate_model_mirror(
     github_sha: str,
     github_ref: str,
 ) -> dict[str, str]:
-    """Validate the repository-owned mirror produced from an approved bundle."""
+    """Validate the repository-owned mirror of an approved source descriptor."""
     prepare_publish(
         approved_model_bundle_image=approved_model_bundle_image,
         model_manifest_sha256=model_manifest_sha256,

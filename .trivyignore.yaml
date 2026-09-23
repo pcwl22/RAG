@@ -4,7 +4,8 @@ misconfigurations:
       - industrial-rag/docker/model-bundle/Dockerfile
       - industrial-rag/docker/model-bundle/Dockerfile.production
     statement: >-
-      These scratch images contain only immutable model data and no executable,
-      shell, entrypoint, or command. They are consumed exclusively through
-      COPY --from, so USER metadata cannot create a runtime privilege boundary.
+      These scratch images contain only an immutable signed model-source
+      descriptor and no weights, executable, shell, entrypoint, or command.
+      They are consumed exclusively through COPY --from, so USER metadata
+      cannot create a runtime privilege boundary.
     expired_at: 2027-09-21

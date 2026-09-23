@@ -1,9 +1,10 @@
 """BGE reranker wrapper."""
 import os
-from typing import Any
+from typing import Any, cast
 
 from app.embedding.embedder import resolve_torch_device
-from app.utils.config import get_config_section
+from app.embedding.model_bundle import prepare_runtime_model
+from app.utils.config import get_config_section, get_settings
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -12,7 +13,7 @@ _reranker_model: Any = None
 
 
 def _reranker_config() -> dict[str, Any]:
-    return get_config_section("reranker")
+    return cast(dict[str, Any], get_config_section("reranker"))
 
 
 def _fallback(documents: list[dict], top_n: int | None) -> list[dict]:
@@ -49,6 +50,7 @@ def load_reranker() -> Any:
     try:
         from sentence_transformers import CrossEncoder
 
+        prepare_runtime_model(get_settings(), "bge-reranker-v2-m3")
         model_path = cfg.get("model_path", "E:/RAG/models/bge-reranker-v2-m3")
         device = resolve_torch_device(
             os.getenv("RERANKER_DEVICE") or cfg.get("device", "cuda"),

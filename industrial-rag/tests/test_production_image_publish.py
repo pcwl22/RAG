@@ -290,8 +290,11 @@ def test_production_publish_workflow_keeps_build_scan_and_signing_contract():
     assert 'sha256sum "$PUBLISH_ARTIFACT_DIR/model/mirror-manifest.json"' not in workflow
     assert "MODEL_BUNDLE_SOURCE_REVISION" in workflow
     assert workflow.count('--certificate-github-workflow-sha "$EXPECTED_REVISION"') == 5
-    assert "Scan repository-bound production model image" in workflow
-    assert "Generate repository-bound production model SBOM" in workflow
+    assert "Scan repository-bound production model source descriptor" in workflow
+    assert "Generate repository-bound production model source SBOM" in workflow
+    assert "io.industrial-rag.model-weights" in workflow
+    assert "/app/model-source-manifest.json" in workflow
+    assert "unexpectedly contains model weights" in workflow
     assert '"model-bundle=$MODEL_BUNDLE_IMAGE"' in workflow
     assert '"$MODEL_BUNDLE_IMAGE")" = "$EXPECTED_REVISION"' in workflow
     assert workflow.index("Scan production API image") < workflow.index(

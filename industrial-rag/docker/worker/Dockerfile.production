@@ -37,13 +37,15 @@ COPY scripts/validate_model_bundle_manifest.py ./scripts/validate_model_bundle_m
 RUN python -m pip check
 COPY prompts/ ./prompts/
 COPY config/ ./config/
-COPY --from=model_bundle /models/ /app/models/
+COPY --from=model_bundle /models/model-manifest.json /app/model-source-manifest.json
 
-RUN test -f /app/models/bge-m3/config.json \
-    && test -f /app/models/bge-reranker-v2-m3/config.json \
-    && test -f /app/models/model-manifest.json \
-    && python scripts/validate_model_bundle_manifest.py /app/models/model-manifest.json --models-root /app/models \
-    && mkdir -p /app/data /app/logs \
+ENV MODEL_MANIFEST_PATH=/app/model-source-manifest.json \
+    HF_ENDPOINT=https://huggingface.co \
+    HF_HUB_DISABLE_TELEMETRY=1
+
+RUN test -f /app/model-source-manifest.json \
+    && python scripts/validate_model_bundle_manifest.py /app/model-source-manifest.json \
+    && mkdir -p /app/data /app/logs /app/models \
     && groupadd --gid 10001 appgroup \
     && useradd --create-home --uid 10001 --gid 10001 --no-log-init appuser \
     && chown -R 10001:10001 /app

@@ -61,7 +61,9 @@ jobs:
           python scripts/validate_evaluation_assets.py
           python scripts/validate_dependency_lock.py
           python scripts/validate_model_bundle_manifest.py \
-            docker/model-bundle/model-manifest.example.json --allow-placeholders
+            model-sources/model-manifest.json
+          cmp --silent model-sources/model-manifest.json \
+            docker/model-bundle/model-manifest.example.json
           python scripts/validate_release_workflow.py \
             ../.github/workflows/release.yml
 
@@ -111,6 +113,7 @@ jobs:
               "requirements-torch-cpu.lock.txt",
               "requirements-torch-cu126.lock.txt",
               "security/evaluation_dependency_exceptions.toml",
+              "model-sources/model-manifest.json",
               "eval/legal_expanded_ragas_40.jsonl",
               "eval/legal_expanded_240.jsonl",
               "eval/legal_holdout_150.jsonl",
@@ -870,12 +873,14 @@ jobs:
           python scripts/validate_production_env.py
           --env-file "$ENV_FILE" --release-snapshot
 
-      - name: Validate locked inputs and model bundle contract
+      - name: Validate locked inputs and model source contract
         run: |
           python scripts/validate_evaluation_assets.py
           python scripts/validate_dependency_lock.py
           python scripts/validate_model_bundle_manifest.py \
-            docker/model-bundle/model-manifest.example.json --allow-placeholders
+            model-sources/model-manifest.json
+          cmp --silent model-sources/model-manifest.json \
+            docker/model-bundle/model-manifest.example.json
 
       - name: Export immutable production image references
         id: release_images
@@ -1110,12 +1115,14 @@ jobs:
             test "$bundled_digest" = "$MODEL_BUNDLE_DIGEST"
             test "$bundled_manifest" = "$MODEL_MANIFEST_SHA256"
           done
+          test "$(docker image inspect --format '{{ index .Config.Labels "io.industrial-rag.model-weights" }}' "$MODEL_BUNDLE_IMAGE")" = "absent"
           test "${MODEL_BUNDLE_IMAGE##*@}" = "$MODEL_BUNDLE_DIGEST"
           docker pull "$MODEL_BUNDLE_IMAGE"
           model_source="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.source" }}' "$MODEL_BUNDLE_IMAGE")"
           model_manifest_label="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.model-manifest-sha256" }}' "$MODEL_BUNDLE_IMAGE")"
           test "$model_source" = "$EXPECTED_SOURCE"
           test "$model_manifest_label" = "$MODEL_MANIFEST_SHA256"
+          test "$(docker image inspect --format '{{ index .Config.Labels "io.industrial-rag.model-weights" }}' "$MODEL_BUNDLE_IMAGE")" = "absent"
           model_container="$(docker create "$MODEL_BUNDLE_IMAGE" /nonexistent)"
           trap 'docker rm -f "$model_container" >/dev/null 2>&1 || true' EXIT
           docker cp "$model_container:/models/model-manifest.json" "$RUNNER_TEMP/industrial-rag-release/model-manifest.json"
@@ -1128,8 +1135,13 @@ jobs:
             image="${entry#*=}"
             application_container="$(docker create "$image")"
             trap 'docker rm -f "$application_container" >/dev/null 2>&1 || true' EXIT
-            docker cp "$application_container:/app/models/model-manifest.json" \
+            docker cp "$application_container:/app/model-source-manifest.json" \
               "$RUNNER_TEMP/industrial-rag-release/$name-model-manifest.json"
+            if docker cp "$application_container:/app/models/bge-m3" \
+              "$RUNNER_TEMP/industrial-rag-release/unexpected-$name-model"; then
+              echo "$name image unexpectedly contains model weights" >&2
+              exit 1
+            fi
             application_manifest_sha="sha256:$(sha256sum "$RUNNER_TEMP/industrial-rag-release/$name-model-manifest.json" | awk '{print $1}')"
             test "$application_manifest_sha" = "$MODEL_MANIFEST_SHA256"
             docker rm "$application_container" >/dev/null

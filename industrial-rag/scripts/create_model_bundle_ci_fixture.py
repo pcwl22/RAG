@@ -1,4 +1,4 @@
-"""Create a deterministic, non-production model bundle for Dockerfile CI builds."""
+"""Create the descriptor-only model source context used by Dockerfile CI builds."""
 
 from __future__ import annotations
 
@@ -6,38 +6,24 @@ import argparse
 import hashlib
 import importlib
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from scripts.build_model_bundle_manifest import MODEL_SPECS, write_manifest
+    from scripts.build_model_bundle_manifest import write_manifest
 else:
     _builder = importlib.import_module(
         "scripts.build_model_bundle_manifest" if __package__ else "build_model_bundle_manifest"
     )
-    MODEL_SPECS: Mapping[str, object] = _builder.MODEL_SPECS
-    write_manifest: Callable[[Path, Path], None] = _builder.write_manifest
+    write_manifest: Callable[[Path], None] = _builder.write_manifest
 
 
 def create_fixture(output: Path) -> str:
-    """Create the minimal tree expected by the production image contract."""
+    """Create the no-weights descriptor context expected by the image contract."""
     root = output.resolve()
-    models = root / "models"
-    for name in MODEL_SPECS:
-        model = models / name
-        model.mkdir(parents=True, exist_ok=True)
-        (model / "config.json").write_text(
-            '{"ci_fixture":true,"not_for_inference":true}\n',
-            encoding="utf-8",
-            newline="\n",
-        )
-        (model / "weights.ci-placeholder").write_bytes(
-            f"industrial-rag-ci-fixture:{name}\n".encode()
-        )
-
     manifest = root / "model-manifest.json"
-    write_manifest(models, manifest)
+    write_manifest(manifest)
     return "sha256:" + hashlib.sha256(manifest.read_bytes()).hexdigest()
 
 

@@ -157,25 +157,20 @@ The zero-digest/example values are intentional release blockers, not deployable
 defaults. This prevents a local or unapproved image from being promoted by
 accident.
 
-The protected model-bundle build creates its manifest from the exact model
-trees before building the image:
+The protected model-source build creates a descriptor without reading model
+weights. Regenerate and validate it with:
 
 ```bash
 cd industrial-rag
 python scripts/build_model_bundle_manifest.py \
-  --models-root ../models --output ../model-manifest.json
-python scripts/validate_model_bundle_manifest.py ../model-manifest.json \
-  --models-root ../models
-cd ..
-manifest_sha256="sha256:$(sha256sum model-manifest.json | awk '{print $1}')"
-docker build -f industrial-rag/docker/model-bundle/Dockerfile \
-  --build-arg "SOURCE_REVISION=$(git rev-parse HEAD)" \
-  --build-arg "SOURCE_REPOSITORY=https://github.com/OWNER/REPOSITORY" \
-  --build-arg "MODEL_MANIFEST_SHA256=$manifest_sha256" .
+  --output /tmp/model-manifest.json
+python scripts/validate_model_bundle_manifest.py /tmp/model-manifest.json
+cmp /tmp/model-manifest.json model-sources/model-manifest.json
 ```
 
-`MODEL_BUNDLE_DIGEST` is the resulting OCI image digest;
-`MODEL_MANIFEST_SHA256` is the SHA-256 of the exact generated manifest file.
-They are deliberately separate release inputs. API and Worker verify the latter
-again before opening PostgreSQL or loading a local model. The example manifest
-is validation-only and cannot be deployed.
+`MODEL_BUNDLE_DIGEST` is the descriptor-only OCI image digest;
+`MODEL_MANIFEST_SHA256` is the SHA-256 of the exact source manifest. They are
+deliberately separate release inputs. The `model-source-init` containers verify
+the latter, download the two immutable Hugging Face commits, verify their tree
+digests, and populate `/app/models`. API and Worker mount that cache read-only
+and verify the descriptor again before opening PostgreSQL or loading a model.

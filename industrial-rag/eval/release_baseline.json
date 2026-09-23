@@ -73,7 +73,7 @@
       "scripts/validate_release_baseline.py",
       "security/evaluation_dependency_exceptions.toml"
     ],
-    "sha256": "9b296635b35ad28eef826d131e0db0a5de91c8b8115996f460b48b5f11a506f1"
+    "sha256": "20a96c6bab70ea4b4bb84085ed9190fc3c6351be36d209b020dbba739f1fd7ee"
   },
   "hash_contract_migration": {
     "from_schema_version": 8,
@@ -139,7 +139,7 @@
     },
     {
       "from_sha256": "95c9d8acdc820d679c4e5b3d24d15c50b78af2cd9e551d5b7c67745df7bec68f",
-      "to_sha256": "9b296635b35ad28eef826d131e0db0a5de91c8b8115996f460b48b5f11a506f1",
+      "to_sha256": "20a96c6bab70ea4b4bb84085ed9190fc3c6351be36d209b020dbba739f1fd7ee",
       "reason": "Replace uploaded model weights with a signed source-only descriptor and runtime exact-commit Hugging Face download while preserving the validated model trees.",
       "evaluation_results_reused": true,
       "application_dependencies_changed": false,

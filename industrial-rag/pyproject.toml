@@ -189,6 +189,7 @@ plugins = ["pydantic.mypy"]
 module = [
     "celery.*",
     "fitz.*",
+    "huggingface_hub.*",
     "jinja2.*",
     "magic_pdf.*",
     "sentence_transformers.*",

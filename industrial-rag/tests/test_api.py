@@ -1,5 +1,7 @@
 """API smoke tests."""
+
 import asyncio
+import time
 
 import httpx
 from starlette.requests import Request
@@ -34,7 +36,9 @@ def test_chat_request_rejects_oversized_aggregate_input(monkeypatch):
         lambda: {"performance": {"max_chat_total_chars": 10, "max_chat_input_tokens": 100}},
     )
     try:
-        ChatRequest(messages=[Message(role="user", content="123456"), Message(role="user", content="78901")])
+        ChatRequest(
+            messages=[Message(role="user", content="123456"), Message(role="user", content="78901")]
+        )
     except ValueError as exc:
         assert "character limit" in str(exc)
     else:
@@ -150,6 +154,8 @@ def test_readiness_uses_live_postgres_probe(monkeypatch):
     async def run():
         previous_startup = app.state.startup_complete
         previous_dependencies = dict(app.state.dependencies)
+        previous_failures = getattr(app.state, "llm_readiness_failures", 0)
+        previous_failure_started_at = getattr(app.state, "llm_readiness_failure_started_at", None)
         try:
             app.state.startup_complete = True
             app.state.dependencies = {
@@ -170,6 +176,8 @@ def test_readiness_uses_live_postgres_probe(monkeypatch):
         finally:
             app.state.startup_complete = previous_startup
             app.state.dependencies = previous_dependencies
+            app.state.llm_readiness_failures = previous_failures
+            app.state.llm_readiness_failure_started_at = previous_failure_started_at
 
     asyncio.run(run())
 
@@ -192,6 +200,8 @@ def test_readiness_requires_llm_and_reranker(monkeypatch):
     async def run():
         previous_startup = app.state.startup_complete
         previous_dependencies = dict(app.state.dependencies)
+        previous_failures = getattr(app.state, "llm_readiness_failures", 0)
+        previous_failure_started_at = getattr(app.state, "llm_readiness_failure_started_at", None)
         try:
             app.state.startup_complete = True
             app.state.dependencies = {
@@ -211,6 +221,107 @@ def test_readiness_requires_llm_and_reranker(monkeypatch):
         finally:
             app.state.startup_complete = previous_startup
             app.state.dependencies = previous_dependencies
+            app.state.llm_readiness_failures = previous_failures
+            app.state.llm_readiness_failure_started_at = previous_failure_started_at
+
+    asyncio.run(run())
+
+
+def test_readiness_tolerates_rapid_transient_llm_probe_failures(monkeypatch):
+    import app.main as main_module
+    from app.vectorstore import storage_adapter
+
+    async def available():
+        return True
+
+    monkeypatch.setattr(storage_adapter, "check_vector_store_health", available)
+
+    class UnavailableLLM:
+        async def check_health(self):
+            return False
+
+    monkeypatch.setattr(main_module, "get_llm_client", lambda: UnavailableLLM())
+
+    async def run():
+        previous_startup = app.state.startup_complete
+        previous_dependencies = dict(app.state.dependencies)
+        previous_failures = getattr(app.state, "llm_readiness_failures", 0)
+        previous_failure_started_at = getattr(app.state, "llm_readiness_failure_started_at", None)
+        try:
+            app.state.startup_complete = True
+            app.state.dependencies = {
+                "postgres": True,
+                "embedding": True,
+                "llm": True,
+                "reranker": True,
+                "redis": True,
+            }
+            app.state.llm_readiness_failures = 0
+            app.state.llm_readiness_failure_started_at = None
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://testserver"
+            ) as client:
+                first = await client.get("/health/ready")
+                second = await client.get("/health/ready")
+
+            assert first.status_code == 200
+            assert first.json()["dependencies"]["llm"] is True
+            assert second.status_code == 200
+            assert second.json()["dependencies"]["llm"] is True
+        finally:
+            app.state.startup_complete = previous_startup
+            app.state.dependencies = previous_dependencies
+            app.state.llm_readiness_failures = previous_failures
+            app.state.llm_readiness_failure_started_at = previous_failure_started_at
+
+    asyncio.run(run())
+
+
+def test_readiness_fails_after_sustained_llm_probe_failures(monkeypatch):
+    import app.main as main_module
+    from app.vectorstore import storage_adapter
+
+    async def available():
+        return True
+
+    monkeypatch.setattr(storage_adapter, "check_vector_store_health", available)
+
+    class UnavailableLLM:
+        async def check_health(self):
+            return False
+
+    monkeypatch.setattr(main_module, "get_llm_client", lambda: UnavailableLLM())
+
+    async def run():
+        previous_startup = app.state.startup_complete
+        previous_dependencies = dict(app.state.dependencies)
+        previous_failures = getattr(app.state, "llm_readiness_failures", 0)
+        previous_failure_started_at = getattr(app.state, "llm_readiness_failure_started_at", None)
+        try:
+            app.state.startup_complete = True
+            app.state.dependencies = {
+                "postgres": True,
+                "embedding": True,
+                "llm": True,
+                "reranker": True,
+                "redis": True,
+            }
+            app.state.llm_readiness_failures = 1
+            app.state.llm_readiness_failure_started_at = time.monotonic() - 61
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://testserver"
+            ) as client:
+                response = await client.get("/health/ready")
+
+            assert response.status_code == 503
+            assert response.json()["dependencies"]["llm"] is False
+        finally:
+            app.state.startup_complete = previous_startup
+            app.state.dependencies = previous_dependencies
+            app.state.llm_readiness_failures = previous_failures
+            app.state.llm_readiness_failure_started_at = previous_failure_started_at
 
     asyncio.run(run())
 
@@ -341,9 +452,7 @@ def test_stream_request_is_logged_after_body_finishes(monkeypatch):
         assert "X-Process-Time" not in response.headers
         assert log_calls == []
 
-        consumer = asyncio.create_task(
-            anext(response.body_iterator)
-        )
+        consumer = asyncio.create_task(anext(response.body_iterator))
         await asyncio.sleep(0)
         assert log_calls == []
         gate.set()

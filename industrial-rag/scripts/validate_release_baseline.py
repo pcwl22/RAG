@@ -31,6 +31,7 @@ REQUIRED_DATASETS = {
 REQUIRED_IMPLEMENTATION_PATHS = frozenset(
     {
         "app/embedding/model_bundle.py",
+        "app/vectorstore/migrations",
         "constraints-docker.txt",
         "docker/api/Dockerfile.production",
         "docker/model-bundle/Dockerfile.production",

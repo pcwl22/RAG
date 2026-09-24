@@ -1,4 +1,5 @@
 """PostgreSQL + pgvector storage with hybrid retrieval."""
+
 import asyncio
 import contextvars
 import functools
@@ -88,9 +89,12 @@ def _load_content_migrations() -> tuple[tuple[str, str, str], ...]:
 
 
 CONTENT_SCHEMA_MIGRATIONS = _load_content_migrations()
-SCHEMA_MIGRATIONS = LEGACY_SCHEMA_MIGRATIONS + STAGED_TENANT_MIGRATIONS + tuple(
-    (migration_id, checksum)
-    for migration_id, checksum, _sql_text in CONTENT_SCHEMA_MIGRATIONS
+SCHEMA_MIGRATIONS = (
+    LEGACY_SCHEMA_MIGRATIONS
+    + STAGED_TENANT_MIGRATIONS
+    + tuple(
+        (migration_id, checksum) for migration_id, checksum, _sql_text in CONTENT_SCHEMA_MIGRATIONS
+    )
 )
 SEARCH_TEXT_EXPRESSION = """(
     content || ' ' ||
@@ -114,8 +118,7 @@ CONCURRENT_INDEX_DEFINITIONS = (
     ),
     (
         "idx_documents_tenant",
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_documents_tenant "
-        "ON documents (tenant_id)",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_documents_tenant ON documents (tenant_id)",
     ),
     (
         "idx_documents_tenant_partition",
@@ -124,8 +127,7 @@ CONCURRENT_INDEX_DEFINITIONS = (
     ),
     (
         "idx_documents_partition",
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_documents_partition "
-        "ON documents (partition)",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_documents_partition ON documents (partition)",
     ),
     (
         "idx_documents_document_id",
@@ -236,8 +238,7 @@ def _runtime_schema_metadata() -> dict[str, str]:
     embedding_identity = {
         "model_name": embedding.get("model_name"),
         "model_revision": embedding.get("model_revision"),
-        "model_manifest_sha256": os.getenv("MODEL_MANIFEST_SHA256", "").strip().lower()
-        or None,
+        "model_manifest_sha256": os.getenv("MODEL_MANIFEST_SHA256", "").strip().lower() or None,
         "dimension": _embedding_dimension(),
         "normalize_embeddings": bool(embedding.get("normalize_embeddings", True)),
         "max_length": embedding.get("max_length"),
@@ -331,9 +332,7 @@ def _set_migration_lock_timeout(cur: Any) -> None:
     indefinitely.  The primary-key cutover uses its own, deliberately
     separate maintenance-window timeout below.
     """
-    lock_timeout = _bounded_positive_env(
-        "POSTGRES_MIGRATION_LOCK_TIMEOUT_SECONDS", 5, 60
-    )
+    lock_timeout = _bounded_positive_env("POSTGRES_MIGRATION_LOCK_TIMEOUT_SECONDS", 5, 60)
     cur.execute("SELECT set_config('lock_timeout', %s, true)", (f"{lock_timeout}s",))
 
 
@@ -612,16 +611,12 @@ def _prepare_composite_key_index(conn: Any, migration: tuple[str, str]) -> None:
         conn.commit()
         conn.autocommit = True
         state = _composite_index_state(cur)
-        if state is not None and state[0] and (
-            not state[1] or state[2] != ("tenant_id", "id")
-        ):
+        if state is not None and state[0] and (not state[1] or state[2] != ("tenant_id", "id")):
             raise RuntimeError(
                 f"PostgreSQL index {COMPOSITE_KEY_INDEX_NAME} has an unexpected definition"
             )
         if state is not None and not state[0]:
-            cur.execute(
-                f"DROP INDEX CONCURRENTLY IF EXISTS public.{COMPOSITE_KEY_INDEX_NAME}"
-            )
+            cur.execute(f"DROP INDEX CONCURRENTLY IF EXISTS public.{COMPOSITE_KEY_INDEX_NAME}")
             state = None
         if state is None:
             cur.execute(
@@ -667,8 +662,7 @@ def _cutover_composite_primary_key(
             )
         if primary_key is not None and primary_key[1] != ("id",):
             raise RuntimeError(
-                "PostgreSQL documents has an unsupported primary key: "
-                + ", ".join(primary_key[1])
+                "PostgreSQL documents has an unsupported primary key: " + ", ".join(primary_key[1])
             )
         if _composite_index_state(cur) != (True, True, ("tenant_id", "id")):
             raise RuntimeError("PostgreSQL composite-key cutover index is not ready")
@@ -680,9 +674,7 @@ def _cutover_composite_primary_key(
                 "and keep the lock timeout bounded."
             )
 
-        lock_timeout = _bounded_positive_env(
-            "POSTGRES_PK_CUTOVER_LOCK_TIMEOUT_SECONDS", 5, 60
-        )
+        lock_timeout = _bounded_positive_env("POSTGRES_PK_CUTOVER_LOCK_TIMEOUT_SECONDS", 5, 60)
         cur.execute("SELECT set_config('lock_timeout', %s, true)", (f"{lock_timeout}s",))
         if primary_key is None:
             cutover_sql = (
@@ -731,15 +723,11 @@ def _run_staged_tenant_migration(
         if not original_autocommit:
             conn.commit()
         conn.autocommit = True
-        cur.execute(
-            "SELECT pg_advisory_lock(hashtext(%s))", (TENANT_MIGRATION_LOCK_NAME,)
-        )
+        cur.execute("SELECT pg_advisory_lock(hashtext(%s))", (TENANT_MIGRATION_LOCK_NAME,))
         lock_acquired = True
         conn.autocommit = False
 
-        expand, backfill, constraints, composite_index, cutover = (
-            STAGED_TENANT_MIGRATIONS
-        )
+        expand, backfill, constraints, composite_index, cutover = STAGED_TENANT_MIGRATIONS
         _expand_tenant_schema(conn, expand)
         _backfill_tenant_ids(conn, backfill)
         _validate_tenant_constraints(conn, constraints)
@@ -959,9 +947,7 @@ def postgres_advisory_lease(name: str) -> Iterator[None]:
         row = cur.fetchone()
         acquired = bool(row and row[0])
         if not acquired:
-            raise PostgresAdvisoryLeaseUnavailable(
-                "PostgreSQL advisory lease is already held"
-            )
+            raise PostgresAdvisoryLeaseUnavailable("PostgreSQL advisory lease is already held")
         yield
     finally:
         if acquired and cur is not None:
@@ -1130,7 +1116,7 @@ def _create_schema_sync() -> None:
                 embedding vector({dimension}),
                 metadata JSONB DEFAULT '{{}}',
                 partition TEXT DEFAULT 'general',
-                created_at TIMESTAMP DEFAULT NOW(),
+                created_at TIMESTAMPTZ DEFAULT NOW(),
                 CONSTRAINT {TENANT_NOT_NULL_CONSTRAINT}
                     CHECK (tenant_id IS NOT NULL),
                 CONSTRAINT {TENANT_FOREIGN_KEY_CONSTRAINT}
@@ -1272,7 +1258,9 @@ def _check_postgres_health_sync() -> bool:
                 EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector')
             """
         )
-        documents_ready, metadata_ready, migrations_ready, tenants_ready, vector_ready = cur.fetchone()
+        documents_ready, metadata_ready, migrations_ready, tenants_ready, vector_ready = (
+            cur.fetchone()
+        )
         if not (
             documents_ready
             and metadata_ready
@@ -1285,8 +1273,13 @@ def _check_postgres_health_sync() -> bool:
             "SELECT migration_id, checksum FROM rag_schema_migrations WHERE migration_id = ANY(%s)",
             ([migration_id for migration_id, _checksum in SCHEMA_MIGRATIONS],),
         )
-        applied_migrations = {str(migration_id): str(checksum) for migration_id, checksum in cur.fetchall()}
-        if any(applied_migrations.get(migration_id) != checksum for migration_id, checksum in SCHEMA_MIGRATIONS):
+        applied_migrations = {
+            str(migration_id): str(checksum) for migration_id, checksum in cur.fetchall()
+        }
+        if any(
+            applied_migrations.get(migration_id) != checksum
+            for migration_id, checksum in SCHEMA_MIGRATIONS
+        ):
             return False
         try:
             tenant_check, tenant_foreign_key = _tenant_constraints(cur)
@@ -1456,7 +1449,9 @@ async def add_documents(
     metadatas: list[dict] | None = None,
     partition: str = "general",
 ) -> int:
-    return await _execute_sync(_add_documents_sync, ids, embeddings, documents, metadatas, partition)
+    return await _execute_sync(
+        _add_documents_sync, ids, embeddings, documents, metadatas, partition
+    )
 
 
 def _replace_document_sync(
@@ -1594,11 +1589,7 @@ def document_commit_matches(
             ),
         )
         row = cur.fetchone()
-        return bool(
-            row
-            and int(row[0]) == expected_chunks
-            and int(row[1]) == expected_chunks
-        )
+        return bool(row and int(row[0]) == expected_chunks and int(row[1]) == expected_chunks)
     finally:
         if cur is not None:
             cur.close()
@@ -1782,11 +1773,11 @@ def _extract_chinese_keywords(query: str) -> list[str]:
     ]
 
     keywords: list[str] = [title for title in law_titles if title in query]
-    keywords.extend(
-        re.findall(r"[\u4e00-\u9fffA-Za-z0-9]+(?:_[\u4e00-\u9fffA-Za-z0-9]+)+", query)
-    )
+    keywords.extend(re.findall(r"[\u4e00-\u9fffA-Za-z0-9]+(?:_[\u4e00-\u9fffA-Za-z0-9]+)+", query))
     keywords.extend(re.findall(r"第[一二三四五六七八九十百千万零〇两0-9]+条", query))
-    keywords.extend(re.findall(r"[\u4e00-\u9fff]{2,12}(?:罪|合同|劳动合同|解除劳动合同|定义|刑罚)", query))
+    keywords.extend(
+        re.findall(r"[\u4e00-\u9fff]{2,12}(?:罪|合同|劳动合同|解除劳动合同|定义|刑罚)", query)
+    )
 
     parts = [p.strip() for p in cleaned.split() if len(p.strip()) >= 2]
     for part in parts:

@@ -3,9 +3,22 @@ export const truncateText = (value = '', maxLength = 180) => {
   return text.length > maxLength ? text.slice(0, maxLength) + '...' : text
 }
 
+const TIME_WITHOUT_ZONE = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?$/
+
+export const parseTimestamp = (value) => {
+  if (!value) return null
+  const text = String(value).trim()
+  if (!text) return null
+  const normalized = TIME_WITHOUT_ZONE.test(text)
+    ? `${text.replace(' ', 'T')}Z`
+    : text
+  const date = new Date(normalized)
+  return Number.isNaN(date.getTime()) ? null : date
+}
+
 export const formatTime = (dateStr) => {
-  if (!dateStr) return ''
-  const date = new Date(dateStr)
+  const date = parseTimestamp(dateStr)
+  if (!date) return ''
   const now = new Date()
   const diff = now - date
 

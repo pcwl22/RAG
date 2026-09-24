@@ -69,7 +69,7 @@ def test_faithfulness_is_supported_claim_ratio() -> None:
 
 
 def test_context_precision_uses_rank_aware_average_precision() -> None:
-    judge, _calls = _judge(
+    judge, calls = _judge(
         {
             "verdicts": [
                 {"index": 0, "relevant": True},
@@ -88,6 +88,9 @@ def test_context_precision_uses_rank_aware_average_precision() -> None:
     )
 
     assert result.value == pytest.approx((1 + 2 / 3) / 2)
+    system_prompt = calls.calls[0]["messages"][0]["content"]
+    assert "exactly 3 contexts indexed from 0 through 2" in system_prompt
+    assert "exactly 3 verdict entries, no more and no fewer" in system_prompt
 
 
 def test_context_recall_is_attributed_reference_claim_ratio() -> None:

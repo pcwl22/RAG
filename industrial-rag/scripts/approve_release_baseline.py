@@ -348,21 +348,26 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    project_root = args.baseline.resolve().parents[1]
+    baseline_path = args.baseline.resolve()
+    ragas_gate_path = args.ragas_gate.resolve()
+    expanded_gate_path = args.expanded_gate.resolve()
+    holdout_gate_path = args.holdout_gate.resolve()
+    production_env_path = args.production_env.resolve()
+    project_root = baseline_path.parents[1]
     candidate = approve(
-        args.baseline,
+        baseline_path,
         project_root,
-        ragas_gate_path=args.ragas_gate,
-        expanded_gate_path=args.expanded_gate,
-        holdout_gate_path=args.holdout_gate,
-        production_env_path=args.production_env,
+        ragas_gate_path=ragas_gate_path,
+        expanded_gate_path=expanded_gate_path,
+        holdout_gate_path=holdout_gate_path,
+        production_env_path=production_env_path,
     )
 
     if not args.write:
         print(json.dumps({"approved_candidate": True, "status": candidate["status"]}, indent=2))
         return
 
-    candidate_path = args.baseline.with_name(f"{args.baseline.name}.candidate")
+    candidate_path = baseline_path.with_name(f"{baseline_path.name}.candidate")
     try:
         candidate_path.write_text(
             json.dumps(candidate, ensure_ascii=False, indent=2) + "\n",
@@ -370,11 +375,11 @@ def main() -> None:
             newline="\n",
         )
         validate(candidate_path, project_root)
-        candidate_path.replace(args.baseline)
+        candidate_path.replace(baseline_path)
     finally:
         candidate_path.unlink(missing_ok=True)
 
-    print(json.dumps({"approved": True, "baseline": str(args.baseline)}, indent=2))
+    print(json.dumps({"approved": True, "baseline": str(baseline_path)}, indent=2))
 
 
 if __name__ == "__main__":

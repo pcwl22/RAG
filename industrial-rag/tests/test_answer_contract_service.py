@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from app.llm.answer_contract import AnswerContractError
+from app.llm.answer_contract import AnswerContractError, AnswerEvidence, ValidatedAnswer
 from app.service import chat_service
 from app.service.chat_service import Generator
 from app.service.enhanced_query_service import EnhancedQueryService
@@ -69,6 +69,39 @@ def test_generation_retries_once_then_formats_server_verified_evidence():
         assert "核验原文：第七条 用人单位自用工之日起建立劳动关系。" in answer
 
     asyncio.run(run())
+
+
+def test_verified_answer_groups_multiple_quotes_from_the_same_source():
+    generator, _calls = _generator([])
+    answer = ValidatedAnswer(
+        conclusion="出口压力超过阈值时应停机。复位前应等待九十秒。",
+        evidence=(
+            AnswerEvidence(
+                claim="出口压力超过阈值时应停机",
+                context_id="ctx-1",
+                quote="出口压力超过 1.80 MPa 时必须立即停机",
+            ),
+            AnswerEvidence(
+                claim="复位前应等待九十秒",
+                context_id="ctx-1",
+                quote="切断主电源后等待 90 秒",
+            ),
+        ),
+        insufficient_context=False,
+    )
+    docs = [
+        {
+            "id": "pump-1",
+            "content": "出口压力超过 1.80 MPa 时必须立即停机；切断主电源后等待 90 秒。",
+            "metadata": {"filename": "pump-manual.txt"},
+        }
+    ]
+
+    rendered = generator.format_verified_answer(answer, docs)
+
+    assert rendered.count("pump-manual.txt") == 1
+    assert "出口压力超过 1.80 MPa 时必须立即停机" in rendered
+    assert "切断主电源后等待 90 秒" in rendered
 
 
 def test_structured_retry_is_deterministic_and_targets_missing_claim_evidence():

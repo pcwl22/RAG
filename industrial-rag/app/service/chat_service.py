@@ -1,4 +1,5 @@
 """Answer generation for retrieved RAG contexts."""
+
 import hashlib
 import re
 from collections.abc import AsyncIterator
@@ -231,7 +232,9 @@ def _evidence_terms(query: str | None, answer: str | None) -> list[str]:
     return unique[:80]
 
 
-def _filter_basis_docs(context_docs: list[dict], query: str | None, answer: str | None) -> list[dict]:
+def _filter_basis_docs(
+    context_docs: list[dict], query: str | None, answer: str | None
+) -> list[dict]:
     if not context_docs:
         return []
 
@@ -402,13 +405,9 @@ def _contract_retry_guidance(exc: Exception) -> str:
             "风险或 quote 未出现的法律后果；claim 与分句必须完全相同。"
         )
     elif "insufficient-context answer must not include evidence" in reason:
-        repair = (
-            "资料不足模式必须使用 evidence: []，不得保留任何引用；conclusion 只说明资料不足。"
-        )
+        repair = "资料不足模式必须使用 evidence: []，不得保留任何引用；conclusion 只说明资料不足。"
     elif "response fields do not match the answer contract" in reason:
-        repair = (
-            "删除所有额外字段；每个 evidence 项也只能包含 claim、context_id、quote 三个字段。"
-        )
+        repair = "删除所有额外字段；每个 evidence 项也只能包含 claim、context_id、quote 三个字段。"
     else:
         repair = (
             "修正所有不存在的 context_id，从对应上下文逐字复制连续 quote，并删除任何未被"
@@ -440,7 +439,9 @@ def _has_no_supported_conclusion(answer: str) -> bool:
         "基础规则",
         "可以确定",
     ]
-    if any(marker in normalized for marker in supported_conclusion_markers) or _article_numbers(answer):
+    if any(marker in normalized for marker in supported_conclusion_markers) or _article_numbers(
+        answer
+    ):
         return False
 
     return (
@@ -477,14 +478,11 @@ class Generator:
         doc: dict,
         content: str,
     ) -> str:
-        return (
-            f"[context_id={context_id}]\n"
-            + self._context_template().format(
-                index=index,
-                source=_doc_source(doc),
-                score=result_score(doc),
-                content=content,
-            )
+        return f"[context_id={context_id}]\n" + self._context_template().format(
+            index=index,
+            source=_doc_source(doc),
+            score=result_score(doc),
+            content=content,
         )
 
     def _context_entries(self, docs: list[dict]) -> list[tuple[str, dict, str]]:
@@ -571,7 +569,9 @@ class Generator:
         basis_docs = _filter_basis_docs(context_docs, query, answer)
         file_locations = self._build_file_locations(basis_docs)
         if file_locations:
-            basis_text = "\n".join(f"{index}. {location}" for index, location in enumerate(file_locations, 1))
+            basis_text = "\n".join(
+                f"{index}. {location}" for index, location in enumerate(file_locations, 1)
+            )
         else:
             basis_text = "无"
 
@@ -588,11 +588,9 @@ class Generator:
             return format_no_context_answer()
 
         entries = {
-            context_id: doc
-            for context_id, doc, _content in self._context_entries(context_docs)
+            context_id: doc for context_id, doc, _content in self._context_entries(context_docs)
         }
-        basis_lines: list[str] = []
-        seen: set[str] = set()
+        grouped_evidence: dict[tuple[str, str], list[str]] = {}
         for evidence in answer.evidence:
             doc = entries.get(evidence.context_id)
             if doc is None:
@@ -601,10 +599,14 @@ class Generator:
                 continue
             source = _doc_source(doc)
             location = _doc_location(doc)
-            line = f"{source}：{location}；核验原文：{evidence.quote}"
-            if line not in seen:
-                seen.add(line)
-                basis_lines.append(f"{len(basis_lines) + 1}. {line}")
+            quotes = grouped_evidence.setdefault((source, location), [])
+            if evidence.quote not in quotes:
+                quotes.append(evidence.quote)
+
+        basis_lines = [
+            f"{index}. {source}：{location}；核验原文：{'；'.join(quotes)}"
+            for index, ((source, location), quotes) in enumerate(grouped_evidence.items(), 1)
+        ]
 
         if not basis_lines:
             return format_no_context_answer()
@@ -718,7 +720,7 @@ class Generator:
         answer = answer.strip()
         answer_match = re.search(r"(?:##\s*)?【回答】", answer)
         if answer_match:
-            answer_body = answer[answer_match.end():]
+            answer_body = answer[answer_match.end() :]
             answer_body = re.split(
                 r"\n\s*---\s*\n|\n\s*依据[:：]|\n(?:##\s*)?【匹配文件】|\n(?:##\s*)?【文件具体位置（文件章节页码）】|\n(?:##\s*)?【文件具体位置和内容（文件章节页码）】|\n(?:##\s*)?【文件具体位置和内容】",
                 answer_body,
@@ -775,9 +777,7 @@ class Generator:
             "provider": provider,
             "model": provider_config.get("model_name"),
             "prompt_sha256": hashlib.sha256(prompt_material.encode("utf-8")).hexdigest(),
-            "rendered_context_sha256": hashlib.sha256(
-                rendered_context.encode("utf-8")
-            ).hexdigest(),
+            "rendered_context_sha256": hashlib.sha256(rendered_context.encode("utf-8")).hexdigest(),
             "documents": context_docs,
         }
 
@@ -805,7 +805,9 @@ class Generator:
                                 self._context_map(context_docs),
                                 query,
                             )
-                            return self.format_verified_answer(cached_validated, context_docs, query)
+                            return self.format_verified_answer(
+                                cached_validated, context_docs, query
+                            )
                         except AnswerContractError:
                             logger.info("Ignoring an ungrounded semantic-cache entry")
                             cached = None
@@ -902,8 +904,7 @@ class Generator:
         max_tokens: int | None = None,
     ) -> str:
         prompt = "\n\n".join(
-            f"{msg.get('role', 'user').capitalize()}: {msg.get('content', '')}"
-            for msg in messages
+            f"{msg.get('role', 'user').capitalize()}: {msg.get('content', '')}" for msg in messages
         )
         return await self.llm.generate(
             prompt=f"{prompt}\n\nAssistant:",
@@ -918,8 +919,7 @@ class Generator:
         max_tokens: int | None = None,
     ) -> AsyncIterator[str]:
         prompt = "\n\n".join(
-            f"{msg.get('role', 'user').capitalize()}: {msg.get('content', '')}"
-            for msg in messages
+            f"{msg.get('role', 'user').capitalize()}: {msg.get('content', '')}" for msg in messages
         )
         async for chunk in self.llm.generate_stream(
             prompt=f"{prompt}\n\nAssistant:",

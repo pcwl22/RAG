@@ -3,7 +3,7 @@
   "hash_contract": "sha256-canonical-text-v1",
   "status": "approved",
   "blocked_reasons": [],
-  "evaluated_at": "2026-09-20T12:01:26.039583+00:00",
+  "evaluated_at": "2026-09-24T05:35:05.452642+00:00",
   "datasets": {
     "legal_expanded_240.jsonl": {
       "sha256": "46d667189610583256f8e16fc6bdcb413048394fda618ef8d6a55eeef3d898f3",
@@ -31,6 +31,7 @@
       "app/service/chat_service.py",
       "app/service/enhanced_query_service.py",
       "app/storage",
+      "app/vectorstore/migrations",
       "app/vectorstore/postgres_store.py",
       "app/vectorstore/storage_adapter.py",
       "app/utils/config.py",
@@ -73,7 +74,7 @@
       "scripts/validate_release_baseline.py",
       "security/evaluation_dependency_exceptions.toml"
     ],
-    "sha256": "20a96c6bab70ea4b4bb84085ed9190fc3c6351be36d209b020dbba739f1fd7ee"
+    "sha256": "ffb7197737a6209a64ec0a0d90ee8aea215ed7426d5eaa36f8bb4f71e9c47d00"
   },
   "hash_contract_migration": {
     "from_schema_version": 8,
@@ -180,7 +181,7 @@
       "model_name": "deepseek-flash",
       "endpoint_sha256": "a34e2a4708ed1c61008a151688838dcf1c44d4e7f08054633e72ba7c0b16cfc1"
     },
-    "retrieval_runtime_contract_sha256": "bc7fc87e5997383f09bcc7ab1e784b0f2b1aa40480e1b0dc0526d1c0bf0a8925",
+    "retrieval_runtime_contract_sha256": "5de3714f5de7018fa50ab2aa42194884c0257a443cffeb94c14ec7f2ea003825",
     "answer_generation_policy_sha256": "fadf20a950fb1502a5c6e9c213a8c0af3cce18a5deb4273aca222101a74a7212",
     "judge_request_policy_sha256": "fadf20a950fb1502a5c6e9c213a8c0af3cce18a5deb4273aca222101a74a7212",
     "evaluation_lock": "requirements-evaluation.lock.txt",
@@ -189,19 +190,19 @@
   },
   "checks": {
     "answer_accuracy": {
-      "value": 0.75,
+      "value": 0.7625,
       "minimum": 0.7
     },
     "faithfulness": {
-      "value": 0.8416666666666667,
+      "value": 0.9091269841269842,
       "minimum": 0.8
     },
     "context_precision": {
-      "value": 0.9944444444444444,
+      "value": 0.9879629629629629,
       "minimum": 0.6
     },
     "context_recall": {
-      "value": 0.9239322714322714,
+      "value": 0.8870731120731121,
       "minimum": 0.7
     },
     "citation_recall": {

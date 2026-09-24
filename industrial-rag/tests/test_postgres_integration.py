@@ -1,4 +1,5 @@
 """Real pgvector integration coverage, enabled explicitly in CI."""
+
 import asyncio
 import json
 import os
@@ -65,6 +66,11 @@ def test_real_postgres_fresh_schema_is_created_at_the_final_contract(monkeypatch
                 "documents_pkey",
                 ("tenant_id", "id"),
             )
+            cur.execute(
+                "SELECT format_type(atttypid, atttypmod) FROM pg_attribute "
+                "WHERE attrelid = 'documents'::regclass AND attname = 'created_at'"
+            )
+            assert cur.fetchone()[0] == "timestamp with time zone"
             cur.execute("SELECT COUNT(*) FROM documents WHERE tenant_id IS NULL")
             assert cur.fetchone()[0] == 0
             cur.execute(
@@ -200,14 +206,12 @@ def test_real_postgres_legacy_upgrade_is_staged_and_lock_failure_is_rerunnable(
             )
             assert inspect_cur.fetchone()[0] == ["id"]
             inspect_cur.execute(
-                "SELECT migration_id FROM rag_schema_migrations "
-                "WHERE migration_id = ANY(%s)",
+                "SELECT migration_id FROM rag_schema_migrations WHERE migration_id = ANY(%s)",
                 ([migration[0] for migration in postgres_store.STAGED_TENANT_MIGRATIONS],),
             )
             applied = {row[0] for row in inspect_cur.fetchall()}
             assert applied == {
-                migration[0]
-                for migration in postgres_store.STAGED_TENANT_MIGRATIONS[:4]
+                migration[0] for migration in postgres_store.STAGED_TENANT_MIGRATIONS[:4]
             }
         finally:
             inspect_cur.close()
@@ -241,6 +245,11 @@ def test_real_postgres_legacy_upgrade_is_staged_and_lock_failure_is_rerunnable(
                 "tenant_id",
                 "id",
             )
+            final_cur.execute(
+                "SELECT format_type(atttypid, atttypmod) FROM pg_attribute "
+                "WHERE attrelid = 'documents'::regclass AND attname = 'created_at'"
+            )
+            assert final_cur.fetchone()[0] == "timestamp with time zone"
             final_cur.execute(
                 "SELECT migration_id, checksum FROM rag_schema_migrations "
                 "WHERE migration_id = ANY(%s)",
@@ -320,9 +329,7 @@ def test_real_postgres_schema_health_and_citation_pairing(monkeypatch):
                 "SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE oid = 'documents'::regclass"
             )
             assert cur.fetchone() == (True, True)
-            cur.execute(
-                "SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = 'rag_app'"
-            )
+            cur.execute("SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = 'rag_app'")
             assert cur.fetchone() == (False, False)
             cur.execute(
                 """
@@ -529,9 +536,7 @@ def test_real_postgres_prevents_cross_tenant_read_and_delete(monkeypatch):
                 lambda: postgres_store.get_documents_by_ids([row_a, row_b], "tenant-test"),
             )
             assert [doc["id"] for doc in docs_a] == [row_a]
-            assert await as_tenant(
-                tenant_a, lambda: postgres_store.delete_document(row_b)
-            ) is False
+            assert await as_tenant(tenant_a, lambda: postgres_store.delete_document(row_b)) is False
 
             docs_b = await as_tenant(
                 tenant_b,

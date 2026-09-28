@@ -595,6 +595,27 @@ def test_embedding_fingerprint_changes_with_inference_runtime(monkeypatch):
     assert upgraded != current
 
 
+def test_torch_cpu_and_cuda_builds_share_embedding_fingerprint(monkeypatch):
+    versions = {
+        "torch": "2.13.0+cpu",
+        "transformers": "5.16.1",
+        "sentence-transformers": "6.0.0",
+        "tokenizers": "0.23.1",
+    }
+    monkeypatch.setattr(
+        postgres_store.importlib.metadata,
+        "version",
+        lambda distribution: versions[distribution],
+    )
+    cpu = postgres_store._runtime_schema_metadata()["embedding_fingerprint"]
+    versions["torch"] = "2.13.0+cu126"
+    cuda = postgres_store._runtime_schema_metadata()["embedding_fingerprint"]
+    assert cuda == cpu
+    versions["torch"] = "2.14.0+cu126"
+    upgraded = postgres_store._runtime_schema_metadata()["embedding_fingerprint"]
+    assert upgraded != cpu
+
+
 def test_retrievers_default_threshold_matches_config_default(monkeypatch):
     docs = [
         {"id": "low", "score": 0.04, "metadata": {"document_id": "doc1", "chunk_index": 0}},

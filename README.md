@@ -235,6 +235,25 @@ E:\RAG\models\
 └── bge-reranker-v2-m3\
 ```
 
+仓库不保存模型权重。全新克隆后，可使用仓库内的固定来源清单下载并校验模型：
+
+```powershell
+New-Item -ItemType Directory -Force models | Out-Null
+Copy-Item industrial-rag/model-sources/model-manifest.json models/model-manifest.json
+(Get-FileHash industrial-rag/model-sources/model-manifest.json -Algorithm SHA256).Hash.ToLowerInvariant()
+```
+
+将输出的哈希填入 `industrial-rag/.env` 的
+`MODEL_MANIFEST_SHA256=sha256:<哈希>`，替换示例中的全零占位符。完成第 4 步的
+Python 环境安装后，在 `industrial-rag` 目录执行：
+
+```powershell
+python -m app.embedding.model_bundle prepare
+```
+
+下载器会按固定的 Hugging Face commit 下载两种模型并校验内容。首次下载需要网络，
+建议预留至少 10 GB 磁盘空间。启动 Compose API 前也要完成此步骤：本地模型目录以只读方式挂载。
+
 如果仓库不在 `E:\RAG`，请修改 `industrial-rag/config/laptop.yaml` 中的 `embedding.model_path` 和 `reranker.model_path`。
 
 ### 6. 启动 API
@@ -685,6 +704,9 @@ OIDC HTTPS 和 `rediss://`。本地 Keycloak/Redis 验收可显式附加 `--allo
 此参数不应用于生产。
 
 ### PostgreSQL 备份与恢复
+
+公开仓库中保存了一个已完成隔离恢复演练的数据库快照。全新克隆的恢复步骤见
+[数据库快照说明](database/README.md)。
 
 备份脚本生成 PostgreSQL custom-format 归档，先写临时文件再原子发布。建议通过 `PGHOST`、
 `PGPORT`、`PGDATABASE`、`PGUSER`、`PGPASSWORD` 注入受限备份账号：

@@ -2,7 +2,7 @@
 
 ## Local startup
 
-1. Create `.env` from `.env.example` and set `POSTGRES_PASSWORD` and one LLM key. The loopback-only `laptop` profile keeps authentication disabled; `RAG_API_KEY` is required by the `base`/Compose profile.
+1. The committed `.env` contains public recovery settings and real local service credentials. Replace the `DEEPSEEK_API_KEY` placeholder with your LLM key before starting. Use `.env.example` if you need independent credentials. The loopback-only `laptop` profile keeps authentication disabled; `RAG_API_KEY` is required by the `base`/Compose profile.
 2. Start dependencies with `docker compose -f ..\docker-compose.yml up -d postgres redis`.
 3. Use the pinned GPU environment in `requirements-gpu-verified.txt` when running CUDA workloads.
 4. Start the API with `uvicorn app.main:app --reload`.

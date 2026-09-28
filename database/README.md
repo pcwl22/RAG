@@ -10,12 +10,12 @@
 
 归档包含数据库中的文档正文、向量、元数据、租户和迁移记录。它不包含 `.env`、
 `industrial-rag/data/uploads` 中的原始上传文件、Redis/Keycloak 卷或模型权重。
-环境变量模板见仓库中的 `.env.example` 和 `industrial-rag/.env.example`；
-模型 API Key 保持占位符，实际密钥需在重建时另行配置。
+仓库同时跟踪根目录 `.env` 和 `industrial-rag/.env`：模型服务 API Key 保持占位符，
+其余当前本地凭据公开保留。需要独立凭据时可参考两份 `.env.example`。
 
 ## 从新克隆恢复
 
-先按根目录 `README.md` 创建 `industrial-rag/.env` 并设置数据库密码。
+仓库已包含 `industrial-rag/.env` 和数据库凭据；先按根目录 `README.md` 核对配置。
 在**全新、空白的 PostgreSQL 卷**上，从仓库根目录执行：
 
 ```powershell

@@ -164,6 +164,7 @@ def test_tenant_rate_limit_has_an_application_deadline(monkeypatch):
 
 
 def test_redis_client_receives_transport_timeouts(monkeypatch):
+    monkeypatch.delenv("REDIS_URL", raising=False)
     captured = {}
 
     class ClosableRedis(FakeRedis):

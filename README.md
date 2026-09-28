@@ -156,9 +156,9 @@ Set-Location RAG
 
 ### 2. 配置环境变量
 
-```powershell
-Copy-Item industrial-rag\.env.example industrial-rag\.env
-```
+仓库已包含公开恢复配置 `industrial-rag/.env` 和根目录 `.env`。其中所有模型服务
+`DEEPSEEK_API_KEY` 都是占位符，需填入自己的模型服务 Key；其余当前凭据按恢复要求
+公开保留。需要重新生成独立配置时可参考两份 `.env.example`。
 
 编辑 `industrial-rag/.env`，至少设置：
 
@@ -196,7 +196,7 @@ python scripts\switch_llm_env.py --env-file .env --activate-profile 1 --profile-
 
 切换会在写入前校验全部新值，并以同目录临时文件原子替换 `.env`；重复变量、带凭据或查询参数的 URL、非本机 HTTP 地址会被拒绝。应用和评测进程在启动时读取配置，因此切换后需重启相应进程/容器。发布评测报告仍绑定 URL 的非敏感哈希与模型名，切换后不能沿用旧 checkpoint 或审批结果。
 
-> 不要提交 `.env`。仓库只跟踪不含真实凭据的 `.env.example`。
+> 两份 `.env` 已按恢复要求公开；不要将自己的模型服务 API Key 提交回仓库。
 
 ### 3. 启动 PostgreSQL 和 Redis
 
@@ -731,7 +731,7 @@ python scripts\restore_postgres.py `
 
 ## 安全说明
 
-- `.env`、本地模型、数据库卷和运行评估报告已加入 `.gitignore`。
+- 两份 `.env` 和 `database/` 中的数据库快照已按恢复要求公开；本地模型、运行数据库卷和生成报告仍未跟踪。
 - API Key 使用恒定时间比较；OIDC access token 校验签名、issuer、audience、过期时间、
   必需的 `tenant_id` 和角色。健康检查保持公开，其他运维与 API 路径受认证保护。
 - 前端使用 OIDC Authorization Code + PKCE，不包含或由 Nginx 注入永久管理员 API Key。
@@ -860,7 +860,7 @@ Reranker 使用绝对相关性阈值，低于阈值时返回 0 条是合法结�
 1. 从 `main` 创建功能分支。
 2. 修改代码时同步添加或更新测试。
 3. 提交前运行后端、前端和 Compose 验证。
-4. 不提交 `.env`、API Key、模型权重、数据库文件和生成报告。
+4. 不提交新的模型服务 API Key、模型权重和生成报告；公开配置及数据库快照按本仓库恢复流程维护。
 5. 通过 Pull Request 合并，确保 GitHub Actions 全部通过。
 
 ## 许可证

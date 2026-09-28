@@ -52,8 +52,9 @@ processed/
 logs/
 *.log
 
-# 环境变量
+# 环境变量：公开恢复快照 .env 是显式例外
 .env
+!.env
 .env.local
 
 # Jupyter

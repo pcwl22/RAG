@@ -266,7 +266,9 @@ def _validate_schema_metadata(existing: dict[str, str], document_count: int) -> 
         if actual is not None and actual != expected[key] and document_count > 0:
             raise RuntimeError(
                 f"PostgreSQL corpus fingerprint mismatch for {key}. "
-                "Rebuild the corpus with an explicit re-embedding migration before startup."
+                "Run `python scripts/reembed_postgres_corpus.py --inspect` from "
+                "industrial-rag for a read-only plan, then follow its reviewed re-embedding "
+                "or source re-ingestion action before startup."
             )
 
 

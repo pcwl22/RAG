@@ -53,8 +53,21 @@ def test_backup_table_accepts_timestamped_repository_name() -> None:
     assert reembed._validate_backup_table(value) == value
 
 
+def test_document_embedding_dimension_reads_pgvector_typmod() -> None:
+    class Cursor:
+        def execute(self, _query):
+            return None
+
+        def fetchone(self):
+            return ("vector(768)", True)
+
+    assert reembed._document_embedding_dimension(Cursor()) == 768
+    assert reembed._document_embedding_contract(Cursor()) == (768, True)
+
+
 def test_no_change_still_validates_database_identity_and_count(monkeypatch) -> None:
     fingerprint = "a" * 64
+    chunking_fingerprint = "c" * 64
     calls = {"connected": 0, "identity": 0, "rollback": 0, "closed": 0}
 
     class Cursor:
@@ -88,7 +101,11 @@ def test_no_change_still_validates_database_identity_and_count(monkeypatch) -> N
     monkeypatch.setattr(
         reembed,
         "_runtime_schema_metadata",
-        lambda: {"embedding_fingerprint": fingerprint, "embedding_dimension": "1024"},
+        lambda: {
+            "embedding_fingerprint": fingerprint,
+            "embedding_dimension": "1024",
+            "chunking_fingerprint": chunking_fingerprint,
+        },
     )
     monkeypatch.setattr(reembed, "_connection_options", lambda: {})
     monkeypatch.setattr(
@@ -99,7 +116,14 @@ def test_no_change_still_validates_database_identity_and_count(monkeypatch) -> N
     monkeypatch.setattr(
         reembed,
         "_current_metadata",
-        lambda _cursor: {"embedding_fingerprint": fingerprint},
+        lambda _cursor: {
+            "embedding_fingerprint": fingerprint,
+            "embedding_dimension": "1024",
+            "chunking_fingerprint": chunking_fingerprint,
+        },
+    )
+    monkeypatch.setattr(
+        reembed, "_document_embedding_contract", lambda _cursor: (1024, False)
     )
     monkeypatch.setattr(
         reembed,
@@ -108,7 +132,9 @@ def test_no_change_still_validates_database_identity_and_count(monkeypatch) -> N
     )
 
     result = reembed.rebuild(
+        source_dimension=1024,
         source_fingerprint=fingerprint,
+        source_chunking_fingerprint=chunking_fingerprint,
         expected_count=1,
         batch_size=8,
         backup_table="rag_embedding_backup_20260910153000",
@@ -119,3 +145,169 @@ def test_no_change_still_validates_database_identity_and_count(monkeypatch) -> N
     assert result["document_count"] == 1
     assert result["source_snapshot_sha256"]
     assert calls == {"connected": 1, "identity": 1, "rollback": 1, "closed": 1}
+
+
+def test_inspect_corpus_returns_copyable_review_and_apply_commands(monkeypatch) -> None:
+    source_fingerprint = "a" * 64
+    target_fingerprint = "b" * 64
+    chunking_fingerprint = "c" * 64
+    calls = {"identity": 0, "rollback": 0, "closed": 0}
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+        def rollback(self):
+            calls["rollback"] += 1
+
+        def close(self):
+            calls["closed"] += 1
+
+    psycopg2 = ModuleType("psycopg2")
+    psycopg2.connect = lambda **_options: Connection()
+    monkeypatch.setitem(sys.modules, "psycopg2", psycopg2)
+    monkeypatch.setattr(reembed, "_connection_options", lambda: {})
+    monkeypatch.setattr(
+        reembed,
+        "_require_migration_identity",
+        lambda _cursor: calls.__setitem__("identity", calls["identity"] + 1),
+    )
+    monkeypatch.setattr(
+        reembed,
+        "_current_metadata",
+        lambda _cursor: {
+            "embedding_fingerprint": source_fingerprint,
+            "embedding_dimension": "1024",
+            "chunking_fingerprint": chunking_fingerprint,
+        },
+    )
+    monkeypatch.setattr(
+        reembed, "_document_embedding_contract", lambda _cursor: (1024, False)
+    )
+    monkeypatch.setattr(reembed, "_document_count", lambda _cursor: 42)
+    monkeypatch.setattr(
+        reembed,
+        "_runtime_schema_metadata",
+        lambda: {
+            "embedding_fingerprint": target_fingerprint,
+            "embedding_dimension": "1024",
+            "chunking_fingerprint": chunking_fingerprint,
+        },
+    )
+    monkeypatch.setattr(
+        reembed,
+        "_default_backup_table",
+        lambda: "rag_embedding_backup_20260924150000",
+    )
+
+    result = reembed.inspect_corpus()
+
+    assert result["status"] == "migration_required"
+    assert result["document_count"] == 42
+    assert "--from-dimension 1024" in result["plan_command"]
+    assert f"--from-fingerprint {source_fingerprint}" in result["plan_command"]
+    assert (
+        f"--from-chunking-fingerprint {chunking_fingerprint}" in result["plan_command"]
+    )
+    assert "--confirm-document-count 42" in result["plan_command"]
+    assert result["apply_command"] == f'{result["plan_command"]} --apply'
+    assert calls == {"identity": 1, "rollback": 1, "closed": 1}
+
+
+def test_inspect_requires_reingest_for_chunking_only_change(monkeypatch) -> None:
+    embedding_fingerprint = "a" * 64
+    source_chunking_fingerprint = "b" * 64
+    target_chunking_fingerprint = "c" * 64
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+        def rollback(self):
+            return None
+
+        def close(self):
+            return None
+
+    psycopg2 = ModuleType("psycopg2")
+    psycopg2.connect = lambda **_options: Connection()
+    monkeypatch.setitem(sys.modules, "psycopg2", psycopg2)
+    monkeypatch.setattr(reembed, "_connection_options", lambda: {})
+    monkeypatch.setattr(reembed, "_require_migration_identity", lambda _cursor: None)
+    monkeypatch.setattr(
+        reembed,
+        "_current_metadata",
+        lambda _cursor: {
+            "embedding_fingerprint": embedding_fingerprint,
+            "embedding_dimension": "1024",
+            "chunking_fingerprint": source_chunking_fingerprint,
+        },
+    )
+    monkeypatch.setattr(
+        reembed, "_document_embedding_contract", lambda _cursor: (1024, False)
+    )
+    monkeypatch.setattr(reembed, "_document_count", lambda _cursor: 42)
+    monkeypatch.setattr(
+        reembed,
+        "_runtime_schema_metadata",
+        lambda: {
+            "embedding_fingerprint": embedding_fingerprint,
+            "embedding_dimension": "1024",
+            "chunking_fingerprint": target_chunking_fingerprint,
+        },
+    )
+
+    result = reembed.inspect_corpus()
+
+    assert result["status"] == "reingest_required"
+    assert "chunking configuration changed" in result["reason"]
+    assert "plan_command" not in result
+    assert "apply_command" not in result
+
+
+def test_rebuild_refuses_to_bless_changed_chunking_metadata(monkeypatch) -> None:
+    source_fingerprint = "a" * 64
+    source_chunking_fingerprint = "b" * 64
+    target_chunking_fingerprint = "c" * 64
+
+    psycopg2 = ModuleType("psycopg2")
+    psycopg2.connect = lambda **_options: pytest.fail("database connection must not be opened")
+    psycopg2.sql = SimpleNamespace()
+    extras = ModuleType("psycopg2.extras")
+    extras.execute_values = lambda *_args, **_kwargs: None
+    monkeypatch.setitem(sys.modules, "psycopg2", psycopg2)
+    monkeypatch.setitem(sys.modules, "psycopg2.extras", extras)
+    monkeypatch.setattr(
+        reembed,
+        "_runtime_schema_metadata",
+        lambda: {
+            "embedding_fingerprint": source_fingerprint,
+            "embedding_dimension": "1024",
+            "chunking_fingerprint": target_chunking_fingerprint,
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="Re-ingest the source corpus"):
+        reembed.rebuild(
+            source_dimension=1024,
+            source_fingerprint=source_fingerprint,
+            source_chunking_fingerprint=source_chunking_fingerprint,
+            expected_count=1,
+            batch_size=8,
+            backup_table="rag_embedding_backup_20260910153000",
+            apply=False,
+        )

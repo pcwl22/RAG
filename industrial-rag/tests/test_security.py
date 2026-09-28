@@ -510,6 +510,92 @@ def test_disabled_authentication_uses_local_admin_identity(monkeypatch):
     asyncio.run(run())
 
 
+def test_loopback_debug_mode_bypasses_ambient_oidc_for_local_frontend(monkeypatch):
+    async def run():
+        monkeypatch.setenv("OIDC_ENABLED", "true")
+        middleware = authentication_middleware(
+            {
+                "app": {"debug": True, "host": "127.0.0.1"},
+                "security": {
+                    "api_key": {"enabled": False, "header_name": "X-API-Key"},
+                    "oidc": {
+                        "enabled": True,
+                        "issuer": "http://localhost:18080/realms/industrial-rag",
+                        "audience": "rag-api",
+                        "jwks_url": "http://localhost:18080/realms/industrial-rag/certs",
+                    },
+                },
+            }
+        )
+        request = Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/api/v1/query/enhanced",
+                "raw_path": b"/api/v1/query/enhanced",
+                "query_string": b"",
+                "headers": [],
+                "client": ("127.0.0.1", 123),
+                "server": ("127.0.0.1", 8000),
+            }
+        )
+
+        async def endpoint(endpoint_request):
+            principal = endpoint_request.state.principal
+            assert principal.subject == "local-system"
+            assert principal.auth_type == "local"
+            assert principal.roles == frozenset({"viewer", "editor", "admin"})
+            return httpx.Response(200)
+
+        response = await middleware(request, endpoint)
+        assert response.status_code == 200
+
+    asyncio.run(run())
+
+
+def test_non_loopback_debug_config_never_bypasses_authentication(monkeypatch):
+    async def run():
+        monkeypatch.setenv("OIDC_ENABLED", "true")
+        middleware = authentication_middleware(
+            {
+                "app": {"debug": True, "host": "0.0.0.0"},
+                "security": {
+                    "api_key": {"enabled": False},
+                    "oidc": {
+                        "enabled": True,
+                        "issuer": "https://issuer.example",
+                        "audience": "rag-api",
+                        "jwks_url": "https://issuer.example/certs",
+                    },
+                },
+            }
+        )
+        request = Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "GET",
+                "scheme": "http",
+                "path": "/api/v1/documents",
+                "raw_path": b"/api/v1/documents",
+                "query_string": b"",
+                "headers": [],
+                "client": ("127.0.0.1", 123),
+                "server": ("127.0.0.1", 8000),
+            }
+        )
+
+        response = await middleware(
+            request,
+            lambda _request: asyncio.sleep(0, result=httpx.Response(200)),
+        )
+        assert response.status_code == 401
+
+    asyncio.run(run())
+
+
 def test_authentication_context_survives_streaming_response(monkeypatch):
     async def run():
         monkeypatch.setenv("RAG_API_KEY", "test-key")

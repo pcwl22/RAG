@@ -74,7 +74,7 @@
       "scripts/validate_release_baseline.py",
       "security/evaluation_dependency_exceptions.toml"
     ],
-    "sha256": "ffb7197737a6209a64ec0a0d90ee8aea215ed7426d5eaa36f8bb4f71e9c47d00"
+    "sha256": "00bcd1fc7a53115b41235d55e2f26c71e2518044a758a343bd663b5389b14e5b"
   },
   "hash_contract_migration": {
     "from_schema_version": 8,
@@ -168,6 +168,46 @@
       "approved_model_revisions": {
         "BAAI/bge-m3": "5617a9f61b028005a4858fdac845db406aefb181",
         "BAAI/bge-reranker-v2-m3": "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e"
+      }
+    },
+    {
+      "from_sha256": "ffb7197737a6209a64ec0a0d90ee8aea215ed7426d5eaa36f8bb4f71e9c47d00",
+      "to_sha256": "38aba1f997cf9bdaf56eafb69b1a656cb75f54ed810c7815aa92949f6d358b85",
+      "reason": "Add read-only PostgreSQL corpus fingerprint inspection and actionable fail-closed migration guidance without changing retrieval behavior.",
+      "evaluation_results_reused": true,
+      "application_dependencies_changed": false,
+      "model_weights_changed": false,
+      "retrieval_behavior_changed": false,
+      "changed_paths": [
+        "app/vectorstore/postgres_store.py",
+        "scripts/reembed_postgres_corpus.py"
+      ],
+      "verification": {
+        "corpus_documents_reembedded": 1867,
+        "backup_rows_verified": 1867,
+        "post_migration_fingerprint_ready": true,
+        "real_user_query_status": 200,
+        "real_user_retrieval_results": 5
+      }
+    },
+    {
+      "from_sha256": "38aba1f997cf9bdaf56eafb69b1a656cb75f54ed810c7815aa92949f6d358b85",
+      "to_sha256": "00bcd1fc7a53115b41235d55e2f26c71e2518044a758a343bd663b5389b14e5b",
+      "reason": "Make PostgreSQL corpus migration dimension-aware, refuse unsafe chunking-only metadata promotion, and atomically rebuild the vector index without changing retrieval behavior.",
+      "evaluation_results_reused": true,
+      "application_dependencies_changed": false,
+      "model_weights_changed": false,
+      "retrieval_behavior_changed": false,
+      "changed_paths": [
+        "app/vectorstore/postgres_store.py",
+        "scripts/reembed_postgres_corpus.py"
+      ],
+      "verification": {
+        "unit_tests_passed": 12,
+        "cross_dimension_integration_tests_passed": 2,
+        "rollback_preserved_source_contract": true,
+        "current_corpus_status": "ready",
+        "current_corpus_document_count": 1867
       }
     }
   ],

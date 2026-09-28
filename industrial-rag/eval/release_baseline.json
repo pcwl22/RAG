@@ -74,7 +74,7 @@
       "scripts/validate_release_baseline.py",
       "security/evaluation_dependency_exceptions.toml"
     ],
-    "sha256": "00bcd1fc7a53115b41235d55e2f26c71e2518044a758a343bd663b5389b14e5b"
+    "sha256": "41a44e54391a8ef2d7f4429112c822558c5b9ca6af3f639594711b1ff5537154"
   },
   "hash_contract_migration": {
     "from_schema_version": 8,
@@ -208,6 +208,29 @@
         "rollback_preserved_source_contract": true,
         "current_corpus_status": "ready",
         "current_corpus_document_count": 1867
+      }
+    },
+    {
+      "from_sha256": "00bcd1fc7a53115b41235d55e2f26c71e2518044a758a343bd663b5389b14e5b",
+      "to_sha256": "41a44e54391a8ef2d7f4429112c822558c5b9ca6af3f639594711b1ff5537154",
+      "reason": "Normalize the PyTorch CPU/CUDA wheel local suffix in the PostgreSQL corpus fingerprint; all 1,867 old and new GPU-generated embedding vectors were compared and are byte-for-byte equal.",
+      "evaluation_results_reused": true,
+      "application_dependencies_changed": false,
+      "model_weights_changed": false,
+      "retrieval_behavior_changed": false,
+      "changed_paths": [
+        "app/vectorstore/postgres_store.py"
+      ],
+      "verification": {
+        "document_vectors_compared": 1867,
+        "document_vectors_exactly_equal": 1867,
+        "retrieval_tests_passed": 36,
+        "restored_document_count": 1867,
+        "restored_tenant_count": 3,
+        "cuda_api_corpus_status": "ready",
+        "cpu_worker_corpus_status": "ready",
+        "postgres_embedding_reranker_redis_healthy": true,
+        "llm_check_pending_user_model_api_key": true
       }
     }
   ],

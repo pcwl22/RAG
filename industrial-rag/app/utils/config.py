@@ -9,6 +9,7 @@
    默认 `laptop`（笔记本推荐配置）。若该文件不存在则回退到 `config/base.yaml`。
 3. 递归替换配置中的 `${VAR}` 占位符为对应环境变量值。
 """
+
 import os
 import re
 from functools import lru_cache
@@ -28,6 +29,7 @@ def _load_dotenv_if_available(path: Path, *, override: bool = False) -> None:
     except ImportError:  # python-dotenv 未安装时降级
         return
     load_dotenv(path, override=override)
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_DIR = PROJECT_ROOT / "config"
@@ -63,9 +65,11 @@ def normalize_openai_base_url(value: str) -> str:
 
 def resolve_queue_provider(config: dict[str, Any]) -> str:
     """Resolve and validate the ingestion queue provider."""
-    provider = str(
-        os.getenv("QUEUE_PROVIDER") or config.get("queue", {}).get("provider", "memory")
-    ).strip().lower()
+    provider = (
+        str(os.getenv("QUEUE_PROVIDER") or config.get("queue", {}).get("provider", "memory"))
+        .strip()
+        .lower()
+    )
     if provider == "rabbitmq":
         provider = "celery"
     if provider not in ALLOWED_QUEUE_PROVIDERS:
@@ -119,9 +123,7 @@ def resolve_object_storage_config(config: dict[str, Any]) -> dict[str, Any]:
         "addressing_style": str(value("S3_ADDRESSING_STYLE", "addressing_style", "path"))
         .strip()
         .lower(),
-        "failed_prefix": str(
-            value("S3_FAILED_PREFIX", "failed_prefix", "failed")
-        ).strip("/"),
+        "failed_prefix": str(value("S3_FAILED_PREFIX", "failed_prefix", "failed")).strip("/"),
         "ca_bundle": ca_bundle,
         "connect_timeout_seconds": positive_int(
             "S3_CONNECT_TIMEOUT_SECONDS",
@@ -146,6 +148,31 @@ def resolve_object_storage_config(config: dict[str, Any]) -> dict[str, Any]:
 
 def validate_runtime_config(config: dict[str, Any]) -> None:
     """Fail fast when runtime settings would otherwise be silently ignored."""
+    llm = config.get("llm", {})
+    if not isinstance(llm, dict):
+        raise ValueError("llm must be a mapping")
+    text_llm = llm.get("text", {})
+    if not isinstance(text_llm, dict):
+        raise ValueError("llm.text must be a mapping")
+    try:
+        healthcheck_timeout = float(text_llm.get("healthcheck_timeout_seconds", 5))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("llm.text.healthcheck_timeout_seconds must be a number") from exc
+    if not 0.1 <= healthcheck_timeout <= 60:
+        raise ValueError("llm.text.healthcheck_timeout_seconds must be between 0.1 and 60")
+    try:
+        readiness_failure_threshold = int(text_llm.get("readiness_failure_threshold", 2))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("llm.text.readiness_failure_threshold must be an integer") from exc
+    if not 1 <= readiness_failure_threshold <= 20:
+        raise ValueError("llm.text.readiness_failure_threshold must be between 1 and 20")
+    try:
+        readiness_failure_grace = float(text_llm.get("readiness_failure_grace_seconds", 60))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("llm.text.readiness_failure_grace_seconds must be a number") from exc
+    if not 0 <= readiness_failure_grace <= 600:
+        raise ValueError("llm.text.readiness_failure_grace_seconds must be between 0 and 600")
+
     queue_provider = resolve_queue_provider(config)
     queue_config = config.get("queue", {})
     reconciliation = (
@@ -183,9 +210,11 @@ def validate_runtime_config(config: dict[str, Any]) -> None:
             raise ValueError(f"{env_name} must be an integer") from exc
         if value < 1 or value > maximum:
             raise ValueError(f"{env_name} must be between 1 and {maximum}")
-    pdf_engine = str(
-        config.get("document_processing", {}).get("pdf", {}).get("engine", "auto")
-    ).strip().lower()
+    pdf_engine = (
+        str(config.get("document_processing", {}).get("pdf", {}).get("engine", "auto"))
+        .strip()
+        .lower()
+    )
     if pdf_engine not in ALLOWED_PDF_ENGINES:
         allowed = ", ".join(sorted(ALLOWED_PDF_ENGINES))
         raise ValueError(f"Unsupported PDF engine '{pdf_engine}'. Expected one of: {allowed}")
@@ -246,21 +275,15 @@ def validate_runtime_config(config: dict[str, Any]) -> None:
             )
     if secure_database_required:
         if postgres_sslmode != "verify-full":
-            raise ValueError(
-                "POSTGRES_SSLMODE must be verify-full in secure/production mode"
-            )
+            raise ValueError("POSTGRES_SSLMODE must be verify-full in secure/production mode")
         if not postgres_sslrootcert:
-            raise ValueError(
-                "POSTGRES_SSLROOTCERT must be configured in secure/production mode"
-            )
+            raise ValueError("POSTGRES_SSLROOTCERT must be configured in secure/production mode")
     min_pool = int(postgres.get("min_pool_size", 1))
     max_pool = int(postgres.get("max_pool_size", 5))
     if min_pool < 1 or max_pool < min_pool:
         raise ValueError("postgres pool sizes must satisfy 1 <= min_pool_size <= max_pool_size")
     if queue_provider == "celery" and max_pool < 2:
-        raise ValueError(
-            "postgres.max_pool_size must be at least 2 for Celery advisory leases"
-        )
+        raise ValueError("postgres.max_pool_size must be at least 2 for Celery advisory leases")
     probes = int(postgres.get("ivfflat_probes", 10))
     if probes < 1:
         raise ValueError("postgres.ivfflat_probes must be at least 1")
@@ -269,9 +292,7 @@ def validate_runtime_config(config: dict[str, Any]) -> None:
     redis_url = str(os.getenv("REDIS_URL") or redis.get("url", "")).strip()
     configured_redis_url = bool(redis_url and not redis_url.startswith("${"))
     redis_validation_required = (
-        queue_provider == "celery"
-        or redis.get("enabled") is True
-        or configured_redis_url
+        queue_provider == "celery" or redis.get("enabled") is True or configured_redis_url
     )
     if not debug and redis_validation_required:
         if not redis_url or redis_url.startswith("${"):
@@ -291,14 +312,18 @@ def validate_runtime_config(config: dict[str, Any]) -> None:
         }
         if tls_required and parsed_redis.scheme != "rediss":
             raise ValueError(
-                "REDIS_URL must use rediss:// when REDIS_REQUIRE_TLS or "
-                "RAG_SECURE_MODE is enabled"
+                "REDIS_URL must use rediss:// when REDIS_REQUIRE_TLS or RAG_SECURE_MODE is enabled"
             )
 
     object_storage = resolve_object_storage_config(config)
     if not debug and rag_env == "base" and not contract_enabled:
         raise ValueError("rag.generation.answer_contract.enabled must be true in production mode")
-    if not debug and rag_env == "base" and queue_provider == "celery" and not object_storage["enabled"]:
+    if (
+        not debug
+        and rag_env == "base"
+        and queue_provider == "celery"
+        and not object_storage["enabled"]
+    ):
         raise ValueError(
             "OBJECT_STORAGE_ENABLED must be true for Celery uploads in base/production mode"
         )
@@ -320,9 +345,7 @@ def validate_runtime_config(config: dict[str, Any]) -> None:
         if object_storage["addressing_style"] not in {"path", "virtual"}:
             raise ValueError("S3_ADDRESSING_STYLE must be path or virtual")
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", str(object_storage["failed_prefix"])):
-            raise ValueError(
-                "S3_FAILED_PREFIX must be a single safe path segment"
-            )
+            raise ValueError("S3_FAILED_PREFIX must be a single safe path segment")
 
     reranker_mode = str(config.get("reranker", {}).get("failure_mode", "closed")).lower()
     if reranker_mode not in {"closed", "open"}:
@@ -357,6 +380,7 @@ def _substitute_env_vars(obj: Any) -> Any:
     if isinstance(obj, list):
         return [_substitute_env_vars(item) for item in obj]
     if isinstance(obj, str):
+
         def _replace(match: re.Match) -> str:
             var_name = match.group(1)
             return os.getenv(var_name, match.group(0))
@@ -486,8 +510,7 @@ def get_config_section(*path: str) -> dict[str, Any]:
         if not isinstance(value, dict):
             located = ".".join(path[: depth + 1])
             raise TypeError(
-                f"Configuration section '{located}' must be a mapping, "
-                f"got {type(value).__name__}"
+                f"Configuration section '{located}' must be a mapping, got {type(value).__name__}"
             )
         section = cast(dict[str, Any], value)
     return section

@@ -11,6 +11,10 @@ llm:
   text:
     provider: "openai_compatible"
     healthcheck_timeout_seconds: 5
+    # A single provider timeout must not remove an otherwise healthy instance
+    # from service. Readiness fails only after both the count and grace limits.
+    readiness_failure_threshold: 2
+    readiness_failure_grace_seconds: 60
     claude:
       model_name: "claude-sonnet-4-6"
       api_key: "${CLAUDE_API_KEY}"

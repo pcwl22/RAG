@@ -37,7 +37,9 @@ def test_openai_base_url_normalization_is_explicit_and_safe():
 
 
 def test_frontend_proxy_exposes_readiness_endpoint():
-    config_path = Path(__file__).resolve().parents[2] / "rag-frontend" / "nginx" / "default.conf.template"
+    config_path = (
+        Path(__file__).resolve().parents[2] / "rag-frontend" / "nginx" / "default.conf.template"
+    )
     config = config_path.read_text(encoding="utf-8")
 
     assert "location = /health/ready" in config
@@ -45,7 +47,9 @@ def test_frontend_proxy_exposes_readiness_endpoint():
 
 
 def test_frontend_proxy_exposes_liveness_endpoint():
-    config_path = Path(__file__).resolve().parents[2] / "rag-frontend" / "nginx" / "default.conf.template"
+    config_path = (
+        Path(__file__).resolve().parents[2] / "rag-frontend" / "nginx" / "default.conf.template"
+    )
     config = config_path.read_text(encoding="utf-8")
 
     assert "location = /health/live" in config
@@ -53,14 +57,18 @@ def test_frontend_proxy_exposes_liveness_endpoint():
 
 
 def test_frontend_csp_allows_oidc_session_iframe():
-    config_path = Path(__file__).resolve().parents[2] / "rag-frontend" / "nginx" / "default.conf.template"
+    config_path = (
+        Path(__file__).resolve().parents[2] / "rag-frontend" / "nginx" / "default.conf.template"
+    )
     config = config_path.read_text(encoding="utf-8")
 
     assert "frame-src 'self' ${OIDC_CONNECT_SRC}" in config
 
 
 def test_frontend_proxy_matches_upload_and_streaming_contracts():
-    config_path = Path(__file__).resolve().parents[2] / "rag-frontend" / "nginx" / "default.conf.template"
+    config_path = (
+        Path(__file__).resolve().parents[2] / "rag-frontend" / "nginx" / "default.conf.template"
+    )
     config = config_path.read_text(encoding="utf-8")
 
     assert "client_max_body_size 105m;" in config
@@ -71,7 +79,9 @@ def test_frontend_proxy_matches_upload_and_streaming_contracts():
 
 
 def test_frontend_only_trusts_the_configured_ingress_proxy_cidr():
-    config_path = Path(__file__).resolve().parents[2] / "rag-frontend" / "nginx" / "default.conf.template"
+    config_path = (
+        Path(__file__).resolve().parents[2] / "rag-frontend" / "nginx" / "default.conf.template"
+    )
     config = config_path.read_text(encoding="utf-8")
 
     assert "real_ip_header X-Forwarded-For;" in config
@@ -91,6 +101,26 @@ def test_runtime_profiles_pass_strict_validation(monkeypatch):
             config["postgres"]["user"] = "rag_runtime"
             config["postgres"]["password"] = "test-runtime-password"
             config["redis"]["url"] = "redis://:test-redis-password@redis:6379/0"
+        validate_runtime_config(config)
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("healthcheck_timeout_seconds", 0, "healthcheck_timeout_seconds"),
+        ("readiness_failure_threshold", 0, "readiness_failure_threshold"),
+        ("readiness_failure_grace_seconds", -1, "readiness_failure_grace_seconds"),
+    ],
+)
+def test_llm_readiness_settings_are_range_checked(key, value, message):
+    config = {
+        "app": {"debug": True},
+        "llm": {"text": {key: value}},
+        "redis": {"enabled": False},
+        "queue": {"provider": "memory", "reconciliation": {}},
+    }
+
+    with pytest.raises(ValueError, match=message):
         validate_runtime_config(config)
 
 
@@ -273,11 +303,9 @@ def test_root_compose_postgres_uses_verify_full_tls():
 
     assert config.count("POSTGRES_SSLMODE: verify-full") == 3
     assert config.count("postgres_tls:/etc/rag/postgres-tls:ro") == 3
-    assert config.count(
-        "POSTGRES_SSLROOTCERT: /etc/rag/postgres-tls/server.crt"
-    ) == 3
+    assert config.count("POSTGRES_SSLROOTCERT: /etc/rag/postgres-tls/server.crt") == 3
     assert "postgres-cert-init:" in config
-    assert 'subjectAltName=DNS:postgres' in config
+    assert "subjectAltName=DNS:postgres" in config
     assert "ssl=on" in config
     assert "ssl_cert_file=/etc/postgresql/tls/server.crt" in config
     assert "ssl_key_file=/etc/postgresql/tls/server.key" in config

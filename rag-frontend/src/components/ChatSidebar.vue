@@ -52,6 +52,7 @@ const emit = defineEmits(['new-chat', 'switch-chat', 'delete-chat'])
 <style scoped>
 .sidebar {
   width: 280px;
+  flex-shrink: 0;
   background: white;
   border-right: 1px solid #e7e3da;
   display: flex;
@@ -175,5 +176,50 @@ const emit = defineEmits(['new-chat', 'switch-chat', 'delete-chat'])
   text-align: center;
   padding: 2rem 1rem;
   color: #6b7077;
+}
+
+@media (max-width: 768px) {
+  .sidebar {
+    width: 100%;
+    max-height: 168px;
+    border-right: 0;
+    border-bottom: 1px solid #e7e3da;
+  }
+
+  .sidebar-header {
+    padding: 0.5rem 0.75rem;
+  }
+
+  .sidebar-header h2 {
+    display: none;
+  }
+
+  .chat-list {
+    display: flex;
+    gap: 0.5rem;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 0.5rem;
+  }
+
+  .chat-item {
+    flex: 0 0 220px;
+    margin-bottom: 0;
+  }
+
+  .empty-state {
+    min-width: 100%;
+    padding: 1rem;
+  }
+}
+
+@media (max-width: 480px) {
+  .sidebar {
+    max-height: 152px;
+  }
+
+  .chat-item {
+    flex-basis: 180px;
+  }
 }
 </style>

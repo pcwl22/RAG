@@ -1,4 +1,5 @@
 """FastAPI application entrypoint for the rag-system layout."""
+
 import asyncio
 import re
 import time
@@ -205,6 +206,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Manage application startup and shutdown."""
     logger.info("Starting RAG System...")
 
+    app.state.llm_readiness_failures = 0
+    app.state.llm_readiness_failure_started_at = None
+
     # This is a release integrity boundary, not an optional dependency health
     # check. Validate the signed descriptor and materialize its pinned models
     # before opening the database or accepting degraded mode.
@@ -224,9 +228,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         try:
             llm_client = get_llm_client()
             timeout = float(
-                config.get("llm", {}).get("text", {}).get(
-                    "healthcheck_timeout_seconds", 5
-                )
+                config.get("llm", {}).get("text", {}).get("healthcheck_timeout_seconds", 5)
             )
             app.state.dependencies["llm"] = await asyncio.wait_for(
                 llm_client.check_health(force=True), timeout=timeout
@@ -305,6 +307,8 @@ app.state.dependencies = {
     "redis": False,
 }
 app.state.startup_complete = False
+app.state.llm_readiness_failures = 0
+app.state.llm_readiness_failure_started_at = None
 app.state.request_semaphore = asyncio.Semaphore(
     int(config.get("performance", {}).get("max_concurrent_requests", 100))
 )
@@ -312,15 +316,11 @@ app.state.tenant_semaphores = {}
 
 
 @app.middleware("http")
-async def limit_api_concurrency(
-    request: Request, call_next: RequestResponseEndpoint
-) -> Response:
+async def limit_api_concurrency(request: Request, call_next: RequestResponseEndpoint) -> Response:
     """Bound API work for the complete response, including SSE body generation."""
     if not request.url.path.startswith("/api/"):
         return await call_next(request)
-    timeout = float(
-        config.get("performance", {}).get("request_queue_timeout_seconds", 5)
-    )
+    timeout = float(config.get("performance", {}).get("request_queue_timeout_seconds", 5))
     queue_deadline = time.monotonic() + max(0.0, timeout)
     performance = config.get("performance", {})
     principal = getattr(request.state, "principal", None)
@@ -414,6 +414,7 @@ async def limit_api_concurrency(
     streaming.body_iterator = limited_body_iterator()
     return response
 
+
 # Starlette wraps middleware so that the most recently registered runs
 # outermost. Authentication must be registered BEFORE CORS so that CORS ends up
 # on the outside and its headers are still attached to 401/403 responses;
@@ -506,30 +507,60 @@ async def _probe_dependencies() -> dict[str, bool]:
     try:
         from app.vectorstore.storage_adapter import check_vector_store_health
 
-        dependencies["postgres"] = await asyncio.wait_for(
-            check_vector_store_health(), timeout=2.0
-        )
+        dependencies["postgres"] = await asyncio.wait_for(check_vector_store_health(), timeout=2.0)
     except Exception:
         logger.warning("PostgreSQL readiness probe failed", exc_info=True)
         dependencies["postgres"] = False
 
+    previous_llm_ready = bool(dependencies.get("llm", False))
+    llm_probe_ready = False
     try:
         llm_client = get_llm_client()
         timeout = float(config.get("llm", {}).get("text", {}).get("healthcheck_timeout_seconds", 5))
-        dependencies["llm"] = await asyncio.wait_for(
-            llm_client.check_health(), timeout=timeout
-        )
+        llm_probe_ready = await asyncio.wait_for(llm_client.check_health(), timeout=timeout)
     except Exception:
         logger.warning("LLM readiness probe failed", exc_info=True)
-        dependencies["llm"] = False
+    if llm_probe_ready:
+        app.state.llm_readiness_failures = 0
+        app.state.llm_readiness_failure_started_at = None
+        dependencies["llm"] = True
+    else:
+        failures = int(getattr(app.state, "llm_readiness_failures", 0)) + 1
+        app.state.llm_readiness_failures = failures
+        now = time.monotonic()
+        failure_started_at = getattr(app.state, "llm_readiness_failure_started_at", None)
+        if failure_started_at is None:
+            failure_started_at = now
+            app.state.llm_readiness_failure_started_at = failure_started_at
+        failure_duration = max(0.0, now - float(failure_started_at))
+        text_config = config.get("llm", {}).get("text", {})
+        threshold = max(
+            1,
+            int(text_config.get("readiness_failure_threshold", 2)),
+        )
+        grace_seconds = max(
+            0.0,
+            float(text_config.get("readiness_failure_grace_seconds", 60)),
+        )
+        dependencies["llm"] = previous_llm_ready and (
+            failures < threshold or failure_duration < grace_seconds
+        )
+        if dependencies["llm"]:
+            logger.warning(
+                "Tolerating transient LLM readiness probe failure",
+                extra={
+                    "consecutive_failures": failures,
+                    "failure_threshold": threshold,
+                    "failure_duration_seconds": round(failure_duration, 3),
+                    "failure_grace_seconds": grace_seconds,
+                },
+            )
 
     if "redis" in required_dependencies() or dependencies.get("redis"):
         try:
             from app.utils.cache import check_redis_health
 
-            dependencies["redis"] = await asyncio.wait_for(
-                check_redis_health(), timeout=1.0
-            )
+            dependencies["redis"] = await asyncio.wait_for(check_redis_health(), timeout=1.0)
         except Exception:
             logger.warning("Redis readiness probe failed", exc_info=True)
             dependencies["redis"] = False
@@ -648,9 +679,7 @@ def _custom_openapi() -> dict[str, Any]:
         )
         response.setdefault("content", {})["text/event-stream"] = {
             "schema": {"type": "string"},
-            "examples": {
-                "event": {"value": 'data: {"type":"chunk","data":"..."}\n\n'}
-            },
+            "examples": {"event": {"value": 'data: {"type":"chunk","data":"..."}\n\n'}},
         }
 
     app.openapi_schema = schema

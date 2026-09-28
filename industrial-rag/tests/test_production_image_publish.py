@@ -344,3 +344,22 @@ def test_production_frontend_uses_a_writable_non_root_pid_path(relative_path):
 
     assert "USER 101:101" in dockerfile
     assert "/tmp/nginx.pid" in dockerfile
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "rag-frontend/Dockerfile",
+        "rag-frontend/Dockerfile.production",
+        "industrial-rag/docker/frontend.Dockerfile.production",
+    ],
+)
+def test_frontend_images_pin_the_fixed_libexpat_package(relative_path):
+    dockerfile = (REPOSITORY_ROOT / relative_path).read_text(encoding="utf-8")
+
+    assert (
+        "nginx:1.30.5-alpine3.24@"
+        "sha256:0985e772fb9f729e6fa0980da05fca5d9c468e870eed43071545afa9d2e27d94"
+        in dockerfile
+    )
+    assert "apk add --no-cache --upgrade 'libexpat=2.8.5-r0'" in dockerfile

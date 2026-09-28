@@ -206,11 +206,15 @@ class ContextPrecisionMetric:
     async def ascore(
         self, *, user_input: str, reference: str, retrieved_contexts: list[str]
     ) -> MetricResult:
+        context_count = len(retrieved_contexts)
+        last_context_index = context_count - 1
         result = await self.judge.generate(
             (
                 "For each context, in its existing order, decide whether it contains information "
-                "useful for deriving the reference answer to the question. Return exactly one "
-                "entry per context as "
+                "useful for deriving the reference answer to the question. "
+                f"The input contains exactly {context_count} contexts indexed from 0 through "
+                f"{last_context_index}. Return exactly {context_count} verdict entries, no more "
+                "and no fewer, with each index appearing once in ascending order, as "
                 '{"verdicts":[{"index":0,"relevant":true|false}],"reason":"brief"}.'
             ),
             {

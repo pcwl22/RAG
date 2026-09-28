@@ -12,10 +12,11 @@ RUN npm ci
 COPY . .
 RUN npm run build
 
-FROM nginx:1.30.5-alpine3.24@sha256:a5f2157a0302eb0c5e300415effb63a9e70ed1eb9c107283819bf6d149ab607c
+FROM nginx:1.30.5-alpine3.24@sha256:0985e772fb9f729e6fa0980da05fca5d9c468e870eed43071545afa9d2e27d94
 COPY nginx/default.conf.template /etc/nginx/templates/default.conf.template
 COPY --from=build /app/dist /usr/share/nginx/html
-RUN sed -i 's/listen 80;/listen 8080;/' /etc/nginx/templates/default.conf.template \
+RUN apk add --no-cache --upgrade 'libexpat=2.8.5-r0' \
+    && sed -i 's/listen 80;/listen 8080;/' /etc/nginx/templates/default.conf.template \
     && sed -i 's|^pid[[:space:]].*;|pid /tmp/nginx.pid;|' /etc/nginx/nginx.conf \
     && sed -i '/^user[[:space:]]/d' /etc/nginx/nginx.conf \
     && mkdir -p /var/cache/nginx /var/run /etc/nginx/conf.d \

@@ -17,9 +17,7 @@ class _ConcurrentIndexCursor:
 
     def execute(self, statement, params=None):
         normalized = " ".join(str(statement).split())
-        self.connection.events.append(
-            ("execute", normalized, self.connection.autocommit, params)
-        )
+        self.connection.events.append(("execute", normalized, self.connection.autocommit, params))
         self._row = None
         if normalized.startswith("SELECT checksum FROM rag_schema_migrations"):
             if self.connection.migration_checksum is not None:
@@ -75,9 +73,7 @@ class _StagedMigrationCursor:
 
     def execute(self, statement, params=None):
         normalized = " ".join(str(statement).split())
-        self.connection.events.append(
-            ("execute", normalized, self.connection.autocommit, params)
-        )
+        self.connection.events.append(("execute", normalized, self.connection.autocommit, params))
         self._rows = []
         self._row = None
         if normalized.startswith("SELECT checksum FROM rag_schema_migrations"):
@@ -92,9 +88,7 @@ class _StagedMigrationCursor:
                 self.connection.null_rows -= updated
             self._rows = [(1,)] * updated
             return
-        if normalized.startswith(
-            "SELECT COUNT(*) FROM public.documents WHERE tenant_id IS NULL"
-        ):
+        if normalized.startswith("SELECT COUNT(*) FROM public.documents WHERE tenant_id IS NULL"):
             self._row = (self.connection.null_rows,)
             return
         if normalized.startswith("SELECT constraint_row.conname, array_agg"):
@@ -108,9 +102,7 @@ class _StagedMigrationCursor:
             "SELECT index_row.indisvalid AND index_row.indisready, index_row.indisunique"
         ):
             state = self.connection.composite_index
-            self._row = (
-                None if state is None else (state[0], state[1], list(state[2]))
-            )
+            self._row = None if state is None else (state[0], state[1], list(state[2]))
             return
         if normalized.startswith("DROP INDEX CONCURRENTLY"):
             self.connection.composite_index = None
@@ -285,9 +277,7 @@ def test_composite_index_and_cutover_retry_after_bounded_lock_failure(monkeypatc
     assert legacy_migration[0] not in connection.migrations
 
     connection.fail_cutover = False
-    postgres_store._cutover_composite_primary_key(
-        connection, cutover_migration, legacy_migration
-    )
+    postgres_store._cutover_composite_primary_key(connection, cutover_migration, legacy_migration)
     assert connection.primary_key == ("documents_pkey", ("tenant_id", "id"))
     assert connection.migrations[cutover_migration[0]] == cutover_migration[1]
     assert connection.migrations[legacy_migration[0]] == legacy_migration[1]
@@ -304,9 +294,7 @@ def test_legacy_primary_key_cutover_requires_explicit_maintenance_gate(
 ):
     legacy_migration = postgres_store.LEGACY_SCHEMA_MIGRATIONS[1]
     cutover_migration = postgres_store.STAGED_TENANT_MIGRATIONS[4]
-    connection = _StagedMigrationConnection(
-        composite_index=(True, True, ("tenant_id", "id"))
-    )
+    connection = _StagedMigrationConnection(composite_index=(True, True, ("tenant_id", "id")))
     monkeypatch.delenv("POSTGRES_ALLOW_LEGACY_PK_CUTOVER", raising=False)
 
     with pytest.raises(RuntimeError, match="traffic"):
@@ -478,9 +466,7 @@ def test_postgres_advisory_lease_is_released_before_pool_return(monkeypatch):
 def test_concurrent_index_migration_repairs_invalid_index_and_records_last():
     first_index = postgres_store.CONCURRENT_INDEX_DEFINITIONS[0][0]
     second_index = postgres_store.CONCURRENT_INDEX_DEFINITIONS[1][0]
-    connection = _ConcurrentIndexConnection(
-        index_states={first_index: False, second_index: True}
-    )
+    connection = _ConcurrentIndexConnection(index_states={first_index: False, second_index: True})
 
     postgres_store._run_search_index_migration_concurrently(
         connection,
@@ -493,8 +479,7 @@ def test_concurrent_index_migration_repairs_invalid_index_and_records_last():
     record_position = next(
         index
         for index, event in enumerate(connection.events)
-        if event[0] == "execute"
-        and event[1].startswith("INSERT INTO rag_schema_migrations")
+        if event[0] == "execute" and event[1].startswith("INSERT INTO rag_schema_migrations")
     )
     last_ddl_position = max(
         index
@@ -504,9 +489,7 @@ def test_concurrent_index_migration_repairs_invalid_index_and_records_last():
 
     assert all(event[2] is True for event in ddl)
     assert any(
-        event[1]
-        == f"DROP INDEX CONCURRENTLY IF EXISTS public.{first_index}"
-        for event in ddl
+        event[1] == f"DROP INDEX CONCURRENTLY IF EXISTS public.{first_index}" for event in ddl
     )
     assert not any(
         event[1].startswith("CREATE INDEX CONCURRENTLY IF NOT EXISTS ")
@@ -539,8 +522,7 @@ def test_concurrent_index_migration_failure_is_safely_rerunnable():
     assert connection.index_states[first_index] is True
     assert connection.autocommit is False
     assert any(
-        event[0] == "execute" and "pg_advisory_unlock" in event[1]
-        for event in connection.events
+        event[0] == "execute" and "pg_advisory_unlock" in event[1] for event in connection.events
     )
 
     connection.fail_index = None
@@ -553,17 +535,14 @@ def test_concurrent_index_migration_failure_is_safely_rerunnable():
         event
         for event in connection.events
         if event[0] == "execute"
-        and event[1].startswith(
-            f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {first_index}"
-        )
+        and event[1].startswith(f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {first_index}")
     ]
 
     assert len(first_index_creates) == 1
     assert connection.migration_checksum == "sha256:expected"
 
     ddl_count = sum(
-        event[0] == "execute" and " INDEX CONCURRENTLY " in event[1]
-        for event in connection.events
+        event[0] == "execute" and " INDEX CONCURRENTLY " in event[1] for event in connection.events
     )
     postgres_store._run_search_index_migration_concurrently(
         connection,
@@ -715,3 +694,14 @@ def test_sql_migration_checksum_is_derived_from_file_content():
     assert migration_id == "20260805_01_schema_v3_contract"
     assert checksum == "sha256:" + hashlib.sha256(sql_text.encode("utf-8")).hexdigest()
     assert "documents_tenant_isolation" in sql_text
+
+    timestamp_migration = next(
+        migration
+        for migration in postgres_store.CONTENT_SCHEMA_MIGRATIONS
+        if migration[0] == "20260923_01_documents_created_at_timestamptz"
+    )
+    assert (
+        timestamp_migration[1]
+        == "sha256:" + hashlib.sha256(timestamp_migration[2].encode("utf-8")).hexdigest()
+    )
+    assert "AT TIME ZONE 'UTC'" in timestamp_migration[2]

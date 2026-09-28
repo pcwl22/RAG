@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 
 import { getModelContextText, getParentContextText, getRelevantSnippet } from '../src/utils/contextText.js'
-import { formatDuration, formatScore, truncateText } from '../src/utils/formatters.js'
+import { formatDuration, formatScore, parseTimestamp, truncateText } from '../src/utils/formatters.js'
 import { ApiError, fetchDocumentChunks, fetchDocuments, fetchHealth } from '../src/api/ragApi.js'
 import { parseSigninCallback } from '../src/auth/oidc.js'
 import { readEventStream } from '../src/utils/eventStream.js'
@@ -24,6 +24,18 @@ test('formatters handle boundaries', () => {
   assert.equal(truncateText('abcdef', 3), 'abc...')
   assert.equal(formatDuration(0.25), '250ms')
   assert.equal(formatScore(0.12345), '0.1235')
+})
+
+test('timezone-less database timestamps are interpreted as UTC', () => {
+  assert.equal(
+    parseTimestamp('2026-09-23T09:12:59.125')?.toISOString(),
+    '2026-09-23T09:12:59.125Z'
+  )
+  assert.equal(
+    parseTimestamp('2026-09-23T09:12:59.125+08:00')?.toISOString(),
+    '2026-09-23T01:12:59.125Z'
+  )
+  assert.equal(parseTimestamp('not-a-date'), null)
 })
 
 test('health requires the readiness endpoint to report ready', async () => {

@@ -779,6 +779,22 @@ docker compose --env-file industrial-rag\.env logs --tail 100 postgres
 
 主机 `laptop` 配置连接 `localhost:15432`；容器 `base` 配置连接 `postgres:5432`，不要混用。
 
+### PostgreSQL corpus fingerprint mismatch
+
+模型版本、维度、归一化设置、最大长度、推理运行时或分块配置变化后，已有语料不能直接继续使用，
+因此服务会拒绝启动。先在 `industrial-rag` 目录运行只读检查：
+
+```powershell
+python scripts\reembed_postgres_corpus.py --inspect
+```
+
+输出会给出数据库和当前运行时指纹、文档数量，以及绑定这些值的 `plan_command` 和
+`apply_command`。先执行不带 `--apply` 的计划命令核对快照摘要；确认维护窗口、数据库目标和
+备份表名后，再执行输出中的 `apply_command`。迁移会在切换前计算全部新向量，并把旧向量保存到
+时间戳备份表；不要通过手工修改 `rag_schema_metadata` 绕过门禁。如果状态为
+`reingest_required`，说明分块配置已经变化，脚本不会生成重嵌入命令；必须通过正常上传/摄取流程
+按新分块策略重新入库，因为仅替换向量无法改变已有文本块边界。
+
 ### Redis 不可用
 
 `laptop` profile 中 Redis 是可选缓存，连接失败时会降级运行；`base` 生产 profile 会要求
@@ -794,6 +810,11 @@ Redis 限流后端不可用时返回 503；仅 laptop profile 显式允许 fail-
 ### 返回 401
 
 启用 API Key 后，请求必须包含与 `RAG_API_KEY` 一致的 `X-API-Key`。浏览器前端应通过同源 Nginx/BFF 访问，避免把密钥暴露给客户端。
+
+`laptop` 配置仅绑定 loopback 且 `app.debug=true`，请求会使用本地管理员身份，即使共享的
+`industrial-rag/.env` 同时保存了 Compose/OIDC 参数也不会误触发 401。这个绕过不会在
+`0.0.0.0`、局域网地址或生产配置上生效。需要验证真实 OIDC 时，应按“启用 Keycloak OIDC 与
+多租户”一节启动 identity、API 和前端 profile。
 
 ### 检索到了相似文本，但没有答案
 

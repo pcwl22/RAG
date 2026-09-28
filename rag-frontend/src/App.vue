@@ -807,6 +807,7 @@ onUnmounted(() => {
 
 .chat-area {
   flex: 1;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   background: white;
@@ -823,15 +824,21 @@ onUnmounted(() => {
 
 .toolbar-left {
   flex: 1;
+  min-width: 0;
 }
 
 .current-chat-title {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-weight: 500;
   color: #1e2227;
 }
 
 .toolbar-right {
   display: flex;
+  flex-shrink: 0;
   gap: 0.5rem;
 }
 
@@ -964,6 +971,7 @@ onUnmounted(() => {
 
 textarea {
   flex: 1;
+  min-width: 0;
   padding: 0.75rem;
   border: 1px solid #e7e3da;
   border-radius: 0.5rem;
@@ -990,5 +998,74 @@ textarea {
 .btn-send:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+@media (max-width: 768px) {
+  .header {
+    padding: 0.75rem 1rem;
+  }
+
+  .header h1 {
+    font-size: 1.125rem;
+  }
+
+  .main-container {
+    flex-direction: column;
+  }
+
+  .chat-area {
+    width: 100%;
+    min-height: 0;
+  }
+
+  .chat-toolbar,
+  .input-area {
+    padding: 0.75rem 1rem;
+  }
+
+  .messages-container {
+    padding: 1rem;
+  }
+
+  .btn-tool {
+    padding: 0.5rem 0.65rem;
+  }
+
+  .input-row {
+    gap: 0.5rem;
+  }
+
+  .btn-send {
+    padding: 0.75rem 1rem;
+  }
+}
+
+@media (max-width: 480px) {
+  .header h1 {
+    font-size: 1rem;
+  }
+
+  .chat-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .toolbar-right .btn-tool {
+    flex: 1;
+  }
+
+  .input-options {
+    flex-wrap: wrap;
+    gap: 0.75rem;
+  }
+
+  .input-row {
+    flex-direction: column;
+  }
+
+  .btn-send {
+    width: 100%;
+  }
 }
 </style>

@@ -149,6 +149,10 @@ def authentication_middleware(
     config: dict[str, Any],
 ) -> Callable[[Request, Callable[[Request], Awaitable[Response]]], Awaitable[Response]]:
     """Authenticate API-key service calls or standard OIDC bearer tokens."""
+    app_config = config.get("app", {})
+    debug_local = bool(app_config.get("debug", False)) and _is_loopback_host(
+        str(app_config.get("host", "")).strip()
+    )
     security = config.get("security", {})
     api_key = security.get("api_key", {})
     enabled = bool(api_key.get("enabled", False))
@@ -161,6 +165,7 @@ def authentication_middleware(
     configured_metrics_token = os.getenv("RAG_METRICS_TOKEN") or prometheus.get("token")
     if isinstance(configured_metrics_token, str) and configured_metrics_token.startswith("${"):
         configured_metrics_token = None
+
     def service_principal() -> Principal:
         configured_roles = os.getenv("RAG_SERVICE_ROLES", "viewer")
         return Principal(
@@ -202,29 +207,30 @@ def authentication_middleware(
                 return JSONResponse(status_code=401, content={"detail": "Metrics authentication required"})
             return await call_next(request)
 
-        principal: Principal | None = None
-        supplied = request.headers.get(header_name, "")
-        if enabled and expected and hmac.compare_digest(str(supplied), str(expected)):
-            principal = service_principal()
-        else:
-            authorization = request.headers.get("Authorization", "")
-            if oidc.enabled and authorization.lower().startswith("bearer "):
-                try:
-                    principal = await oidc.validate(authorization.split(None, 1)[1])
-                except OIDCAuthenticationError:
-                    logger.info("Bearer token rejected", extra={"path": request.url.path})
-                    return JSONResponse(
-                        status_code=401,
-                        content={"detail": "Invalid bearer token"},
-                        headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
-                    )
-                except OIDCProviderUnavailable:
-                    logger.error("OIDC validation dependency unavailable", exc_info=True)
-                    return JSONResponse(
-                        status_code=503,
-                        content={"detail": "Authentication service temporarily unavailable"},
-                        headers={"Retry-After": "5"},
-                    )
+        principal: Principal | None = current_principal() if debug_local else None
+        if not debug_local:
+            supplied = request.headers.get(header_name, "")
+            if enabled and expected and hmac.compare_digest(str(supplied), str(expected)):
+                principal = service_principal()
+            else:
+                authorization = request.headers.get("Authorization", "")
+                if oidc.enabled and authorization.lower().startswith("bearer "):
+                    try:
+                        principal = await oidc.validate(authorization.split(None, 1)[1])
+                    except OIDCAuthenticationError:
+                        logger.info("Bearer token rejected", extra={"path": request.url.path})
+                        return JSONResponse(
+                            status_code=401,
+                            content={"detail": "Invalid bearer token"},
+                            headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
+                        )
+                    except OIDCProviderUnavailable:
+                        logger.error("OIDC validation dependency unavailable", exc_info=True)
+                        return JSONResponse(
+                            status_code=503,
+                            content={"detail": "Authentication service temporarily unavailable"},
+                            headers={"Retry-After": "5"},
+                        )
 
         if principal is None:
             if enabled or oidc.enabled:

@@ -126,14 +126,10 @@ RAG/
 - Docker Desktop + Docker Compose v2
 - NVIDIA GPU（推荐 8 GB 显存；CPU 也可运行但速度较慢）
 
-当前验证环境使用：
-
-- NVIDIA GeForce RTX 4060 Laptop GPU
-- PyTorch `2.4.0+cu121`
-- CUDA wheel 版本 `12.1`
-- `transformers==4.44.2`
-- `sentence-transformers==3.0.1`
-- Ragas `0.4.3`
+恢复快照已在 NVIDIA GeForce RTX 4060 Laptop GPU 上验证；请使用仓库锁定的 PyTorch
+`2.13.0`（CUDA 12.6 或 CPU 构建）、`transformers==5.16.1`、
+`sentence-transformers==6.0.0` 和 `tokenizers==0.23.1`。API 与 worker 可使用
+不同的 CPU/CUDA 构建，但 PyTorch 版本号及其他模型依赖必须一致。
 
 ### 默认端口
 
@@ -160,7 +156,7 @@ Set-Location RAG
 `DEEPSEEK_API_KEY` 都是占位符，需填入自己的模型服务 Key；其余当前凭据按恢复要求
 公开保留。需要重新生成独立配置时可参考两份 `.env.example`。
 
-编辑 `industrial-rag/.env`，至少设置：
+仓库中的 `industrial-rag/.env` 已预填恢复值；以下列出关键变量名称。只需替换模型服务 API Key，勿将示意值覆盖现有凭据：
 
 ```dotenv
 RAG_ENV=laptop
@@ -169,14 +165,17 @@ RAG_SERVICE_ROLES=viewer
 POSTGRES_PASSWORD=replace-with-a-strong-password
 POSTGRES_RUNTIME_USER=rag_runtime
 POSTGRES_APP_PASSWORD=replace-with-a-different-strong-password
+POSTGRES_RUNTIME_PASSWORD=replace-with-a-different-strong-password
 REDIS_PASSWORD=replace-with-a-third-strong-password
 REDIS_URL=redis://:replace-with-a-third-strong-password@localhost:16379/0
 COMPOSE_REDIS_URL=redis://:replace-with-a-third-strong-password@redis:6379/0
+RAG_API_KEY=replace-with-a-random-64-character-key
 DEEPSEEK_API_KEY=replace-with-your-key
 DEEPSEEK_API_URL=https://api.deepseek.com/v1
 DEEPSEEK_MODEL=deepseek-chat
 ```
 
+公开配置中的服务 `RAG_API_KEY` 已更新为符合启动校验的 64 字符随机值；原有短 Key 不再适用。
 也可以切换到 Claude 或智谱，具体 provider 在 `industrial-rag/config/laptop.yaml` 中配置。
 
 如需切换 OpenAI-compatible 网关、模型或密钥，可在 `industrial-rag` 目录执行原子切换命令。密钥通过隐藏输入读取，不会出现在命令行、日志或命令输出中；只切换 URL/model 时会保留现有密钥：
@@ -210,9 +209,10 @@ docker compose --env-file industrial-rag\.env ps
 
 ### 4. 准备 Python/CUDA 环境
 
-项目提供经过验证的 CUDA 安装脚本：
+项目提供经过验证的 CUDA 安装脚本。新机器上先创建 Python 3.12 环境；若同名环境已存在，跳过第一条命令，但仍执行安装脚本以升级到项目锁定版本：
 
 ```powershell
+conda create -n industrial-rag python=3.12 -y
 Push-Location industrial-rag
 pwsh -File scripts\setup_gpu_env.ps1 -EnvironmentName industrial-rag
 Pop-Location
@@ -256,7 +256,9 @@ conda run -n industrial-rag python -m app.embedding.model_bundle prepare
 Pop-Location
 ```
 
-下载器会按固定的 Hugging Face commit 下载两种模型并校验内容。首次下载需要网络，
+下载器会按固定的 Hugging Face commit 下载两种模型并校验内容。下载后可在 `industrial-rag` 目录执行
+`conda run -n industrial-rag python scripts/reembed_postgres_corpus.py --inspect`，结果应为 `ready`；
+若提示指纹不匹配，请检查是否使用锁定依赖和仓库清单。首次下载需要网络，
 建议预留至少 10 GB 磁盘空间。启动 Compose API 前也要完成此步骤：本地模型目录以只读方式挂载。
 
 如果仓库不在 `E:\RAG`，请修改 `industrial-rag/config/laptop.yaml` 中的 `embedding.model_path` 和 `reranker.model_path`。
@@ -736,7 +738,7 @@ python scripts\restore_postgres.py `
 
 ## 安全说明
 
-- 两份 `.env` 和 `database/` 中的数据库快照已按恢复要求公开；本地模型、运行数据库卷和生成报告仍未跟踪。
+- 两份 `.env`、`database/` 中的数据库快照和 7 个 `industrial-rag/data/uploads` 原件已按恢复要求公开；本地模型、运行数据库卷和生成报告仍未跟踪。
 - API Key 使用恒定时间比较；OIDC access token 校验签名、issuer、audience、过期时间、
   必需的 `tenant_id` 和角色。健康检查保持公开，其他运维与 API 路径受认证保护。
 - 前端使用 OIDC Authorization Code + PKCE，不包含或由 Nginx 注入永久管理员 API Key。

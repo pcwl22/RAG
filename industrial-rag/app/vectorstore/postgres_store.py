@@ -221,11 +221,18 @@ def _fingerprint(payload: dict[str, Any]) -> str:
 
 
 def _inference_runtime_versions() -> dict[str, str]:
-    """Return the exact libraries that can change embedding/reranking output."""
+    """Record model-library versions shared by CPU and CUDA workers.
+
+    Torch's local ``+cpu``/``+cu126`` wheel tag identifies the backend build,
+    while the application intentionally permits either device for inference.
+    Keep its upstream version in the corpus identity and preserve exact versions
+    for the other model libraries.
+    """
     versions: dict[str, str] = {}
     for distribution in ("torch", "transformers", "sentence-transformers", "tokenizers"):
         try:
-            versions[distribution] = importlib.metadata.version(distribution)
+            version = importlib.metadata.version(distribution)
+            versions[distribution] = version.partition("+")[0] if distribution == "torch" else version
         except importlib.metadata.PackageNotFoundError:
             versions[distribution] = "not-installed"
     return versions

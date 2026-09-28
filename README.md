@@ -205,15 +205,17 @@ docker compose --env-file industrial-rag\.env up -d postgres redis
 docker compose --env-file industrial-rag\.env ps
 ```
 
-等待两个服务显示 `healthy`。
+等待两个服务显示 `healthy`。需要恢复已提交的数据时，请在启动 API 前按
+[数据库快照恢复说明](database/README.md) 导入；新克隆的空白数据库卷只需导入一次。
 
 ### 4. 准备 Python/CUDA 环境
 
 项目提供经过验证的 CUDA 安装脚本：
 
 ```powershell
-Set-Location industrial-rag
+Push-Location industrial-rag
 pwsh -File scripts\setup_gpu_env.ps1 -EnvironmentName industrial-rag
+Pop-Location
 ```
 
 脚本会先从 PyTorch CUDA 12.6 专用索引安装经过 SHA-256 校验的 PyTorch，
@@ -222,7 +224,9 @@ pwsh -File scripts\setup_gpu_env.ps1 -EnvironmentName industrial-rag
 如果环境已经创建，可以单独检查：
 
 ```powershell
+Push-Location industrial-rag
 conda run -n industrial-rag python scripts\check_cuda.py
+Pop-Location
 ```
 
 ### 5. 放置本地模型
@@ -243,12 +247,13 @@ Copy-Item industrial-rag/model-sources/model-manifest.json models/model-manifest
 (Get-FileHash industrial-rag/model-sources/model-manifest.json -Algorithm SHA256).Hash.ToLowerInvariant()
 ```
 
-将输出的哈希填入 `industrial-rag/.env` 的
-`MODEL_MANIFEST_SHA256=sha256:<哈希>`，替换示例中的全零占位符。完成第 4 步的
-Python 环境安装后，在 `industrial-rag` 目录执行：
+将输出的哈希与 `industrial-rag/.env` 中预填的 `MODEL_MANIFEST_SHA256` 比较；
+清单变更时同步更新该值。完成第 4 步的 Python 环境安装后，执行：
 
 ```powershell
-python -m app.embedding.model_bundle prepare
+Push-Location industrial-rag
+conda run -n industrial-rag python -m app.embedding.model_bundle prepare
+Pop-Location
 ```
 
 下载器会按固定的 Hugging Face commit 下载两种模型并校验内容。首次下载需要网络，

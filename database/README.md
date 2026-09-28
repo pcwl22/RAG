@@ -15,7 +15,7 @@
 
 ## 从新克隆恢复
 
-先按根目录 `README.md` 创建 `industrial-rag/.env` 并设置数据库密码。
+仓库已包含 `industrial-rag/.env` 和数据库凭据；先按根目录 `README.md` 核对配置。
 在**全新、空白的 PostgreSQL 卷**上，从仓库根目录执行：
 
 ```powershell

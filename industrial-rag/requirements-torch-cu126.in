@@ -1,2 +1,2 @@
 # Windows amd64 / CPython 3.12 CUDA 12.6 Torch carrier.
-torch==2.13.0+cu126
+torch==2.14.0

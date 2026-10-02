@@ -51,5 +51,5 @@ python-json-logger==4.2.0
 # ===== HTTP、鉴权和分词 =====
 httpx==0.28.1
 python-multipart==0.0.32
-PyJWT[crypto]==2.13.0
+PyJWT[crypto]==2.15.0
 tiktoken==0.14.0
